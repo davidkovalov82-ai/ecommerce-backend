@@ -64,6 +64,16 @@ def setup_test_database() -> Generator[None]:
         conn.execute(text(f"DROP DATABASE IF EXISTS {TEST_DB_NAME} WITH (FORCE)"))
 
 
+def _sync_users_sequence(conn: Any) -> None:
+    """Синхронизира PostgreSQL sequence-а на users с текущото максимално ID."""
+    conn.execute(
+        text(
+            "SELECT setval(pg_get_serial_sequence('users', 'id'), "
+            "coalesce(max(id), 1), max(id) IS NOT NULL) FROM users;"
+        )
+    )
+
+
 @pytest.fixture
 def db_session() -> Generator[Session]:
     """Изолирана сесия за тестове с автоматично почистване на новите записи."""
@@ -72,11 +82,27 @@ def db_session() -> Generator[Session]:
         yield session
     finally:
         session.rollback()
-        # Премахваме всички добавени от тестовете редове, запазвайки началното id=1 от миграцията
+        # Премахваме всички добавени от тестовете редове
+        session.execute(text("DELETE FROM users"))
+        _sync_users_sequence(session)
         session.execute(text("DELETE FROM products WHERE id != 1"))
         _sync_products_sequence(session)
         session.commit()
         session.close()
+
+
+@pytest.fixture(autouse=True)
+def clean_users_table() -> Generator[None]:
+    """Гарантира почистване на таблицата users преди и след всеки тест."""
+    with TestingSessionLocal() as session:
+        session.execute(text("DELETE FROM users"))
+        _sync_users_sequence(session)
+        session.commit()
+    yield
+    with TestingSessionLocal() as session:
+        session.execute(text("DELETE FROM users"))
+        _sync_users_sequence(session)
+        session.commit()
 
 
 @pytest.fixture(autouse=True)
