@@ -10,3 +10,9 @@ class ProductResponse(BaseModel):
     currency: str
     stock: int
     active: bool
+
+
+class ProductListResponse(BaseModel):
+    items: list[ProductResponse]
+    limit: int
+    offset: int

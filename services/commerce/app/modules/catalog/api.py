@@ -1,11 +1,26 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 
 from app.dependencies import DbSession
 from app.modules.catalog import service
-from app.modules.catalog.schemas import ProductResponse
+from app.modules.catalog.schemas import ProductListResponse, ProductResponse
 from app.modules.catalog.service import ProductNotFound
 
 router = APIRouter(prefix="/products", tags=["catalog"])
+
+
+@router.get("", response_model=ProductListResponse)
+def list_products(
+    session: DbSession,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> ProductListResponse:
+    """HTTP обработчик за получаване на публичен списък с активни продукти."""
+    products = service.list_active_products(session, limit=limit, offset=offset)
+    return ProductListResponse(
+        items=[ProductResponse.model_validate(p) for p in products],
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/{product_id}", response_model=ProductResponse)

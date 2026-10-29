@@ -74,6 +74,7 @@ def db_session() -> Generator[Session]:
         session.rollback()
         # Премахваме всички добавени от тестовете редове, запазвайки началното id=1 от миграцията
         session.execute(text("DELETE FROM products WHERE id != 1"))
+        session.execute(text("UPDATE products SET active = true WHERE id = 1"))
         _sync_products_sequence(session)
         session.commit()
         session.close()
