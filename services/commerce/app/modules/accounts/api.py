@@ -1,7 +1,6 @@
 from fastapi import APIRouter, HTTPException, status
 
-from app.dependencies import DbSession
-from app.modules.accounts import service
+from app.modules.accounts.dependencies import AccountServiceDep
 from app.modules.accounts.schemas import UserRegisterRequest, UserResponse
 from app.modules.accounts.service import EmailAlreadyExists
 
@@ -11,12 +10,11 @@ router = APIRouter(prefix="/users", tags=["accounts"])
 @router.post("", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 def register(
     request: UserRegisterRequest,
-    session: DbSession,
+    account_service: AccountServiceDep,
 ) -> UserResponse:
     """HTTP обработчик за регистрация на нов потребител (винаги customer)."""
     try:
-        user = service.register_user(
-            session=session,
+        user = account_service.register_user(
             email=request.email,
             password=request.password,
         )
