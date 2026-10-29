@@ -61,7 +61,9 @@ def test_zero_price_and_zero_stock_allowed(db_session: Session) -> None:
     db_session.flush()
 
     # Проверяваме, че записът е успешно съхранен и четен
-    saved = db_session.scalar(select(Product).where(Product.title == "Free Out of Stock Sample"))
+    saved = db_session.scalar(
+        select(Product).where(Product.title == "Free Out of Stock Sample")
+    )
     assert saved is not None
     assert saved.price_minor == 0
     assert saved.stock == 0

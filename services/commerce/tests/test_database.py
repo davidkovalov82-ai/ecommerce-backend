@@ -21,8 +21,6 @@ def test_database_connection_select_one() -> None:
         assert result == 1
 
 
-
-
 def test_db_session_lifecycle_closes_on_success() -> None:
     """Проверка, че сесията се създава и затваря надеждно при успешен сценарий."""
     mock_session = MagicMock()

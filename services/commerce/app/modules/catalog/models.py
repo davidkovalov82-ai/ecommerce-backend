@@ -9,7 +9,9 @@ class Product(Base):
 
     __tablename__ = "products"
     __table_args__ = (
-        CheckConstraint("price_minor >= 0", name="ck_products_price_minor_non_negative"),
+        CheckConstraint(
+            "price_minor >= 0", name="ck_products_price_minor_non_negative"
+        ),
         CheckConstraint("stock >= 0", name="ck_products_stock_non_negative"),
         CheckConstraint("currency = 'EUR'", name="ck_products_currency_eur"),
     )

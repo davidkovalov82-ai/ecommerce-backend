@@ -19,10 +19,14 @@ TEST_DATABASE_URL = (
 
 # Проверка за сигурност: тестовият URL задължително трябва да сочи към commerce_test
 assert TEST_DB_NAME in TEST_DATABASE_URL
-assert settings.db_name != TEST_DB_NAME, "Основната база не бива да се казва commerce_test"
+assert settings.db_name != TEST_DB_NAME, (
+    "Основната база не бива да се казва commerce_test"
+)
 
 test_engine = create_engine(TEST_DATABASE_URL, pool_pre_ping=True)
-TestingSessionLocal = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
+TestingSessionLocal = sessionmaker(
+    bind=test_engine, autoflush=False, expire_on_commit=False
+)
 
 
 def _sync_products_sequence(conn: Any) -> None:
@@ -33,7 +37,6 @@ def _sync_products_sequence(conn: Any) -> None:
             "coalesce(max(id), 1), max(id) IS NOT NULL) FROM products;"
         )
     )
-
 
 
 @pytest.fixture(scope="session", autouse=True)

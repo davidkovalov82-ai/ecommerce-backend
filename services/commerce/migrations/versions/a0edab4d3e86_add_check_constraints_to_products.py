@@ -40,4 +40,6 @@ def downgrade() -> None:
     """Downgrade schema."""
     op.drop_constraint("ck_products_currency_eur", "products", type_="check")
     op.drop_constraint("ck_products_stock_non_negative", "products", type_="check")
-    op.drop_constraint("ck_products_price_minor_non_negative", "products", type_="check")
+    op.drop_constraint(
+        "ck_products_price_minor_non_negative", "products", type_="check"
+    )

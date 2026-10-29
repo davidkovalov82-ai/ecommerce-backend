@@ -17,4 +17,3 @@ SessionLocal = sessionmaker(
 
 class Base(DeclarativeBase):
     """Базов клас за всички SQLAlchemy ORM модели."""
-
