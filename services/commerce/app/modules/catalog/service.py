@@ -1,3 +1,5 @@
+from collections.abc import Sequence
+
 from sqlalchemy.orm import Session
 
 from app.modules.catalog import repository
@@ -17,3 +19,10 @@ def get_product_by_id(session: Session, product_id: int) -> Product:
     if product is None:
         raise ProductNotFound(f"Product with id {product_id} not found")
     return product
+
+
+def list_active_products(
+    session: Session, limit: int, offset: int
+) -> Sequence[Product]:
+    """Сценарий: извличане на публичен списък с активни продукти с пагинация."""
+    return repository.list_active(session, limit=limit, offset=offset)
