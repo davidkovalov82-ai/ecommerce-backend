@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  commerce-checks:
+    name: commerce-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        working-directory: services/commerce
+
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: "5432"
+      DB_USER: commerce
+      DB_PASSWORD: commerce_ci
+      DB_NAME: commerce
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: commerce
+          POSTGRES_PASSWORD: commerce_ci
+          POSTGRES_DB: commerce
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U commerce -d commerce"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9
+        with:
+          version: "0.13.6"
+
+      - name: Install Python
+        run: uv python install 3.13
+
+      - name: Install locked dependencies
+        run: uv sync --locked --dev --python 3.13
+
+      - name: Check lint
+        run: uv run --locked ruff check .
+
+      - name: Check formatting
+        run: uv run --locked ruff format --check .
+
+      - name: Apply migrations to an empty database
+        run: uv run --locked alembic upgrade head
+
+      - name: Check standalone product insertion
+        run: >-
+          uv run --locked pytest
+          tests/test_product_constraints.py::test_zero_price_and_zero_stock_allowed
+          -q
+
+      - name: Run all tests
+        run: uv run --locked pytest -q
