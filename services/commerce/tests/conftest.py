@@ -86,6 +86,7 @@ def db_session() -> Generator[Session]:
         session.execute(text("DELETE FROM users"))
         _sync_users_sequence(session)
         session.execute(text("DELETE FROM products WHERE id != 1"))
+        session.execute(text("UPDATE products SET active = true WHERE id = 1"))
         _sync_products_sequence(session)
         session.commit()
         session.close()

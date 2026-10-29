@@ -1,13 +1,14 @@
 import pytest
 from fastapi.testclient import TestClient
+from pwdlib import PasswordHash
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.main import app
-from app.modules.accounts import service
 from app.modules.accounts.models import User
-from app.modules.accounts.service import is_unique_email_violation
+from app.modules.accounts.repository import UserRepository
+from app.modules.accounts.service import AccountService, is_unique_email_violation
 
 client = TestClient(app)
 
@@ -190,11 +191,21 @@ def test_password_hash_stored_and_verifies_original(db_session: Session) -> None
     # Трябва да е валиден Argon2 хеш
     assert user_in_db.password_hash.startswith("$argon2id$")
 
+    user_repo = UserRepository(db_session)
+    account_service = AccountService(
+        user_repository=user_repo,
+        session=db_session,
+        password_hasher=PasswordHash.recommended(),
+    )
     # Проверка на оригиналната парола срещу хеша
-    assert service.verify_password(raw_password, user_in_db.password_hash) is True
+    assert (
+        account_service.verify_password(raw_password, user_in_db.password_hash) is True
+    )
     # Проверка на грешна парола
     assert (
-        service.verify_password("wrong_password_attempt", user_in_db.password_hash)
+        account_service.verify_password(
+            "wrong_password_attempt", user_in_db.password_hash
+        )
         is False
     )
 
