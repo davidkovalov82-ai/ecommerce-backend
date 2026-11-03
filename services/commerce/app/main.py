@@ -7,6 +7,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.db import db
+from app.modules.accounts.api import auth_router
 from app.modules.accounts.api import router as accounts_router
 from app.modules.catalog.api import router as catalog_router
 
@@ -88,6 +89,7 @@ def create_app() -> FastAPI:
 
     app.include_router(catalog_router)
     app.include_router(accounts_router)
+    app.include_router(auth_router)
     return app
 
 

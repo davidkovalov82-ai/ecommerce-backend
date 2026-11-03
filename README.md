@@ -16,6 +16,9 @@
 - **`accounts` (Потребителски профили и автентикация)**:
   - Регистрация на нови потребители (`POST /users`).
   - Сигурно хеширане на пароли с **Argon2id** чрез `pwdlib`.
+  - Вход в системата (`POST /auth/login`) и издаване на кратковременни **JWT access tokens** (HS256, 15 минути).
+  - Защита от timing attacks при грешен потребител чрез сравнение срещу предварително подготвен статичен dummy hash.
+  - Извличане на текущо автентикирания потребител (`GET /users/me`) по `sub` claim от токена с директна проверка в базата данни.
   - Защита на паролите: пълно саниране и недопускане на изтичане на пароли във валидационните грешки (HTTP 422), логовете или HTTP отговорите.
   - Бизнес правила: роля по подразбиране `customer` (невъзможност за самоназначаване на административни роли), нормализация на имейли (case-insensitive уникалност).
 
@@ -96,13 +99,24 @@ docker compose up -d db
 cp services/commerce/.env.example services/commerce/.env
 ```
 
-Съдържание по подразбиране в `.env`:
+Генерирайте сигурен таен ключ (поне 32 байта) за подписване на JWT токените:
+```bash
+# Пример чрез Python secrets:
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+# или чрез openssl:
+openssl rand -hex 32
+```
+
+Попълнете стойността в `services/commerce/.env`:
 ```env
 DB_HOST=localhost
 DB_PORT=5432
 DB_USER=commerce
 DB_PASSWORD=commerce
 DB_NAME=commerce
+
+# Задължително: поне 32 байта таен ключ за JWT (няма работеща стойност по подразбиране в прод)
+JWT_SECRET=your_generated_random_secret_at_least_32_bytes_long
 ```
 
 ### 3. Инсталиране на зависимостите
@@ -187,7 +201,7 @@ uv run ruff format .
   - Връща 200 с данните за продукта, ако е активен.
   - Връща 404 `PRODUCT_NOT_FOUND`, ако продуктът липсва или е деактивиран (`active: false`).
 
-### 2. Потребителски профили (Accounts)
+### 2. Потребителски профили и автентикация (Accounts & Auth)
 
 - **`POST /users`** – Регистрация на нов клиент:
   - Тяло на заявката:
@@ -210,23 +224,113 @@ uv run ruff format .
     ```
   - При опит за дублиран имейл: 409 Conflict (`EMAIL_ALREADY_EXISTS`).
 
+- **`POST /auth/login`** – Вход в системата и получаване на JWT токен:
+  - Тяло на заявката:
+    ```json
+    {
+      "email": "customer@example.com",
+      "password": "secure_password_15_chars_or_more"
+    }
+    ```
+  - Поведение:
+    - Имейлът се нормализира (trim и lowercase) по същите правила като при регистрацията.
+    - Паролата се проверява директно в оригинален вид.
+    - При несъществуващ имейл или грешна парола се връща унифициран отговор **401 Unauthorized** (`detail.code = "INVALID_CREDENTIALS"`, `detail.message = "Invalid email or password"`) с хедър `WWW-Authenticate: Bearer`.
+    - Използва се предварително подготвен статичен dummy hash срещу timing attacks при неизвестен потребител.
+  - Отговор (200 OK):
+    ```json
+    {
+      "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+      "token_type": "bearer"
+    }
+    ```
+
+- **`GET /users/me`** – Извличане на профила на текущо влезлия потребител:
+  - Изисква хедър:
+    ```http
+    Authorization: Bearer <access_token>
+    ```
+  - Поведение:
+    - Проверява подписа, валидността и срока на токена (HS256).
+    - Извлича актуалния потребител от базата данни по `sub` (user ID) – ролята и правата не се четат от недоверени данни в токена.
+    - При невалиден/изтекъл токен или изтрит потребител връща **401 Unauthorized** с хедър `WWW-Authenticate: Bearer`.
+  - Отговор (200 OK):
+    ```json
+    {
+      "id": 1,
+      "email": "customer@example.com",
+      "role": "customer"
+    }
+    ```
+
 ---
 
-## Демонстрация чрез cURL
+## Демонстрация чрез cURL и Swagger UI
 
-### Регистрация на нов потребител:
+### 1. Пълен цикъл за автентикация (Registration -> Login -> Profile)
+
+#### Стъпка 1: Регистрация на нов потребител
 ```bash
 curl -X POST http://localhost:8000/users \
   -H "Content-Type: application/json" \
   -d '{"email": "alex@example.com", "password": "SuperSecretPassphrase123!"}'
 ```
 
-### Извличане на продукти с пагинация:
+#### Стъпка 2: Вход в системата (Login) и получаване на токен
 ```bash
-curl "http://localhost:8000/products?limit=5&offset=0"
+curl -X POST http://localhost:8000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "alex@example.com", "password": "SuperSecretPassphrase123!"}'
+```
+*Примерен отговор:*
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwiaWF0IjoxNzM...",
+  "token_type": "bearer"
+}
 ```
 
-### Преглед на детайл за продукт:
+#### Стъпка 3: Достъп до защитения крайпът `GET /users/me`
+Запазете токена в променлива или го подайте директно:
 ```bash
+TOKEN="<вашият_access_token>"
+
+curl -X GET http://localhost:8000/users/me \
+  -H "Authorization: Bearer $TOKEN"
+```
+*Връща:*
+```json
+{
+  "id": 1,
+  "email": "alex@example.com",
+  "role": "customer"
+}
+```
+
+### 2. Използване през Swagger UI (`/docs`)
+
+1. Отворете [http://localhost:8000/docs](http://localhost:8000/docs).
+2. Изпълнете `POST /auth/login` с вашите данни и копирайте върнатия `access_token`.
+3. Натиснете бутона **Authorize** (горе вдясно с катинарчето).
+4. В полето **Value** поставете копирания токен (Swagger UI автоматично управлява `Bearer` префикса чрез конфигурираната `HTTPBearer` схема).
+5. Натиснете **Authorize**, след което **Close**.
+6. Вече можете да извиквате `GET /users/me` директно от интерфейса.
+
+### 3. Работа с каталога
+```bash
+# Извличане на продукти с пагинация:
+curl "http://localhost:8000/products?limit=5&offset=0"
+
+# Преглед на детайл за единичен продукт:
 curl "http://localhost:8000/products/1"
 ```
+
+---
+
+## Архитектурни бележки и технически ограничения
+
+- **Кратковременни токени**: Access токенът е валиден 15 минути. В тази стъпка нарочно **не са** включени refresh tokens или списък за оттегляне (token revocation / denylist), за да се запази архитектурата проста и без излишен овърхед.
+- **Stateless проверка**: Токенът се проверява криптографски с HMAC-SHA256 (`HS256`). Потребителският запис се зарежда директно от базата данни при всяка защитена заявка, гарантирайки актуалност на статуса и ролята.
+- **Изисквания за продукционна среда**:
+  - **HTTPS/TLS**: Задължително е целият трафик да минава през криптиран HTTPS канал за предпазване на bearer токените и паролите при пренос по мрежата.
+  - **Rate Limiting**: За крайния път `/auth/login` е задължително налагането на ограничение на броя опити (rate limiting срещу brute-force и credential stuffing атаки) преди публично внедряване.

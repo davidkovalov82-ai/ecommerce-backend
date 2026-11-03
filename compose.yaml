@@ -34,6 +34,7 @@ services:
       DB_USER: commerce
       DB_PASSWORD: commerce
       DB_NAME: commerce
+      JWT_SECRET: ${JWT_SECRET:-insecure_compose_jwt_secret_change_in_production_32b}
     ports:
       - "8000:8000"
     command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"

@@ -10,6 +10,16 @@ class EmailAlreadyExists(Exception):
     """Сигнализира, че потребител с този имейл вече съществува."""
 
 
+class InvalidCredentials(Exception):
+    """Сигнализира за невалиден имейл или парола при опит за автентикация."""
+
+
+# Предварително изчислен валиден Argon2 хеш за предотвратяване на timing attacks при несъществуващ потребител
+_DUMMY_HASH: str = PasswordHash.recommended().hash(
+    "timing_attack_mitigation_dummy_password"
+)
+
+
 def is_unique_email_violation(exc: IntegrityError) -> bool:
     """Проверява дали грешката е конкретно нарушение на уникалното ограничение uq_users_email."""
     orig = getattr(exc, "orig", None)  # как работи и кьде се намира
@@ -35,6 +45,23 @@ class AccountService:
     def verify_password(self, plain_password: str, hashed_password: str) -> bool:
         """Проверява съвпадението на предоставена парола спрямо съхранен хеш."""
         return self._password_hasher.verify(plain_password, hashed_password)
+
+    def authenticate_user(self, email: str, password: str) -> User:
+        """Сценарий: автентикация на потребител с имейл и парола.
+
+        Хвърля InvalidCredentials при несъществуващ потребител или грешна парола.
+        При несъществуващ потребител верифицира срещу dummy hash, за да предотврати timing attack.
+        """
+        user = self._user_repository.get_by_email(email)
+        if user is None:
+            # Изпълняваме проверка срещу dummy hash, за да изравним времето за отговор
+            self._password_hasher.verify(password, _DUMMY_HASH)
+            raise InvalidCredentials("Invalid email or password")
+
+        if not self._password_hasher.verify(password, user.password_hash):
+            raise InvalidCredentials("Invalid email or password")
+
+        return user
 
     def register_user(self, email: str, password: str) -> User:
         """Сценарий: регистрация на нов потребител.

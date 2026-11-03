@@ -1,3 +1,4 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,6 +14,17 @@ class Settings(BaseSettings):
     db_user: str = "commerce"
     db_password: str = "commerce"
     db_name: str = "commerce"
+
+    jwt_secret: str
+    jwt_algorithm: str = "HS256"
+    jwt_access_token_expire_minutes: int = 15
+
+    @field_validator("jwt_secret")
+    @classmethod
+    def validate_jwt_secret(cls, v: str) -> str:
+        if not v or len(v.encode("utf-8")) < 32:
+            raise ValueError("JWT_SECRET must be at least 32 bytes long")
+        return v
 
     @property
     def database_url(self) -> str:

@@ -1,10 +1,48 @@
 from fastapi import APIRouter, HTTPException, status
 
-from app.modules.accounts.dependencies import AccountServiceDep
-from app.modules.accounts.schemas import UserRegisterRequest, UserResponse
-from app.modules.accounts.service import EmailAlreadyExists
+from app.config import settings
+from app.modules.accounts.dependencies import AccountServiceDep, CurrentUserDep
+from app.modules.accounts.schemas import (
+    TokenResponse,
+    UserLoginRequest,
+    UserRegisterRequest,
+    UserResponse,
+)
+from app.modules.accounts.service import EmailAlreadyExists, InvalidCredentials
+from app.modules.accounts.tokens import create_access_token
 
 router = APIRouter(prefix="/users", tags=["accounts"])
+auth_router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@auth_router.post("/login", response_model=TokenResponse)
+def login(
+    request: UserLoginRequest,
+    account_service: AccountServiceDep,
+) -> TokenResponse:
+    """HTTP обработчик за вход на потребител и издаване на JWT токен."""
+    try:
+        user = account_service.authenticate_user(
+            email=request.email,
+            password=request.password,
+        )
+    except InvalidCredentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "INVALID_CREDENTIALS",
+                "message": "Invalid email or password",
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    access_token = create_access_token(
+        user_id=user.id,
+        secret=settings.jwt_secret,
+        algorithm=settings.jwt_algorithm,
+        expire_minutes=settings.jwt_access_token_expire_minutes,
+    )
+    return TokenResponse(access_token=access_token, token_type="bearer")
 
 
 @router.post("", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
@@ -27,3 +65,11 @@ def register(
                 "message": "User with this email already exists",
             },
         )
+
+
+@router.get("/me", response_model=UserResponse)
+def get_me(
+    current_user: CurrentUserDep,
+) -> UserResponse:
+    """HTTP обработчик за извличане на данните на текущия автентикиран потребител."""
+    return UserResponse.model_validate(current_user)

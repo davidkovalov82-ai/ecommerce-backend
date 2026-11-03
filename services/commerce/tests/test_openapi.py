@@ -32,3 +32,19 @@ def test_openapi_registered_operations() -> None:
     assert "/users" in paths
     assert "post" in paths["/users"]
     assert paths["/users"]["post"]["operationId"] is not None
+
+    # 4. POST /auth/login
+    assert "/auth/login" in paths
+    assert "post" in paths["/auth/login"]
+    assert paths["/auth/login"]["post"]["operationId"] is not None
+
+    # 5. GET /users/me
+    assert "/users/me" in paths
+    assert "get" in paths["/users/me"]
+    assert paths["/users/me"]["get"]["operationId"] is not None
+
+    # 6. Bearer сигурностна схема в компонентите
+    security_schemes = schema.get("components", {}).get("securitySchemes", {})
+    assert "HTTPBearer" in security_schemes
+    assert security_schemes["HTTPBearer"]["type"] == "http"
+    assert security_schemes["HTTPBearer"]["scheme"] == "bearer"

@@ -1,5 +1,11 @@
+import os
 from collections.abc import Generator
 from typing import Any
+
+# Задаваме отделен тестов таен ключ за тестовата среда
+os.environ.setdefault(
+    "JWT_SECRET", "ci-and-test-jwt-secret-key-at-least-32-bytes-long!"
+)
 
 import pytest
 from alembic import command

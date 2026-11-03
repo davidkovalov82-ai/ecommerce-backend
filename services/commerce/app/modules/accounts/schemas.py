@@ -19,6 +19,30 @@ class UserRegisterRequest(BaseModel):
         return v
 
 
+class UserLoginRequest(BaseModel):
+    """Схема за входните данни при вход (логин) на потребител."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr
+    password: str
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, v: object) -> object:
+        """Нормализира имейл адреса (strip и lowercase), без да променя паролата."""
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
+
+
+class TokenResponse(BaseModel):
+    """Схема за отговор при успешен вход с издаден Bearer JWT токен."""
+
+    access_token: str
+    token_type: str = "bearer"
+
+
 class UserResponse(BaseModel):
     """Публична схема за отговор с данни на потребител (без парола или хеш)."""
 
