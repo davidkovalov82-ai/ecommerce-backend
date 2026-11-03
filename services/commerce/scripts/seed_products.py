@@ -82,8 +82,8 @@ def generate_100_products() -> list[dict[str, object]]:
 
 
 def seed(session: Session) -> int:
-    """Вмъква 100 продукта в базата данни, ако вече не са добавени."""
-    # Синхронизиране на sequence-а предварително, тъй като id=1 е вмъкнат от миграция
+    """Вмъква демонстрационни продукти в базата данни, като добавя само липсващите."""
+    # Синхронизиране на sequence-а предварително, в случай че има съществуващи записи
     session.execute(
         text(
             "SELECT setval(pg_get_serial_sequence('products', 'id'), "
@@ -92,39 +92,44 @@ def seed(session: Session) -> int:
     )
     session.commit()
 
-    existing_count = session.scalar(select(func.count(Product.id))) or 0
-    print(f"Текущ брой продукти в базата: {existing_count}")
-
-    if existing_count > 1:
-        print(
-            "Базата данни вече съдържа демонстрационни продукти. Пропускане на зареждането."
-        )
-        return 0
-
-    if existing_count > 1:
-        print("Базата данни вече съдържа демонстрационни продукти. Пропускане на зареждането.")
-        return 0
-
     products = generate_100_products()
+    demo_titles = [str(p["title"]) for p in products]
+
+    # Разпознаваме съществуващите демопродукти по уникалното им заглавие (стабилен идентификатор)
+    existing_demo_titles = set(
+        session.scalars(
+            select(Product.title).where(Product.title.in_(demo_titles))
+        ).all()
+    )
+
+    print(
+        f"Намерени вече съществуващи демопродукти: {len(existing_demo_titles)} от {len(products)}"
+    )
+
     added = 0
     for data in products:
+        if str(data["title"]) in existing_demo_titles:
+            continue
         p = Product(**data)
         session.add(p)
         added += 1
 
-    session.commit()
+    if added > 0:
+        session.commit()
 
-    # Синхронизиране на sequence-а в PostgreSQL
-    session.execute(
-        text(
-            "SELECT setval(pg_get_serial_sequence('products', 'id'), "
-            "coalesce(max(id), 1), max(id) IS NOT NULL) FROM products;"
+        # Синхронизиране на sequence-а в PostgreSQL след добавянето на новите записи
+        session.execute(
+            text(
+                "SELECT setval(pg_get_serial_sequence('products', 'id'), "
+                "coalesce(max(id), 1), max(id) IS NOT NULL) FROM products;"
+            )
         )
-    )
-    session.commit()
+        session.commit()
+        print(f"Успешно добавени нови демонстрационни продукти: {added}")
+    else:
+        print("Всички демонстрационни продукти вече присъстват в базата данни.")
 
     total_count = session.scalar(select(func.count(Product.id))) or 0
-    print(f"Успешно добавени нови продукти: {added}")
     print(f"Общ брой продукти в базата след seeding: {total_count}")
     return added
 
