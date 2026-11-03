@@ -12,8 +12,8 @@ class EmailAlreadyExists(Exception):
 
 def is_unique_email_violation(exc: IntegrityError) -> bool:
     """Проверява дали грешката е конкретно нарушение на уникалното ограничение uq_users_email."""
-    orig = getattr(exc, "orig", None)
-    diag = getattr(orig, "diag", None)
+    orig = getattr(exc, "orig", None)  # как работи и кьде се намира
+    diag = getattr(orig, "diag", None)  # как работи и кьде се намира
     if diag and getattr(diag, "constraint_name", None) == "uq_users_email":
         return True
     return "uq_users_email" in str(exc)

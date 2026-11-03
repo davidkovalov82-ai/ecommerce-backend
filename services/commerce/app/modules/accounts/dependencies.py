@@ -16,6 +16,7 @@ def get_password_hasher() -> PasswordHash:
     return _password_hasher
 
 
+# какво това е не разбирам фабрика за какво исползваме фабрика каква е идея?
 def get_user_repository(session: DbSession) -> UserRepository:
     """Фабрика за UserRepository с текущата сесия на заявката."""
     return UserRepository(session)

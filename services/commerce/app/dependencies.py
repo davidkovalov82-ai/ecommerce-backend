@@ -6,6 +6,8 @@ from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
 
+# also need to be in the class
+
 
 def get_db_session() -> Generator[Session]:
     """FastAPI зависимост за управление на жизнения цикъл на SQLAlchemy сесията.

@@ -9,6 +9,7 @@ class UserRegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=15, max_length=128)
 
+    # как работи field_validator и classmethod защо ги исползваме тук
     @field_validator("email", mode="before")
     @classmethod
     def normalize_email(cls, v: object) -> object:
