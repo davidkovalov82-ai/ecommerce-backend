@@ -91,3 +91,21 @@ def get_current_user(
 
 
 CurrentUserDep = Annotated[User, Depends(get_current_user)]
+
+
+def require_admin(
+    current_user: CurrentUserDep,
+) -> User:
+    """Зависимост, проверяваща дали текущият автентикиран потребител притежава администраторска роля (admin)."""
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "FORBIDDEN",
+                "message": "Admin privileges required",
+            },
+        )
+    return current_user
+
+
+AdminUserDep = Annotated[User, Depends(require_admin)]

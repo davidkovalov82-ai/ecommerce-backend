@@ -215,6 +215,24 @@ def test_get_current_user_missing_required_claims_and_invalid_sub() -> None:
     assert r2.status_code == 401
     assert r2.json()["detail"]["code"] == "INVALID_TOKEN"
 
+    # Липсващ iat
+    t_no_iat = jwt.encode(
+        {"sub": "1", "exp": now + 900}, settings.jwt_secret, algorithm="HS256"
+    )
+    r_no_iat = client.get("/users/me", headers={"Authorization": f"Bearer {t_no_iat}"})
+    assert r_no_iat.status_code == 401
+    assert r_no_iat.json()["detail"]["code"] == "INVALID_TOKEN"
+
+    # Липсващ iat
+    t_no_iat = jwt.encode(
+        {"sub": "1", "exp": now + 900}, settings.jwt_secret, algorithm="HS256"
+    )
+    r_no_iat = client.get(
+        "/users/me", headers={"Authorization": f"Bearer {t_no_iat}"}
+    )
+    assert r_no_iat.status_code == 401
+    assert r_no_iat.json()["detail"]["code"] == "INVALID_TOKEN"
+
     # Невалиден sub формат (буквен низ)
     t_bad_sub = jwt.encode(
         {"sub": "not-an-int", "iat": now, "exp": now + 900},
@@ -270,3 +288,29 @@ def test_password_and_hash_never_leaked_in_login_errors() -> None:
     )
     assert res_malformed.status_code == 422
     assert secret not in res_malformed.text
+
+
+def test_token_with_unsupported_algorithm_rejected() -> None:
+    """Токен, подписан с HS384, се отхвърля при разрешен само HS256."""
+    now = int(datetime.now(UTC).timestamp())
+    token_hs384 = jwt.encode(
+        {"sub": "1", "iat": now, "exp": now + 900},
+        settings.jwt_secret,
+        algorithm="HS384",
+    )
+    res = client.get("/users/me", headers={"Authorization": f"Bearer {token_hs384}"})
+    assert res.status_code == 401
+    assert res.headers.get("WWW-Authenticate") == "Bearer"
+    assert res.json()["detail"]["code"] == "INVALID_TOKEN"
+
+
+def test_create_access_token_exact_duration_900_seconds() -> None:
+    """exp - iat е точно 900 секунди (15 минути) при стандартната конфигурация."""
+    token = create_access_token(user_id=42, secret=settings.jwt_secret)
+    decoded = jwt.decode(
+        token,
+        settings.jwt_secret,
+        algorithms=["HS256"],
+        options={"verify_signature": True},
+    )
+    assert decoded["exp"] - decoded["iat"] == 900

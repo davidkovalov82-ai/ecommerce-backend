@@ -55,13 +55,10 @@ def setup_test_database() -> Generator[None]:
         conn.execute(text(f"CREATE DATABASE {TEST_DB_NAME}"))
 
     # 2. Изпълняваме реалните Alembic миграции до последната (head)
+    # Последната миграция автоматично синхронизира sequence-а на products с id=1
     alembic_cfg = Config("alembic.ini")
     alembic_cfg.set_main_option("sqlalchemy.url", TEST_DATABASE_URL)
     command.upgrade(alembic_cfg, "head")
-
-    # 3. Синхронизираме sequence след първата миграция, която вече вмъква id=1
-    with test_engine.begin() as conn:
-        _sync_products_sequence(conn)
 
     yield
 

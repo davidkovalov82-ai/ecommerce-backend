@@ -40,7 +40,7 @@
 
 ```bash
 # Клонирайте хранилището и стартирайте контейнерите
-docker compose up --build
+docker compose --env-file services/commerce/.env up --build
 ```
 
 Compose автоматично:
@@ -59,11 +59,11 @@ Compose автоматично:
    # ВАЖНО: Не използвайте 'down -v' или '--volumes', ако искате да запазите данните!
    docker rm -f commerce-db commerce-api
    # или ако сте в services/commerce:
-   docker compose down
+   docker compose --env-file services/commerce/.env down
    ```
 2. Стартирайте приложението от корена:
    ```bash
-   docker compose up -d
+   docker compose --env-file services/commerce/.env up -d
    ```
    *Забележка:* В `compose.yaml` е конфигуриран проект `name: commerce`, което гарантира, че Docker продължава да използва същия именуван volume (`commerce_postgres_data`) без загуба на данни и без конфликти в имената на контейнерите.
 
@@ -71,9 +71,20 @@ Compose автоматично:
 За да заредите 100 примерни продукта в работещия контейнер:
 
 ```bash
-docker compose exec api python scripts/seed_products.py
+docker compose --env-file services/commerce/.env exec api python scripts/seed_products.py
 ```
 *Забележка: Скриптът е идемпотентен – повторно изпълнение няма да дублира продуктите.*
+
+### Повишаване на потребител до администратор (CLI)
+Регистрацията през API създава потребители единствено с роля `customer`. Повишаването до `admin` се извършва контролирано през локална CLI команда:
+
+```bash
+# В работещия Docker контейнер:
+docker compose --env-file services/commerce/.env exec api python scripts/promote_admin.py admin@example.com
+
+# Или локално (при стартиран само Postgres):
+cd services/commerce && uv run python scripts/promote_admin.py admin@example.com
+```
 
 ### Интерактивна документация
 Отворете браузъра си на:
@@ -89,7 +100,7 @@ docker compose exec api python scripts/seed_products.py
 ### 1. Стартиране само на базата данни
 
 ```bash
-docker compose up -d db
+docker compose --env-file services/commerce/.env up -d db
 ```
 
 ### 2. Конфигуриране на средата
@@ -201,6 +212,31 @@ uv run ruff format .
   - Връща 200 с данните за продукта, ако е активен.
   - Връща 404 `PRODUCT_NOT_FOUND`, ако продуктът липсва или е деактивиран (`active: false`).
 
+- **`POST /products`** – Създаване на нов продукт (само за администратори):
+  - Изисква хедър: `Authorization: Bearer <admin_token>`
+  - Тяло на заявката:
+    ```json
+    {
+      "title": "Ergonomic Mechanical Keyboard",
+      "price_minor": 12999,
+      "currency": "EUR",
+      "stock": 25,
+      "active": true
+    }
+    ```
+  - Изисквания към полетата:
+    - `title`: низ от 1 до 255 символа (външните интервали се премахват автоматично).
+    - `price_minor`: строго цяло неотрицателно число (от 0 до 2 147 483 647).
+    - `currency`: само `EUR`.
+    - `stock`: строго цяло неотрицателно число (от 0 до 2 147 483 647).
+    - `active`: boolean, по подразбиране `true`.
+    - Забранени са всякакви непознати полета, включително подаване на ръчно `id`.
+  - Отговори:
+    - `201 Created`: връща създадения продукт със системно генерирано `id`.
+    - `401 Unauthorized`: при липсващ или невалиден Bearer токен.
+    - `403 Forbidden` (`detail.code = "FORBIDDEN"`): при заявка от клиент (`customer`).
+    - `422 Unprocessable Entity`: при нарушаване на типовете или ограниченията.
+
 ### 2. Потребителски профили и автентикация (Accounts & Auth)
 
 - **`POST /users`** – Регистрация на нов клиент:
@@ -267,56 +303,75 @@ uv run ruff format .
 
 ## Демонстрация чрез cURL и Swagger UI
 
-### 1. Пълен цикъл за автентикация (Registration -> Login -> Profile)
+### 1. Пълен цикъл за администратор (Registration -> Promote -> Login -> Create Product -> View Product)
 
-#### Стъпка 1: Регистрация на нов потребител
+#### Стъпка 1: Регистрация на нов потребител (създава се като customer)
 ```bash
 curl -X POST http://localhost:8000/users \
   -H "Content-Type: application/json" \
-  -d '{"email": "alex@example.com", "password": "SuperSecretPassphrase123!"}'
+  -d '{"email": "manager@example.com", "password": "SuperSecretPassphrase123!"}'
 ```
 
-#### Стъпка 2: Вход в системата (Login) и получаване на токен
+#### Стъпка 2: Локално повишаване до роля `admin` през CLI
 ```bash
-curl -X POST http://localhost:8000/auth/login \
+# В работещия контейнер:
+docker compose --env-file services/commerce/.env exec api python scripts/promote_admin.py manager@example.com
+
+# Или локално:
+cd services/commerce && uv run python scripts/promote_admin.py manager@example.com
+```
+
+#### Стъпка 3: Вход в системата (Login) и получаване на JWT токен
+```bash
+ADMIN_TOKEN=$(curl -s -X POST http://localhost:8000/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email": "alex@example.com", "password": "SuperSecretPassphrase123!"}'
-```
-*Примерен отговор:*
-```json
-{
-  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwiaWF0IjoxNzM...",
-  "token_type": "bearer"
-}
+  -d '{"email": "manager@example.com", "password": "SuperSecretPassphrase123!"}' \
+  | grep -o '"access_token":"[^"]*' | cut -d'"' -f4)
+
+echo "Admin Token: $ADMIN_TOKEN"
 ```
 
-#### Стъпка 3: Достъп до защитения крайпът `GET /users/me`
-Запазете токена в променлива или го подайте директно:
+#### Стъпка 4: Създаване на нов продукт (`POST /products`)
 ```bash
-TOKEN="<вашият_access_token>"
-
-curl -X GET http://localhost:8000/users/me \
-  -H "Authorization: Bearer $TOKEN"
+curl -i -X POST http://localhost:8000/products \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{
+    "title": "Ergonomic Mechanical Keyboard RGB",
+    "price_minor": 14999,
+    "currency": "EUR",
+    "stock": 15,
+    "active": true
+  }'
 ```
-*Връща:*
+*Връща `201 Created` с автоматично генерирано `id` (напр. `2`).*
+
+#### Стъпка 5: Преглед на създадения продукт (`GET /products/{id}`)
+```bash
+curl -X GET http://localhost:8000/products/2
+```
+*Връща `200 OK`:*
 ```json
 {
-  "id": 1,
-  "email": "alex@example.com",
-  "role": "customer"
+  "id": 2,
+  "title": "Ergonomic Mechanical Keyboard RGB",
+  "price_minor": 14999,
+  "currency": "EUR",
+  "stock": 15,
+  "active": true
 }
 ```
 
 ### 2. Използване през Swagger UI (`/docs`)
 
 1. Отворете [http://localhost:8000/docs](http://localhost:8000/docs).
-2. Изпълнете `POST /auth/login` с вашите данни и копирайте върнатия `access_token`.
+2. Изпълнете `POST /auth/login` с данни на администратор и копирайте върнатия `access_token`.
 3. Натиснете бутона **Authorize** (горе вдясно с катинарчето).
-4. В полето **Value** поставете копирания токен (Swagger UI автоматично управлява `Bearer` префикса чрез конфигурираната `HTTPBearer` схема).
+4. В полето **Value** поставете копирания токен (Swagger UI автоматично добавя `Bearer ` префикса).
 5. Натиснете **Authorize**, след което **Close**.
-6. Вече можете да извиквате `GET /users/me` директно от интерфейса.
+6. Вече можете да извиквате `POST /products` и `GET /users/me` директно от интерфейса.
 
-### 3. Работа с каталога
+### 3. Работа с публичния каталог
 ```bash
 # Извличане на продукти с пагинация:
 curl "http://localhost:8000/products?limit=5&offset=0"
@@ -329,8 +384,10 @@ curl "http://localhost:8000/products/1"
 
 ## Архитектурни бележки и технически ограничения
 
+- **Администраторски контрол**: `POST /products` е достъпен единствено за потребители с роля `admin`. Потребители с роля `customer` получават `403 FORBIDDEN` (`detail.code = "FORBIDDEN"`). Операциите `PATCH` и `DELETE` за продукти съзнателно **не са** част от тази учебна стъпка.
+- **Синхронизиране на ID Sequence**: Чрез миграцията `4af78c666cf2` PostgreSQL sequence-ът се синхронизира автоматично с максималното съществуващо ID. Новите продукти получават автоматични ID-та без ръчна намеса и без необходимост от `setval` при всяка HTTP заявка.
 - **Кратковременни токени**: Access токенът е валиден 15 минути. В тази стъпка нарочно **не са** включени refresh tokens или списък за оттегляне (token revocation / denylist), за да се запази архитектурата проста и без излишен овърхед.
-- **Stateless проверка**: Токенът се проверява криптографски с HMAC-SHA256 (`HS256`). Потребителският запис се зарежда директно от базата данни при всяка защитена заявка, гарантирайки актуалност на статуса и ролята.
+- **Stateless проверка с актуалност от БД**: Токенът се проверява криптографски с HMAC-SHA256 (`HS256`). Потребителският запис се зарежда директно от базата данни при всяка защитена заявка, което гарантира, че незабавно се отчита всяка промяна на ролята дори със съществуващ токен.
 - **Изисквания за продукционна среда**:
   - **HTTPS/TLS**: Задължително е целият трафик да минава през криптиран HTTPS канал за предпазване на bearer токените и паролите при пренос по мрежата.
   - **Rate Limiting**: За крайния път `/auth/login` е задължително налагането на ограничение на броя опити (rate limiting срещу brute-force и credential stuffing атаки) преди публично внедряване.

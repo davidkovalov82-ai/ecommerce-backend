@@ -26,3 +26,9 @@ class ProductRepository:
             .offset(offset)
         )
         return self._session.scalars(stmt).all()
+
+    def create(self, product: Product) -> Product:
+        """Добавя продукт в текущата сесия и прави flush, за да получи автоматично генерирано ID."""
+        self._session.add(product)
+        self._session.flush()
+        return product

@@ -1,10 +1,32 @@
 from fastapi import APIRouter, HTTPException, Query, status
 
+from app.modules.accounts.dependencies import AdminUserDep
 from app.modules.catalog.dependencies import CatalogServiceDep
-from app.modules.catalog.schemas import ProductListResponse, ProductResponse
+from app.modules.catalog.schemas import (
+    ProductCreateRequest,
+    ProductListResponse,
+    ProductResponse,
+)
 from app.modules.catalog.service import ProductNotFound
 
 router = APIRouter(prefix="/products", tags=["catalog"])
+
+
+@router.post("", response_model=ProductResponse, status_code=status.HTTP_201_CREATED)
+def create_product(
+    data: ProductCreateRequest,
+    catalog_service: CatalogServiceDep,
+    _: AdminUserDep,
+) -> ProductResponse:
+    """HTTP обработчик за създаване на нов продукт (само за администратори)."""
+    product = catalog_service.create_product(
+        title=data.title,
+        price_minor=data.price_minor,
+        currency=data.currency,
+        stock=data.stock,
+        active=data.active,
+    )
+    return ProductResponse.model_validate(product)
 
 
 @router.get("", response_model=ProductListResponse)

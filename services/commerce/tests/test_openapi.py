@@ -18,10 +18,12 @@ def test_openapi_registered_operations() -> None:
     schema = response.json()
     paths = schema.get("paths", {})
 
-    # 1. GET /products
+    # 1. GET & POST /products
     assert "/products" in paths
     assert "get" in paths["/products"]
     assert paths["/products"]["get"]["operationId"] is not None
+    assert "post" in paths["/products"]
+    assert paths["/products"]["post"]["operationId"] is not None
 
     # 2. GET /products/{product_id}
     assert "/products/{product_id}" in paths
