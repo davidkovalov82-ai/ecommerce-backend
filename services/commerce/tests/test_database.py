@@ -25,15 +25,19 @@ def test_database_connection_select_one() -> None:
 def test_database_class_lifecycle() -> None:
     """Проверка на методите на новия Database клас (engine, session, close)."""
     custom_db = Database(settings.database_url, pool_pre_ping=True)
-    assert custom_db.engine is not None
+    try:
+        assert custom_db.engine is not None
 
-    with custom_db.session() as s:
-        result = s.execute(text("SELECT 1")).scalar()
-        assert result == 1
+        with custom_db.session() as s:
+            result = s.execute(text("SELECT 1")).scalar()
+            assert result == 1
 
-    with patch.object(custom_db._engine, "dispose") as mock_dispose:
+        with patch.object(custom_db._engine, "dispose") as mock_dispose:
+            custom_db.close()
+            assert mock_dispose.call_count == 1
+    finally:
+        # Реално освобождаване на connection pool-а след приключване на теста
         custom_db.close()
-        assert mock_dispose.call_count == 1
 
 
 def test_db_session_lifecycle_closes_on_success() -> None:
@@ -83,4 +87,16 @@ async def test_fastapi_lifespan_closes_db() -> None:
     with patch("app.main.db.close") as mock_close:
         async with lifespan(app):
             pass
+        assert mock_close.call_count == 1
+
+
+@pytest.mark.anyio
+async def test_fastapi_lifespan_closes_db_on_exception() -> None:
+    """Проверка, че FastAPI lifespan извиква db.close() дори при изключение вътре в контекста."""
+    from app.main import app, lifespan
+
+    with patch("app.main.db.close") as mock_close:
+        with pytest.raises(RuntimeError, match="Lifespan test exception"):
+            async with lifespan(app):
+                raise RuntimeError("Lifespan test exception")
         assert mock_close.call_count == 1

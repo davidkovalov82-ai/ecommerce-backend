@@ -2,10 +2,6 @@
 trigger: always_on
 ---
 
----
-trigger: always_on
----
-
 Това е учебен e-commerce backend. Целта е да разбирам
 и самостоятелно да реализирам всяка функция.
 

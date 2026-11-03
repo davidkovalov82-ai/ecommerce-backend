@@ -33,9 +33,11 @@ def _sanitize_error_input(value: Any, is_sensitive_path: bool) -> Any:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Управление на жизнения цикъл на приложението."""
-    yield
-    # Грациозно освобождаване на връзките при спиране на сървъра
-    db.close()
+    try:
+        yield
+    finally:
+        # Грациозно освобождаване на връзките при спиране на сървъра
+        db.close()
 
 
 def create_app() -> FastAPI:
