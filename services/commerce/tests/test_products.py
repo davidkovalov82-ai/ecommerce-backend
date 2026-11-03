@@ -601,3 +601,51 @@ def test_role_change_in_db_recognized_with_existing_token(
         headers={"Authorization": f"Bearer {token}"},
     )
     assert res_after.status_code == 201
+
+
+def test_role_revocation_in_db_recognized_with_existing_token(
+    db_session: Session,
+) -> None:
+    """Отнемане на права (admin -> customer в БД): същият токен получава 403 при POST /products и не се създава продукт."""
+    user, token = _create_user_with_role(
+        db_session, "demoted_later@example.com", "admin"
+    )
+
+    # 1. Докато е admin, заявката е успешна
+    res_before = client.post(
+        "/products",
+        json={
+            "title": "Admin Initial Product",
+            "price_minor": 100,
+            "currency": "EUR",
+            "stock": 1,
+            "active": True,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert res_before.status_code == 201
+
+    # 2. Отнемаме правата директно в базата данни (admin -> customer)
+    user.role = "customer"
+    db_session.commit()
+
+    # 3. Със СЪЩИЯ токен вече получава 403 FORBIDDEN
+    res_after = client.post(
+        "/products",
+        json={
+            "title": "Blocked Customer Product",
+            "price_minor": 100,
+            "currency": "EUR",
+            "stock": 1,
+            "active": True,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert res_after.status_code == 403
+    assert res_after.json()["detail"]["code"] == "FORBIDDEN"
+
+    # 4. Проверяваме, че продуктът не е създаден в БД
+    blocked_product = db_session.execute(
+        text("SELECT id FROM products WHERE title = 'Blocked Customer Product'")
+    ).scalar()
+    assert blocked_product is None

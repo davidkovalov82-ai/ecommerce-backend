@@ -36,10 +36,35 @@
 
 ## Бърз старт с Docker Compose
 
-Най-лесният начин да стартирате цялото приложение (PostgreSQL + Commerce API) е чрез Docker Compose:
+> [!IMPORTANT]
+> Всички Docker Compose команди трябва да се изпълняват от **корена на хранилището**.
+
+### 1. Подготовка на средата и генериране на JWT_SECRET
+
+Преди първоначалното стартиране на контейнерите е необходимо да подготвите `.env` файла (ако все още не съществува) и да генерирате сигурен таен ключ за JWT токените.
+
+Копирайте примерната конфигурация **без да презаписвате** съществуващ `.env` файл:
+```bash
+test -f services/commerce/.env || cp services/commerce/.env.example services/commerce/.env
+```
+
+Генерирайте сигурен таен ключ (поне 32 байта):
+```bash
+# Пример чрез Python secrets:
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+# или чрез openssl:
+openssl rand -hex 32
+```
+
+Отворете `services/commerce/.env` и попълнете генерирания ключ срещу `JWT_SECRET`:
+```env
+JWT_SECRET=вашият_генериран_ключ_поне_32_байта
+```
+*(Забележка: няма работеща стойност по подразбиране – задаването на непразен ключ от поне 32 байта е задължително).*
+
+### 2. Стартиране на контейнерите (от корена на хранилището)
 
 ```bash
-# Клонирайте хранилището и стартирайте контейнерите
 docker compose --env-file services/commerce/.env up --build
 ```
 
@@ -58,17 +83,17 @@ Compose автоматично:
    ```bash
    # ВАЖНО: Не използвайте 'down -v' или '--volumes', ако искате да запазите данните!
    docker rm -f commerce-db commerce-api
-   # или ако сте в services/commerce:
-   docker compose --env-file services/commerce/.env down
+   # или ако се намирате в services/commerce (използвайки локалния .env път):
+   docker compose --env-file .env down
    ```
-2. Стартирайте приложението от корена:
+2. Стартирайте приложението от **корена на хранилището**:
    ```bash
    docker compose --env-file services/commerce/.env up -d
    ```
    *Забележка:* В `compose.yaml` е конфигуриран проект `name: commerce`, което гарантира, че Docker продължава да използва същия именуван volume (`commerce_postgres_data`) без загуба на данни и без конфликти в имената на контейнерите.
 
 ### Зареждане на демонстрационни данни (Seeding)
-За да заредите 100 примерни продукта в работещия контейнер:
+За да заредите 100 примерни продукта в работещия контейнер (от корена на хранилището):
 
 ```bash
 docker compose --env-file services/commerce/.env exec api python scripts/seed_products.py
@@ -79,7 +104,7 @@ docker compose --env-file services/commerce/.env exec api python scripts/seed_pr
 Регистрацията през API създава потребители единствено с роля `customer`. Повишаването до `admin` се извършва контролирано през локална CLI команда:
 
 ```bash
-# В работещия Docker контейнер:
+# В работещия Docker контейнер (от корена на хранилището):
 docker compose --env-file services/commerce/.env exec api python scripts/promote_admin.py admin@example.com
 
 # Или локално (при стартиран само Postgres):
@@ -97,28 +122,19 @@ cd services/commerce && uv run python scripts/promote_admin.py admin@example.com
 
 Ако разработвате локално с Python и `uv`:
 
-### 1. Стартиране само на базата данни
+### 1. Конфигуриране на средата и генериране на JWT_SECRET
 
+Първо подгответе `.env` файла, **без да презаписвате** съществуващ:
 ```bash
-docker compose --env-file services/commerce/.env up -d db
+test -f services/commerce/.env || cp services/commerce/.env.example services/commerce/.env
 ```
 
-### 2. Конфигуриране на средата
-
-Копирайте примерния файл с настройки:
+Генерирайте сигурен таен ключ (поне 32 байта):
 ```bash
-cp services/commerce/.env.example services/commerce/.env
-```
-
-Генерирайте сигурен таен ключ (поне 32 байта) за подписване на JWT токените:
-```bash
-# Пример чрез Python secrets:
 python3 -c "import secrets; print(secrets.token_urlsafe(32))"
-# или чрез openssl:
-openssl rand -hex 32
 ```
 
-Попълнете стойността в `services/commerce/.env`:
+Попълнете стойностите в `services/commerce/.env`:
 ```env
 DB_HOST=localhost
 DB_PORT=5432
@@ -126,8 +142,14 @@ DB_USER=commerce
 DB_PASSWORD=commerce
 DB_NAME=commerce
 
-# Задължително: поне 32 байта таен ключ за JWT (няма работеща стойност по подразбиране в прод)
-JWT_SECRET=your_generated_random_secret_at_least_32_bytes_long
+# Задължително: поне 32 байта таен ключ за JWT (няма работеща стойност по подразбиране)
+JWT_SECRET=вашият_генериран_ключ_поне_32_байта
+```
+
+### 2. Стартиране само на базата данни (от корена на хранилището)
+
+```bash
+docker compose --env-file services/commerce/.env up -d db
 ```
 
 ### 3. Инсталиране на зависимостите
@@ -314,26 +336,24 @@ curl -X POST http://localhost:8000/users \
 
 #### Стъпка 2: Локално повишаване до роля `admin` през CLI
 ```bash
-# В работещия контейнер:
+# В работещия контейнер (изпълнява се от корена на хранилището):
 docker compose --env-file services/commerce/.env exec api python scripts/promote_admin.py manager@example.com
 
 # Или локално:
 cd services/commerce && uv run python scripts/promote_admin.py manager@example.com
 ```
 
-#### Стъпка 3: Вход в системата (Login) и получаване на JWT токен
+#### Стъпка 3: Вход в системата (Login) и извличане на JWT токен чрез JSON парсер
 ```bash
 ADMIN_TOKEN=$(curl -s -X POST http://localhost:8000/auth/login \
   -H "Content-Type: application/json" \
   -d '{"email": "manager@example.com", "password": "SuperSecretPassphrase123!"}' \
-  | grep -o '"access_token":"[^"]*' | cut -d'"' -f4)
-
-echo "Admin Token: $ADMIN_TOKEN"
+  | python3 -c "import sys, json; print(json.load(sys.stdin)['access_token'])")
 ```
 
-#### Стъпка 4: Създаване на нов продукт (`POST /products`)
+#### Стъпка 4: Създаване на нов продукт (`POST /products`) и извличане на реалното ID
 ```bash
-curl -i -X POST http://localhost:8000/products \
+CREATE_RESPONSE=$(curl -s -X POST http://localhost:8000/products \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -d '{
@@ -342,15 +362,17 @@ curl -i -X POST http://localhost:8000/products \
     "currency": "EUR",
     "stock": 15,
     "active": true
-  }'
-```
-*Връща `201 Created` с автоматично генерирано `id` (напр. `2`).*
+  }')
 
-#### Стъпка 5: Преглед на създадения продукт (`GET /products/{id}`)
-```bash
-curl -X GET http://localhost:8000/products/2
+# Извличаме реалното ID, генерирано от базата данни:
+PRODUCT_ID=$(echo "$CREATE_RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin)['id'])")
 ```
-*Връща `200 OK`:*
+
+#### Стъпка 5: Преглед на създадения продукт по реалното ID (`GET /products/{id}`)
+```bash
+curl -X GET "http://localhost:8000/products/$PRODUCT_ID"
+```
+*Връща `200 OK` с данните за новосъздадения продукт:*
 ```json
 {
   "id": 2,

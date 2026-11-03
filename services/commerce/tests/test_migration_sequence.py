@@ -60,4 +60,3 @@ def test_migration_head_syncs_sequence_for_automatic_ids() -> None:
         with admin_engine.connect() as conn:
             conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
         admin_engine.dispose()
-
