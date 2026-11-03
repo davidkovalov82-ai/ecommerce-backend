@@ -1,9 +1,12 @@
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from app.db import db
 from app.modules.accounts.api import router as accounts_router
 from app.modules.catalog.api import router as catalog_router
 
@@ -27,12 +30,21 @@ def _sanitize_error_input(value: Any, is_sensitive_path: bool) -> Any:
     return value
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+    """Управление на жизнения цикъл на приложението."""
+    yield
+    # Грациозно освобождаване на връзките при спиране на сървъра
+    db.close()
+
+
 def create_app() -> FastAPI:
     """Фабрична функция за създаване и конфигуриране на приложението."""
     app = FastAPI(
         title="Commerce API",
         version="0.1.0",
         docs_url="/docs",
+        lifespan=lifespan,
     )
 
     @app.exception_handler(RequestValidationError)

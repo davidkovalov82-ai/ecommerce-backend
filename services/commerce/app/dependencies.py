@@ -4,9 +4,7 @@ from typing import Annotated
 from fastapi import Depends
 from sqlalchemy.orm import Session
 
-from app.db import SessionLocal
-
-# also need to be in the class
+from app.db import db
 
 
 def get_db_session() -> Generator[Session]:
@@ -15,11 +13,8 @@ def get_db_session() -> Generator[Session]:
     Създава нова сесия за всяка HTTP заявка и гарантира затварянето ѝ
     независимо от изхода на заявката (успех или грешка).
     """
-    session = SessionLocal()
-    try:
+    with db.session() as session:
         yield session
-    finally:
-        session.close()
 
 
 # Type alias за удобна употреба в обработчиците
