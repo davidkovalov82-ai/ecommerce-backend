@@ -37,6 +37,29 @@ def test_get_missing_product() -> None:
     }
 
 
+def test_get_inactive_product_returns_404(db_session: Session) -> None:
+    """Публичният детайл по ID връща 404 за неактивен продукт."""
+    inactive_product = Product(
+        title="Archived Old Product",
+        price_minor=1999,
+        currency="EUR",
+        stock=0,
+        active=False,
+    )
+    db_session.add(inactive_product)
+    db_session.commit()
+    db_session.refresh(inactive_product)
+
+    response = client.get(f"/products/{inactive_product.id}")
+    assert response.status_code == 404
+    assert response.json() == {
+        "detail": {
+            "code": "PRODUCT_NOT_FOUND",
+            "message": "Product not found",
+        }
+    }
+
+
 def test_get_invalid_product_id() -> None:
     """Критерий 3: GET /products/abc връща 422 Unprocessable Entity."""
     response = client.get("/products/abc")

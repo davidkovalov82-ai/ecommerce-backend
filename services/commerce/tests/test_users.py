@@ -228,6 +228,43 @@ def test_password_and_hash_never_leaked_in_responses() -> None:
     assert short_secret not in res_err.text
     assert "password_hash" not in res_err.text
 
+    # При липсващ email, но подадена парола
+    missing_email_pass = "super_secret_provided_pass_123"
+    res_missing_email = client.post(
+        "/users",
+        json={"password": missing_email_pass},
+    )
+    assert res_missing_email.status_code == 422
+    assert missing_email_pass not in res_missing_email.text
+
+    # При грешна структура на JSON (подаден стринг вместо обект)
+    raw_str_pass = "raw_secret_string_pass_123"
+    res_raw_str = client.post(
+        "/users",
+        json=raw_str_pass,
+    )
+    assert res_raw_str.status_code == 422
+    assert raw_str_pass not in res_raw_str.text
+
+    # При грешна структура на JSON (подаден списък с парола)
+    list_pass = "list_secret_pass_12345"
+    res_list = client.post(
+        "/users",
+        json=[{"password": list_pass}],
+    )
+    assert res_list.status_code == 422
+    assert list_pass not in res_list.text
+
+    # При невалиден JSON синтаксис с парола в тялото
+    malformed_pass = "malformed_json_secret_123"
+    res_malformed = client.post(
+        "/users",
+        content=f'{{"password": "{malformed_pass}",',
+        headers={"Content-Type": "application/json"},
+    )
+    assert res_malformed.status_code == 422
+    assert malformed_pass not in res_malformed.text
+
     # При успешен отговор
     res_ok = client.post(
         "/users",

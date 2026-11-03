@@ -15,12 +15,12 @@ class CatalogService:
         self._product_repository = product_repository
 
     def get_product_by_id(self, product_id: int) -> Product:
-        """Сценарий: намиране на продукт по ID.
+        """Сценарий: намиране на активен продукт по ID.
 
-        Хвърля ProductNotFound, ако продуктът липсва в базата данни.
+        Хвърля ProductNotFound, ако продуктът липсва в базата данни или не е активен.
         """
         product = self._product_repository.get_by_id(product_id)
-        if product is None:
+        if product is None or not product.active:
             raise ProductNotFound(f"Product with id {product_id} not found")
         return product
 

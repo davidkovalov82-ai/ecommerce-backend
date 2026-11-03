@@ -95,6 +95,12 @@ def seed(session: Session) -> int:
     existing_count = session.scalar(select(func.count(Product.id))) or 0
     print(f"Текущ брой продукти в базата: {existing_count}")
 
+    if existing_count > 1:
+        print(
+            "Базата данни вече съдържа демонстрационни продукти. Пропускане на зареждането."
+        )
+        return 0
+
     products = generate_100_products()
     added = 0
     for data in products:
