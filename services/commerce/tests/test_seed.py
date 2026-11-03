@@ -23,3 +23,4 @@ def test_seed_products_idempotent(db_session: Session) -> None:
 
     count_after_second = db_session.scalar(select(func.count(Product.id))) or 0
     assert count_after_second == count_after_first
+
