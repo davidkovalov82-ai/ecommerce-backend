@@ -21,11 +21,6 @@ class UserRepository:
 
     def lock_by_id(self, user_id: int) -> User | None:
         """Заключва реда на потребителя с FOR NO KEY UPDATE за синхронизация."""
-        stmt = select(User).where(User.id == user_id).with_for_update(key_share=True)
-        return self._session.scalars(stmt).first()
-
-    def lock_by_id(self, user_id: int) -> User | None:
-        """Заключва реда на потребителя с FOR NO KEY UPDATE за синхронизация."""
         stmt = (
             select(User)
             .where(User.id == user_id)

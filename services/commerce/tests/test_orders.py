@@ -396,36 +396,92 @@ def test_same_idempotency_key_different_users(db_session: Session) -> None:
     assert r_a.json()["id"] != r_b.json()["id"]
 
 
-def test_rollback_on_simulated_error(
+def test_late_rollback_on_simulated_error_before_commit(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Критерий: Rollback при симулирана грешка след започнали промени (не остават частични записи)."""
+    """Критерий: Симулирана грешка след създаване на поръчка, позиции, намаляване на stock и изчистване на количка (след flush, преди commit).
+
+    След rollback през отделна сесия:
+    - няма поръчка и позиции;
+    - наличността е възстановена;
+    - количката е непроменена.
+    След премахване на грешката, повторен опит със същия Idempotency-Key успява точно веднъж.
+    """
     user, token = _create_user_and_token(db_session)
     product = _create_product(db_session, stock=10, price_minor=1000)
     _add_to_cart(db_session, user.id, product.id, quantity=2)
 
-    from app.modules.orders.repository import OrderRepository
-
-    def _failing_add_item(self: OrderRepository, item: OrderItem) -> OrderItem:
-        raise RuntimeError("Simulated failure during order item persist")
-
-    monkeypatch.setattr(OrderRepository, "add_item", _failing_add_item)
-
+    idempotency_key = str(uuid.uuid4())
     headers = {
         "Authorization": f"Bearer {token}",
-        "Idempotency-Key": str(uuid.uuid4()),
+        "Idempotency-Key": idempotency_key,
     }
-    with pytest.raises(RuntimeError, match="Simulated failure"):
+
+    original_commit = Session.commit
+
+    def _failing_commit(self: Session) -> None:
+        raise RuntimeError("Simulated failure right before commit")
+
+    monkeypatch.setattr(Session, "commit", _failing_commit)
+
+    with pytest.raises(RuntimeError, match="Simulated failure right before commit"):
         client.post("/orders", json={}, headers=headers)
 
-    # Проверка след rollback: няма създадена поръчка, складът е непокътнат, количката е налична
-    db_session.expire_all()
-    assert db_session.query(Order).filter(Order.user_id == user.id).count() == 0
-    p = db_session.get(Product, product.id)
-    assert p is not None and p.stock == 10
-    cart_items = db_session.query(CartItem).filter(CartItem.user_id == user.id).all()
-    assert len(cart_items) == 1
-    assert cart_items[0].quantity == 2
+    # Проверка през НАПЪЛНО ОТДЕЛНА сесия след rollback
+    with TestingSessionLocal() as verification_session:
+        # 1. Няма поръчка и няма позиции от неуспешния опит
+        assert (
+            verification_session.query(Order).filter(Order.user_id == user.id).count()
+            == 0
+        )
+        assert verification_session.query(OrderItem).count() == 0
+
+        # 2. Наличността е възстановена на първоначалните 10
+        refreshed_p = verification_session.get(Product, product.id)
+        assert refreshed_p is not None
+        assert refreshed_p.stock == 10
+
+        # 3. Количката е непроменена (съдържа продукта с quantity=2)
+        cart_items = (
+            verification_session.query(CartItem)
+            .filter(CartItem.user_id == user.id)
+            .all()
+        )
+        assert len(cart_items) == 1
+        assert cart_items[0].product_id == product.id
+        assert cart_items[0].quantity == 2
+
+    # Премахваме симулираната грешка
+    monkeypatch.setattr(Session, "commit", original_commit)
+
+    # Повтаряме със СЪЩИЯ Idempotency-Key
+    r_retry = client.post("/orders", json={}, headers=headers)
+    assert r_retry.status_code == 201
+    order_data = r_retry.json()
+    assert order_data["status"] == "pending_payment"
+    assert order_data["total_minor"] == 2000
+    assert len(order_data["items"]) == 1
+
+    # Проверка през отделна сесия, че поръчката е създадена точно веднъж
+    with TestingSessionLocal() as verification_session:
+        assert (
+            verification_session.query(Order).filter(Order.user_id == user.id).count()
+            == 1
+        )
+        refreshed_p2 = verification_session.get(Product, product.id)
+        assert refreshed_p2 is not None
+        assert refreshed_p2.stock == 8
+        assert (
+            verification_session.query(CartItem)
+            .filter(CartItem.user_id == user.id)
+            .count()
+            == 0
+        )
+
+    # Трето повторение със същия ключ -> връща същата поръчка (идемпотентност)
+    r_idempotent = client.post("/orders", json={}, headers=headers)
+    assert r_idempotent.status_code == 201
+    assert r_idempotent.json()["id"] == order_data["id"]
 
 
 # ============================================================================
@@ -709,8 +765,26 @@ def test_concurrent_checkouts_same_cart_different_keys(
     assert db_session.query(Order).filter(Order.user_id == user.id).count() == 1
 
 
-def test_parallel_checkout_and_cart_modification(db_session: Session) -> None:
-    """Критерий: Паралелен checkout и промяна на количката се сериализират от общата DB блокировка на потребителя."""
+@pytest.mark.parametrize("scenario", ["put_first", "checkout_first"])
+def test_parallel_checkout_and_cart_modification(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    """Критерий: Паралелен checkout и промяна на количката се сериализират от общата DB блокировка на потребителя.
+
+    Доказва, че никога не се губят позиции при нито един от двата реда на изпълнение:
+    А) PUT се изпълнява преди checkout:
+       - p2 присъства в поръчката с quantity=3;
+       - p2 липсва от количката;
+       - stock на p2 е 7.
+    Б) Checkout се изпълнява преди PUT:
+       - p2 липсва от поръчката;
+       - p2 остава в количката с quantity=3;
+       - stock на p2 е 10.
+    И в двата случая:
+       - p1 присъства в поръчката с quantity=1 и stock на p1 е 9;
+       - p2 не липсва и от поръчката, и от количката;
+       - няма дублиране на позиции.
+    """
     user, token = _create_user_and_token(db_session)
     p1 = _create_product(db_session, stock=10, price_minor=1000)
     p2 = _create_product(db_session, stock=10, price_minor=2000)
@@ -725,22 +799,50 @@ def test_parallel_checkout_and_cart_modification(db_session: Session) -> None:
     original_override = app.dependency_overrides.get(get_db_session)
     app.dependency_overrides[get_db_session] = _timed_db
 
-    barrier = threading.Barrier(2)
+    put_locked = threading.Event()
+    checkout_started = threading.Event()
+    checkout_locked = threading.Event()
+    put_started = threading.Event()
+
+    from app.modules.accounts.repository import UserRepository
+
+    original_lock_by_id = UserRepository.lock_by_id
+
+    def _sync_lock_by_id(self: UserRepository, user_id: int):
+        user_row = original_lock_by_id(self, user_id)
+        current_name = threading.current_thread().name
+        if scenario == "put_first" and current_name == "put_worker":
+            put_locked.set()
+            checkout_started.wait(timeout=5.0)
+        elif scenario == "checkout_first" and current_name == "checkout_worker":
+            checkout_locked.set()
+            put_started.wait(timeout=5.0)
+        return user_row
+
+    monkeypatch.setattr(UserRepository, "lock_by_id", _sync_lock_by_id)
+
+    idempotency_key = str(uuid.uuid4())
 
     def _do_checkout() -> int:
-        barrier.wait(timeout=5.0)
+        threading.current_thread().name = "checkout_worker"
+        if scenario == "put_first":
+            put_locked.wait(timeout=5.0)
+            checkout_started.set()
         r = client.post(
             "/orders",
             json={},
             headers={
                 "Authorization": f"Bearer {token}",
-                "Idempotency-Key": str(uuid.uuid4()),
+                "Idempotency-Key": idempotency_key,
             },
         )
         return r.status_code
 
     def _do_cart_put() -> int:
-        barrier.wait(timeout=5.0)
+        threading.current_thread().name = "put_worker"
+        if scenario == "checkout_first":
+            checkout_locked.wait(timeout=5.0)
+            put_started.set()
         r = client.put(
             f"/cart/items/{p2.id}",
             json={"quantity": 3},
@@ -760,13 +862,59 @@ def test_parallel_checkout_and_cart_modification(db_session: Session) -> None:
         else:
             app.dependency_overrides.pop(get_db_session, None)
 
-    # И двете операции са завършили успешно благодарение на сериализацията
     assert checkout_status == 201
     assert cart_status == 200
 
-    db_session.expire_all()
-    # Поръчката съществува
-    assert db_session.query(Order).filter(Order.user_id == user.id).count() == 1
+    # Проверка през отделна чиста сесия
+    with TestingSessionLocal() as session:
+        order = session.query(Order).filter(Order.user_id == user.id).one()
+        order_items_by_pid = {item.product_id: item for item in order.items}
+        cart_items_by_pid = {
+            item.product_id: item
+            for item in session.query(CartItem)
+            .filter(CartItem.user_id == user.id)
+            .all()
+        }
+        refreshed_p1 = session.get(Product, p1.id)
+        refreshed_p2 = session.get(Product, p2.id)
+
+        assert refreshed_p1 is not None
+        assert refreshed_p2 is not None
+
+        # Проверка на p1 (винаги е в поръчката с quantity=1, а наличността му става 9)
+        assert p1.id in order_items_by_pid
+        assert order_items_by_pid[p1.id].quantity == 1
+        assert refreshed_p1.stock == 9
+        assert p1.id not in cart_items_by_pid
+
+        p2_in_order = p2.id in order_items_by_pid
+        p2_in_cart = p2.id in cart_items_by_pid
+
+        # Доказваме, че p2 не липсва и от поръчката, и от количката!
+        assert p2_in_order or p2_in_cart
+        # И че не се дублира едновременно в двете
+        assert not (p2_in_order and p2_in_cart)
+
+        if scenario == "put_first":
+            # А) PUT се изпълнява преди checkout:
+            # - p2 присъства в поръчката с quantity=3;
+            # - p2 липсва от количката;
+            # - stock на p2 е 7.
+            assert p2_in_order
+            assert not p2_in_cart
+            assert order_items_by_pid[p2.id].quantity == 3
+            assert refreshed_p2.stock == 7
+            assert order.total_minor == 1 * 1000 + 3 * 2000  # 7000
+        else:
+            # Б) Checkout се изпълнява преди PUT:
+            # - p2 липсва от поръчката;
+            # - p2 остава в количката с quantity=3;
+            # - stock на p2 е 10.
+            assert not p2_in_order
+            assert p2_in_cart
+            assert cart_items_by_pid[p2.id].quantity == 3
+            assert refreshed_p2.stock == 10
+            assert order.total_minor == 1 * 1000  # 1000
 
 
 # ============================================================================

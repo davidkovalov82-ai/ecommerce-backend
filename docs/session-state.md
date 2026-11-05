@@ -1,16 +1,16 @@
 # Session State
 
-- **Текуща задача**: Реализация на завършен модул за поръчки (`orders`) с транзакционен checkout и идемпотентност.
+- **Текуща задача**: Завършване на проверките и поправките по модул `orders` върху клон `feat/orders`.
 - **Реализирано**:
-  - Alembic миграция `568b759ac3a0`: таблици `orders` и `order_items` с BigInteger суми, UNIQUE, CHECK и FK ограничения (RESTRICT/CASCADE).
-  - Модели, схеми, repository, service и API: `POST /orders`, `GET /orders`, `GET /orders/{order_id}`.
-  - Транзакционен протокол: `FOR NO KEY UPDATE` върху потребителя, заключване на продуктите по възходящ ID с `FOR UPDATE`, проверка на наличности, исторически snapshot, намаляване на склад, изчистване на количката и rollback при грешка.
-  - Строга идемпотентност по `Idempotency-Key` (UUID) на ниво потребител.
-  - Изчерпателни тестове в `test_orders.py` (19 теста) и `test_migration_sequence.py`, актуализирана документация в `README.md`.
+  - Отстранен дублиран метод `UserRepository.lock_by_id` (F811) със запазване на `FOR NO KEY UPDATE`.
+  - Задължителна `user_repository` зависимост в `CartService` и безусловно заключване на потребителя при PUT/DELETE.
+  - Укрепен `test_parallel_checkout_and_cart_modification` за двата реда (PUT-first и Checkout-first) без sleep; доказано запазване на позициите.
+  - Добавен тест `test_late_rollback_on_simulated_error_before_commit` с `flush()` и проверка през отделна сесия.
+  - Успешни 163 теста и пълен Ruff lint/format.
 - **Оставащи ограничения / Непроверено**:
   - Резервациите остават в `pending_payment` без автоматично изтичане (плащания и auto-expiration предстоят).
 - **Работещи команди**:
   - `cd services/commerce && uv run --locked pytest -q`
   - `cd services/commerce && uv run --locked ruff check . && uv run --locked ruff format --check .`
-- **Засегнати файлове**: `app/modules/orders/*`, `app/modules/cart/*`, `app/modules/catalog/*`, `app/modules/accounts/*`, `migrations/*`, `tests/*`, `README.md`.
-- **Следваща стъпка**: Модул за плащания и управление на жизнения цикъл на поръчката (плащане, отказ, изтичане на резервация).
+- **Засегнати файлове**: `app/modules/accounts/repository.py`, `app/modules/cart/service.py`, `app/modules/orders/service.py`, `tests/test_orders.py`, `docs/session-state.md`.
+- **Следваща стъпка**: Преглед и вливане на `feat/orders` в `main`.

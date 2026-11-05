@@ -18,13 +18,13 @@ class CartService:
         self,
         cart_repository: CartRepository,
         product_repository: ProductRepository,
+        user_repository: UserRepository,
         session: Session,
-        user_repository: UserRepository | None = None,
     ) -> None:
         self._cart_repository = cart_repository
         self._product_repository = product_repository
-        self._session = session
         self._user_repository = user_repository
+        self._session = session
 
     def get_cart(self, user_id: int) -> CartResponse:
         """Сценарий: извличане и изчисляване на текущата количка на потребител.
@@ -84,8 +84,7 @@ class CartService:
         Управлява транзакционната граница (commit/rollback).
         """
         try:
-            if self._user_repository is not None:
-                self._user_repository.lock_by_id(user_id)
+            self._user_repository.lock_by_id(user_id)
 
             product = self._product_repository.get_by_id(product_id)
             if product is None or not product.active:
@@ -113,8 +112,7 @@ class CartService:
         Идемпотентна операция. Управлява транзакционната граница (commit/rollback).
         """
         try:
-            if self._user_repository is not None:
-                self._user_repository.lock_by_id(user_id)
+            self._user_repository.lock_by_id(user_id)
 
             self._cart_repository.delete_item(user_id=user_id, product_id=product_id)
             self._session.commit()

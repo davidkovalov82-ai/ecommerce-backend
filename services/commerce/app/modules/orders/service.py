@@ -149,6 +149,9 @@ class OrderService:
             # 8. Изчистване на поръчаната количка
             self._cart_repository.clear_by_user_id(user_id)
 
+            # Гарантираме с flush, че всички промени са изпратени към БД преди commit
+            self._session.flush()
+
             # 9. Commit
             self._session.commit()
             self._session.refresh(order)

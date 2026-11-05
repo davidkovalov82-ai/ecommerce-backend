@@ -58,4 +58,3 @@ class OrderListResponse(BaseModel):
     total: int
     limit: int
     offset: int
-
