@@ -25,10 +25,12 @@ def test_openapi_registered_operations() -> None:
     assert "post" in paths["/products"]
     assert paths["/products"]["post"]["operationId"] is not None
 
-    # 2. GET /products/{product_id}
+    # 2. GET & PATCH /products/{product_id}
     assert "/products/{product_id}" in paths
     assert "get" in paths["/products/{product_id}"]
     assert paths["/products/{product_id}"]["get"]["operationId"] is not None
+    assert "patch" in paths["/products/{product_id}"]
+    assert paths["/products/{product_id}"]["patch"]["operationId"] is not None
 
     # 3. POST /users
     assert "/users" in paths

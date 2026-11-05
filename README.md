@@ -259,6 +259,27 @@ uv run ruff format .
     - `403 Forbidden` (`detail.code = "FORBIDDEN"`): при заявка от клиент (`customer`).
     - `422 Unprocessable Entity`: при нарушаване на типовете или ограниченията.
 
+- **`PATCH /products/{product_id}`** – Частично обновяване на продукт (само за администратори):
+  - Изисква хедър: `Authorization: Bearer <admin_token>`
+  - Тяло на заявката (поне едно поле е задължително):
+    ```json
+    {
+      "price_minor": 11999,
+      "active": false
+    }
+    ```
+  - Поведение:
+    - Променят се само изрично подадените полета (`title`, `price_minor`, `currency`, `stock`, `active`). Пропуснатите запазват стойностите си.
+    - Изрично `null`, празен обект `{}` и непознати полета (вкл. `id`) се отхвърлят с `422 Unprocessable Entity`.
+    - Администраторът може да редактира и неактивни продукти.
+    - При `active: false` продуктът се деактивира и веднага се скрива от публичните `GET` операции. При `active: true` се активира отново.
+  - Отговори:
+    - `200 OK`: връща актуализирания продукт с пълен `ProductResponse`.
+    - `401 Unauthorized`: при липсващ или невалиден Bearer токен.
+    - `403 Forbidden` (`detail.code = "FORBIDDEN"`): при заявка от клиент (`customer`).
+    - `404 Not Found` (`detail.code = "PRODUCT_NOT_FOUND"`): при несъществуващ продукт.
+    - `422 Unprocessable Entity`: при нарушаване на типовете, валидационните правила или празно/null тяло.
+
 ### 2. Потребителски профили и автентикация (Accounts & Auth)
 
 - **`POST /users`** – Регистрация на нов клиент:
@@ -384,6 +405,33 @@ curl -X GET "http://localhost:8000/products/$PRODUCT_ID"
 }
 ```
 
+#### Стъпка 6: Редактиране, деактивиране и повторно активиране (`PATCH /products/{id}`)
+
+Обновяване само на цената и наличността (останалите полета се запазват):
+```bash
+curl -X PATCH "http://localhost:8000/products/$PRODUCT_ID" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"price_minor": 12999, "stock": 20}'
+```
+
+Деактивиране на продукта (веднага се скрива от публичните GET заявки):
+```bash
+curl -X PATCH "http://localhost:8000/products/$PRODUCT_ID" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"active": false}'
+```
+*След това `GET /products/$PRODUCT_ID` връща `404 PRODUCT_NOT_FOUND`.*
+
+Повторно активиране:
+```bash
+curl -X PATCH "http://localhost:8000/products/$PRODUCT_ID" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"active": true}'
+```
+
 ### 2. Използване през Swagger UI (`/docs`)
 
 1. Отворете [http://localhost:8000/docs](http://localhost:8000/docs).
@@ -391,7 +439,7 @@ curl -X GET "http://localhost:8000/products/$PRODUCT_ID"
 3. Натиснете бутона **Authorize** (горе вдясно с катинарчето).
 4. В полето **Value** поставете копирания токен (Swagger UI автоматично добавя `Bearer ` префикса).
 5. Натиснете **Authorize**, след което **Close**.
-6. Вече можете да извиквате `POST /products` и `GET /users/me` директно от интерфейса.
+6. Вече можете да извиквате `POST /products`, `PATCH /products/{product_id}` и `GET /users/me` директно от интерфейса.
 
 ### 3. Работа с публичния каталог
 ```bash
@@ -406,7 +454,7 @@ curl "http://localhost:8000/products/1"
 
 ## Архитектурни бележки и технически ограничения
 
-- **Администраторски контрол**: `POST /products` е достъпен единствено за потребители с роля `admin`. Потребители с роля `customer` получават `403 FORBIDDEN` (`detail.code = "FORBIDDEN"`). Операциите `PATCH` и `DELETE` за продукти съзнателно **не са** част от тази учебна стъпка.
+- **Администраторски контрол**: `POST /products` и `PATCH /products/{product_id}` са достъпни единствено за потребители с роля `admin`. Потребители с роля `customer` получават `403 FORBIDDEN` (`detail.code = "FORBIDDEN"`). Операциите `DELETE` и `PUT` за продукти съзнателно **не са** част от тази учебна стъпка.
 - **Синхронизиране на ID Sequence**: Чрез миграцията `4af78c666cf2` PostgreSQL sequence-ът се синхронизира автоматично с максималното съществуващо ID. Новите продукти получават автоматични ID-та без ръчна намеса и без необходимост от `setval` при всяка HTTP заявка.
 - **Кратковременни токени**: Access токенът е валиден 15 минути. В тази стъпка нарочно **не са** включени refresh tokens или списък за оттегляне (token revocation / denylist), за да се запази архитектурата проста и без излишен овърхед.
 - **Stateless проверка с актуалност от БД**: Токенът се проверява криптографски с HMAC-SHA256 (`HS256`). Потребителският запис се зарежда директно от базата данни при всяка защитена заявка, което гарантира, че незабавно се отчита всяка промяна на ролята дори със съществуващ токен.

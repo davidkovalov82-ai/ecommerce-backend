@@ -63,6 +63,11 @@ def create_app() -> FastAPI:
         sanitized_errors = []
         for err in exc.errors():
             err_dict = dict(err)
+            if "ctx" in err_dict and isinstance(err_dict["ctx"], dict):
+                err_dict["ctx"] = {
+                    k: str(v) if isinstance(v, Exception) else v
+                    for k, v in err_dict["ctx"].items()
+                }
             loc = err_dict.get("loc", ())
 
             # 1. Ако локацията на грешката съдържа "password", премахваме input изцяло

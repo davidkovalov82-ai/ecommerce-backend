@@ -12,9 +12,6 @@ from scripts.promote_admin import promote_user
 from tests.conftest import TEST_DB_NAME
 
 SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "promote_admin.py"
-SCRIPT_PATH = (
-    Path(__file__).resolve().parent.parent / "scripts" / "promote_admin.py"
-)
 
 
 def _get_cli_test_env() -> dict[str, str]:

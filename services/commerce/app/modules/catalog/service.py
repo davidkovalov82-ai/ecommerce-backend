@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -38,6 +39,30 @@ class CatalogService:
         )
         try:
             self._product_repository.create(product)
+            self._session.commit()
+            return product
+        except Exception:
+            self._session.rollback()
+            raise
+
+    def update_product(
+        self,
+        product_id: int,
+        update_data: dict[str, Any],
+    ) -> Product:
+        """Сценарий: администратор редактира, деактивира или активира продукт по ID.
+
+        Редактира както активни, така и неактивни продукти.
+        Хвърля ProductNotFound, ако продуктът липсва в базата данни.
+        Управлява транзакционната граница (commit/rollback).
+        """
+        product = self._product_repository.get_by_id(product_id)
+        if product is None:
+            raise ProductNotFound(f"Product with id {product_id} not found")
+
+        try:
+            for field, value in update_data.items():
+                setattr(product, field, value)
             self._session.commit()
             return product
         except Exception:

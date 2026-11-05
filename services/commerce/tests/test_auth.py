@@ -219,9 +219,7 @@ def test_get_current_user_missing_required_claims_and_invalid_sub() -> None:
     t_no_iat = jwt.encode(
         {"sub": "1", "exp": now + 900}, settings.jwt_secret, algorithm="HS256"
     )
-    r_no_iat = client.get(
-        "/users/me", headers={"Authorization": f"Bearer {t_no_iat}"}
-    )
+    r_no_iat = client.get("/users/me", headers={"Authorization": f"Bearer {t_no_iat}"})
     assert r_no_iat.status_code == 401
     assert r_no_iat.json()["detail"]["code"] == "INVALID_TOKEN"
 
