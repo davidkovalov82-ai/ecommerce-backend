@@ -86,6 +86,7 @@ def db_session() -> Generator[Session]:
     finally:
         session.rollback()
         # Премахваме всички добавени от тестовете редове
+        session.execute(text("DELETE FROM cart_items"))
         session.execute(text("DELETE FROM users"))
         _sync_users_sequence(session)
         session.execute(text("DELETE FROM products WHERE id != 1"))
@@ -97,13 +98,15 @@ def db_session() -> Generator[Session]:
 
 @pytest.fixture(autouse=True)
 def clean_users_table() -> Generator[None]:
-    """Гарантира почистване на таблицата users преди и след всеки тест."""
+    """Гарантира почистване на таблицата users и cart_items преди и след всеки тест."""
     with TestingSessionLocal() as session:
+        session.execute(text("DELETE FROM cart_items"))
         session.execute(text("DELETE FROM users"))
         _sync_users_sequence(session)
         session.commit()
     yield
     with TestingSessionLocal() as session:
+        session.execute(text("DELETE FROM cart_items"))
         session.execute(text("DELETE FROM users"))
         _sync_users_sequence(session)
         session.commit()

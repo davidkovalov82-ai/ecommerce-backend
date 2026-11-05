@@ -21,6 +21,12 @@
   - Извличане на текущо автентикирания потребител (`GET /users/me`) по `sub` claim от токена с директна проверка в базата данни.
   - Защита на паролите: пълно саниране и недопускане на изтичане на пароли във валидационните грешки (HTTP 422), логовете или HTTP отговорите.
   - Бизнес правила: роля по подразбиране `customer` (невъзможност за самоназначаване на административни роли), нормализация на имейли (case-insensitive уникалност).
+- **`cart` (Потребителска количка)**:
+  - Собственост и изолация: всеки регистриран потребител (и `customer`, и `admin`) управлява единствено своята собствена количка чрез проверения токен (`CurrentUserDep`). Заявките никога не приемат `user_id`.
+  - Модел за данни: таблица `cart_items` със съставен първичен ключ `(user_id, product_id)`, каскадно изтриване при премахване на потребител (`ON DELETE CASCADE`), защита от изтриване на продукт в количка (`ON DELETE RESTRICT`) и валидация на количеството между 1 и 99 (`CHECK (quantity >= 1 AND quantity <= 99)`).
+  - Идемпотентност и конкурентност: атомарен PostgreSQL upsert (`INSERT ... ON CONFLICT (user_id, product_id) DO UPDATE`) при задаване на количество.
+  - Динамичност: цените не се замразяват в количката, а се изчисляват динамично от актуалния каталог. Количката не резервира и не намалява складова наличност (`stock`). При деактивиране или изчерпване на продукт позицията остава в количката с флаг `available: false`, но сумата ѝ продължава да участва в `total_minor`.
+  - Оптимизация срещу N+1: групово зареждане на продуктите чрез една SQL заявка с `IN` клауза.
 
 ---
 
@@ -342,6 +348,71 @@ uv run ruff format .
     }
     ```
 
+### 3. Потребителска количка (Cart)
+
+Всички операции с количката са строго автентикирани (`CurrentUserDep`) и оперират единствено върху количката на текущия потребител.
+
+- **`GET /cart`** – Преглед на текущата количка:
+  - Изисква хедър: `Authorization: Bearer <token>`
+  - Празна количка връща:
+    ```json
+    {
+      "items": [],
+      "total_minor": 0,
+      "currency": "EUR"
+    }
+    ```
+  - Непразна количка връща актуално изчислените позиции, сортирани по `product_id` възходящо:
+    ```json
+    {
+      "items": [
+        {
+          "product_id": 1,
+          "title": "Notebook",
+          "quantity": 2,
+          "unit_price_minor": 1299,
+          "subtotal_minor": 2598,
+          "available": true
+        }
+      ],
+      "total_minor": 2598,
+      "currency": "EUR"
+    }
+    ```
+  - Полета на всяка позиция:
+    - `product_id`: идентификатор на продукта;
+    - `title`: актуално заглавие от каталога;
+    - `quantity`: брой единици в количката (1–99);
+    - `unit_price_minor`: актуална единична цена в центове;
+    - `subtotal_minor`: произведение на `unit_price_minor * quantity`;
+    - `available`: `true`, ако продуктът е активен (`active: true`) и наличността покрива заявеното количество (`stock >= quantity`). При изчерпване или деактивиране става `false`, но позицията остава в количката и сумата ѝ продължава да участва в `total_minor`.
+
+- **`PUT /cart/items/{product_id}`** – Задаване на точно количество на продукт (идемпотентна операция):
+  - Изисква хедър: `Authorization: Bearer <token>`
+  - Тяло на заявката:
+    ```json
+    {
+      "quantity": 3
+    }
+    ```
+  - Валидация:
+    - `quantity`: строго цяло число между 1 и 99.
+    - Стойности като `0`, `<= -1`, `> 99`, плаваща запетая (`float`), `boolean`, `null`, празно тяло `{}` или допълнителни непознати полета се отхвърлят с `422 Unprocessable Entity`.
+  - Поведение и отговори:
+    - `200 OK`: връща пълната обновена количка (`CartResponse`).
+    - `401 Unauthorized`: при липсващ или невалиден Bearer токен.
+    - `404 Not Found` (`PRODUCT_NOT_FOUND`): ако продуктът не съществува или е деактивиран (`active: false`).
+    - `409 Conflict` (`INSUFFICIENT_STOCK`): ако заявеното количество надвишава текущата складова наличност (`quantity > stock`). Количката остава непроменена.
+    - Използва атомарен PostgreSQL upsert (`ON CONFLICT DO UPDATE`), гарантиращ липса на колизии при конкурентни заявки.
+
+- **`DELETE /cart/items/{product_id}`** – Премахване на продукт от количката:
+  - Изисква хедър: `Authorization: Bearer <token>`
+  - Поведение и отговори:
+    - `204 No Content`: успешно премахване (празно тяло).
+    - Идемпотентност: ако продуктът не е бил в количката, отново връща `204 No Content`.
+    - Безопасност: работи успешно (204) дори ако продуктът е бил деактивиран в каталога или напълно липсва.
+    - `401 Unauthorized`: при липсващ или невалиден Bearer токен.
+
 ---
 
 ## Демонстрация чрез cURL и Swagger UI
@@ -448,6 +519,42 @@ curl "http://localhost:8000/products?limit=5&offset=0"
 
 # Преглед на детайл за единичен продукт:
 curl "http://localhost:8000/products/1"
+```
+
+### 4. Управление на потребителска количка (Cart Walkthrough)
+
+```bash
+# 1. Вход като клиент и извличане на токен
+CUSTOMER_TOKEN=$(curl -s -X POST http://localhost:8000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "customer@example.com", "password": "SuperSecretPassphrase123!"}' \
+  | python3 -c "import sys, json; print(json.load(sys.stdin)['access_token'])")
+
+# 2. Преглед на текущата количка (първоначално празна)
+curl -X GET http://localhost:8000/cart \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN"
+
+# 3. Добавяне / задаване на количество от продукт #1 (например 2 бр.)
+curl -X PUT http://localhost:8000/cart/items/1 \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN" \
+  -d '{"quantity": 2}'
+
+# 4. Идемпотентно обновяване на количеството (напр. до 4 бр.)
+curl -X PUT http://localhost:8000/cart/items/1 \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN" \
+  -d '{"quantity": 4}'
+
+# 5. Опит за заявяване на количество, надвишаващо наличността (връща 409 INSUFFICIENT_STOCK)
+curl -X PUT http://localhost:8000/cart/items/1 \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN" \
+  -d '{"quantity": 99}'
+
+# 6. Изтриване на позиция от количката (връща 204 No Content)
+curl -i -X DELETE http://localhost:8000/cart/items/1 \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN"
 ```
 
 ---

@@ -16,6 +16,13 @@ class ProductRepository:
         """Извлича продукт по неговото ID от PostgreSQL базата данни."""
         return self._session.get(Product, product_id)
 
+    def get_by_ids(self, product_ids: Sequence[int]) -> Sequence[Product]:
+        """Извлича списък с продукти по техните ID-та чрез една IN заявка."""
+        if not product_ids:
+            return []
+        stmt = select(Product).where(Product.id.in_(product_ids))
+        return self._session.scalars(stmt).all()
+
     def list_active(self, limit: int, offset: int) -> Sequence[Product]:
         """Извлича списък с активни продукти, подредени по ID възходящо с пагинация."""
         stmt = (
