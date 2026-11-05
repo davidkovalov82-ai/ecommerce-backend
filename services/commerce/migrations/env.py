@@ -3,11 +3,12 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-import app.modules.accounts.models
-import app.modules.cart.models
-import app.modules.catalog.models  # noqa: F401
 from app.config import settings
 from app.db import Base
+from app.modules.accounts import models as _accounts_models  # noqa: F401
+from app.modules.cart import models as _cart_models  # noqa: F401
+from app.modules.catalog import models as _catalog_models  # noqa: F401
+from app.modules.orders import models as _orders_models  # noqa: F401
 
 config = context.config
 if not config.get_main_option("sqlalchemy.url"):

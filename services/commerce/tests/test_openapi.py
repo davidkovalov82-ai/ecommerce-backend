@@ -59,7 +59,19 @@ def test_openapi_registered_operations() -> None:
     assert "delete" in paths["/cart/items/{product_id}"]
     assert paths["/cart/items/{product_id}"]["delete"]["operationId"] is not None
 
-    # 8. Bearer сигурностна схема в компонентите
+    # 8. GET & POST /orders
+    assert "/orders" in paths
+    assert "get" in paths["/orders"]
+    assert paths["/orders"]["get"]["operationId"] is not None
+    assert "post" in paths["/orders"]
+    assert paths["/orders"]["post"]["operationId"] is not None
+
+    # 9. GET /orders/{order_id}
+    assert "/orders/{order_id}" in paths
+    assert "get" in paths["/orders/{order_id}"]
+    assert paths["/orders/{order_id}"]["get"]["operationId"] is not None
+
+    # 10. Bearer сигурностна схема в компонентите
     security_schemes = schema.get("components", {}).get("securitySchemes", {})
     assert "HTTPBearer" in security_schemes
     assert security_schemes["HTTPBearer"]["type"] == "http"

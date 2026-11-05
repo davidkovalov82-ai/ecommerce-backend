@@ -415,6 +415,41 @@ uv run ruff format .
 
 ---
 
+### 4. Поръчки (Orders)
+
+- **`POST /orders`** – Оформяне на текущата количка в поръчка със статус `pending_payment`:
+  - Изисква хедъри:
+    - `Authorization: Bearer <token>`
+    - `Idempotency-Key: <UUID>` (валиден UUID v4)
+  - Изисква тяло: празен JSON обект `{}` (всякакви допълнителни полета се отхвърлят с `422`).
+  - Поведение и отговори:
+    - `201 Created`: успешно оформена поръчка с пълен детайл и списък със запазени позиции (`OrderDetailResponse`).
+    - `401 Unauthorized`: при липсващ или невалиден токен.
+    - `422 Unprocessable Entity`: при липсващ/невалиден UUID в `Idempotency-Key` или невалидно тяло.
+    - `409 Conflict` (`CART_EMPTY`): ако потребителската количка е празна.
+    - `409 Conflict` (`CART_PRODUCT_UNAVAILABLE`): ако продукт от количката е деактивиран или не съществува в каталога (връща и засегнатия `product_id`).
+    - `409 Conflict` (`INSUFFICIENT_STOCK`): ако складовата наличност не достига за заявеното количество (връща и засегнатия `product_id`).
+    - Идемпотентност: повторно изпращане със същия `Idempotency-Key` от същия потребител връща съществуващата поръчка с `201 Created`, без повторно намаляване на склада и без промяна в количката.
+
+- **`GET /orders`** – Списък със собствените поръчки на текущия потребител:
+  - Изисква хедър: `Authorization: Bearer <token>`
+  - Query параметри:
+    - `limit`: брой записи на страница (по подразбиране `20`, диапазон `1–100`).
+    - `offset`: отместване от началото (по подразбиране `0`, минимум `0`).
+  - Подредба: строго `created_at DESC, id DESC`.
+  - Поведение и отговори:
+    - `200 OK`: връща пагиниран списък (`OrderListResponse`) с обобщена информация (`OrderSummaryResponse`) без вложени позиции.
+    - `401 Unauthorized`: при липсващ или невалиден токен.
+
+- **`GET /orders/{order_id}`** – Преглед на единична собствена поръчка с нейните позиции:
+  - Изисква хедър: `Authorization: Bearer <token>`
+  - Поведение и отговори:
+    - `200 OK`: детайлна поръчка със запазените исторически заглавия, цени и количества, подредени по `product_id` възходящо (`OrderDetailResponse`).
+    - `401 Unauthorized`: при липсващ или невалиден токен.
+    - `404 Not Found` (`ORDER_NOT_FOUND`): ако поръчката не съществува или принадлежи на друг потребител (строга изолация, без административен достъп до чужди поръчки в този обхват).
+
+---
+
 ## Демонстрация чрез cURL и Swagger UI
 
 ### 1. Пълен цикъл за администратор (Registration -> Promote -> Login -> Create Product -> View Product)
@@ -557,12 +592,57 @@ curl -i -X DELETE http://localhost:8000/cart/items/1 \
   -H "Authorization: Bearer $CUSTOMER_TOKEN"
 ```
 
+### 5. Оформяне и управление на поръчки (Orders Walkthrough)
+
+```bash
+# 1. Добавяне на продукт в количката
+curl -X PUT http://localhost:8000/cart/items/1 \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN" \
+  -d '{"quantity": 2}'
+
+# 2. Генериране на UUID за Idempotency-Key
+IDEMPOTENCY_KEY=$(python3 -c "import uuid; print(uuid.uuid4())")
+
+# 3. Оформяне на количката в поръчка (POST /orders с Idempotency-Key и празно тяло {})
+ORDER_RESPONSE=$(curl -s -X POST http://localhost:8000/orders \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN" \
+  -H "Idempotency-Key: $IDEMPOTENCY_KEY" \
+  -d '{}')
+echo "$ORDER_RESPONSE"
+
+ORDER_ID=$(python3 -c "import json; print(json.loads('''$ORDER_RESPONSE''')['id'])")
+
+# 4. Повторно изпращане със СЪЩИЯ Idempotency-Key (идемпотентност -> връща 201 и същата поръчка)
+curl -i -X POST http://localhost:8000/orders \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN" \
+  -H "Idempotency-Key: $IDEMPOTENCY_KEY" \
+  -d '{}'
+
+# 5. Преглед на пагинирания списък с поръчки на потребителя
+curl -s http://localhost:8000/orders?limit=10&offset=0 \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN"
+
+# 6. Преглед на единична поръчка с нейните запазени позиции
+curl -s http://localhost:8000/orders/$ORDER_ID \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN"
+```
+
 ---
 
 ## Архитектурни бележки и технически ограничения
 
 - **Администраторски контрол**: `POST /products` и `PATCH /products/{product_id}` са достъпни единствено за потребители с роля `admin`. Потребители с роля `customer` получават `403 FORBIDDEN` (`detail.code = "FORBIDDEN"`). Операциите `DELETE` и `PUT` за продукти съзнателно **не са** част от тази учебна стъпка.
 - **Синхронизиране на ID Sequence**: Чрез миграцията `4af78c666cf2` PostgreSQL sequence-ът се синхронизира автоматично с максималното съществуващо ID. Новите продукти получават автоматични ID-та без ръчна намеса и без необходимост от `setval` при всяка HTTP заявка.
+- **Транзакционен протокол за поръчки и количка**:
+  - Всяка мутация (checkout, добавяне или премахване от количка) придобива ред-блокировка върху потребителя с `FOR NO KEY UPDATE` в PostgreSQL преди каквито и да е други четения или промени.
+  - При оформяне на поръчка продуктите се заключват с `FOR UPDATE` в строго възходящ ред по ID (`ORDER BY id ASC`), което напълно елиминира риска от deadlocks между конкурентни процеси.
+  - Намаляването на складовата наличност при статус `pending_payment` представлява резервация на стоката.
+- **Жизнен цикъл на резервациите**:
+  - **В тази версия резервациите остават в статус `pending_payment` без автоматично изтичане (auto-expiration)**.
+  - Интеграцията с плащания, асинхронни таймери, фоново освобождаване на изтекли резервации и последващи статуси (`paid`, `cancelled`) ще бъдат реализирани в следващ етап.
 - **Кратковременни токени**: Access токенът е валиден 15 минути. В тази стъпка нарочно **не са** включени refresh tokens или списък за оттегляне (token revocation / denylist), за да се запази архитектурата проста и без излишен овърхед.
 - **Stateless проверка с актуалност от БД**: Токенът се проверява криптографски с HMAC-SHA256 (`HS256`). Потребителският запис се зарежда директно от базата данни при всяка защитена заявка, което гарантира, че незабавно се отчита всяка промяна на ролята дори със съществуващ токен.
 - **Изисквания за продукционна среда**:
