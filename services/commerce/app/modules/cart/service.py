@@ -112,4 +112,3 @@ class CartService:
         except Exception:
             self._session.rollback()
             raise
-

@@ -1,16 +1,15 @@
 # Session State
 
-- **Текуща задача**: Реализация на завършен модул за количка в `services/commerce/app/modules/cart`.
+- **Текуща задача**: Подготовка на клона за вливане в main: укрепване на concurrency тест и форматиране.
 - **Реализирано**:
-  - Alembic миграция `9c17d651dd68_create_cart_items_table` с композитен PK, FKs (CASCADE/RESTRICT) и CHECK constraint.
-  - CRUD и бизнес логика за количка: `GET /cart`, `PUT /cart/items/{product_id}`, `DELETE /cart/items/{product_id}`.
-  - Атомарен PostgreSQL upsert (`ON CONFLICT DO UPDATE`), групово извличане (`ProductRepository.get_by_ids`).
-  - Пълна изолация между потребители по JWT `CurrentUserDep`, динамични цени без блокиране на наличности.
-  - Документация в `README.md` и изчерпателни тестове в `test_cart.py` (23 теста) и `test_openapi.py`.
-- **Непроверено**: Интеграция с бъдещия checkout сценарий (orders/payments).
+  - Укрепен `test_put_cart_item_concurrency` със синхронизиран старт (`threading.Barrier`), отделна DB сесия за заявка, SQL lock/statement timeouts и future таймаути.
+  - Поправено форматиране на файловете в `app/modules/cart` и `tests/test_cart.py` чрез Ruff.
+  - Проведени успешни проверки: 142 теста в pytest (вкл. конкурентност и DB ограничения) и Ruff lint/format.
+- **Оставащи ограничения / Непроверено**:
+  - Бъдещ checkout модул: превръщане на количката в поръчка, заключване на склад и плащане.
 - **Работещи команди**:
-  - `cd services/commerce && uv run --locked pytest`
+  - `cd services/commerce && uv run --locked ruff format app/modules/cart`
   - `cd services/commerce && uv run --locked ruff check . && uv run --locked ruff format --check .`
-  - `docker compose --env-file services/commerce/.env up -d --build api`
-- **Засегнати файлове**: `app/modules/cart/*`, `catalog/repository.py`, `app/main.py`, `migrations/*`, `tests/*`, `README.md`.
-- **Следваща стъпка**: Реализация на създаване и жизнен цикъл на поръчка (`orders`).
+  - `cd services/commerce && uv run --locked pytest -q`
+- **Засегнати файлове**: `app/modules/cart/*`, `tests/test_cart.py`, `docs/session-state.md`.
+- **Следваща стъпка**: Преглед и вливане на клона в main или стартиране на модул поръчки (`orders`).

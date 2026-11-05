@@ -26,4 +26,3 @@ class CartItem(Base):
         primary_key=True,
     )
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
-

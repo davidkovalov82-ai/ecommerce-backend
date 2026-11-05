@@ -58,4 +58,3 @@ def remove_cart_item(
         user_id=current_user.id,
         product_id=product_id,
     )
-

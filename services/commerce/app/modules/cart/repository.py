@@ -46,4 +46,3 @@ class CartRepository:
         )
         result = self._session.execute(stmt)
         return bool(result.rowcount and result.rowcount > 0)
-

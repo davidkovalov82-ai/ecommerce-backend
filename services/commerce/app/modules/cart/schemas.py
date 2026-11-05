@@ -35,4 +35,3 @@ class CartResponse(BaseModel):
     items: list[CartItemResponse]
     total_minor: int
     currency: str = "EUR"
-

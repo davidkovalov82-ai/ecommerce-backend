@@ -28,4 +28,3 @@ def get_cart_service(
 
 
 CartServiceDep = Annotated[CartService, Depends(get_cart_service)]
-

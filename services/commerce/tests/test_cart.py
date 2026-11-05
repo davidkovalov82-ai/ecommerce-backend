@@ -1,3 +1,5 @@
+import threading
+from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -7,11 +9,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.dependencies import get_db_session
 from app.main import app
 from app.modules.accounts.models import User
 from app.modules.accounts.tokens import create_access_token
 from app.modules.cart.models import CartItem
 from app.modules.catalog.models import Product
+from tests.conftest import TestingSessionLocal
 
 client = TestClient(app)
 
@@ -156,7 +160,20 @@ def test_put_cart_item_concurrency(db_session: Session) -> None:
     product = _create_product(db_session, stock=20)
     headers = {"Authorization": f"Bearer {token}"}
 
+    def _timed_test_db() -> Generator[Session]:
+        with TestingSessionLocal() as session:
+            session.execute(text("SET lock_timeout = '3000ms'"))
+            session.execute(text("SET statement_timeout = '5000ms'"))
+            yield session
+
+    original_override = app.dependency_overrides.get(get_db_session)
+    app.dependency_overrides[get_db_session] = _timed_test_db
+
+    num_workers = 8
+    barrier = threading.Barrier(num_workers)
+
     def _send_put(qty: int) -> int:
+        barrier.wait(timeout=5.0)
         r = client.put(
             f"/cart/items/{product.id}",
             json={"quantity": qty},
@@ -164,20 +181,27 @@ def test_put_cart_item_concurrency(db_session: Session) -> None:
         )
         return r.status_code
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(_send_put, i) for i in range(1, 9)]
-        status_codes = [f.result() for f in futures]
+    try:
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(_send_put, i) for i in range(1, num_workers + 1)]
+            status_codes = [f.result(timeout=10.0) for f in futures]
+    finally:
+        if original_override:
+            app.dependency_overrides[get_db_session] = original_override
+        else:
+            app.dependency_overrides.pop(get_db_session, None)
 
     assert all(code == 200 for code in status_codes)
 
     # Проверка в базата: съществува точно един ред за (user_id, product_id)
+    db_session.expire_all()
     items = (
         db_session.query(CartItem)
         .filter(CartItem.user_id == user.id, CartItem.product_id == product.id)
         .all()
     )
     assert len(items) == 1
-    assert 1 <= items[0].quantity <= 8
+    assert 1 <= items[0].quantity <= num_workers
 
 
 # 5. Количка с няколко различни продукта и изчисления
