@@ -13,10 +13,11 @@ def get_product_repository(session: DbSession) -> ProductRepository:
 
 
 def get_catalog_service(
+    session: DbSession,
     product_repository: Annotated[ProductRepository, Depends(get_product_repository)],
 ) -> CatalogService:
-    """Фабрика за CatalogService с инжектирано хранилище."""
-    return CatalogService(product_repository)
+    """Фабрика за CatalogService с инжектирано хранилище и обща сесия за заявката."""
+    return CatalogService(product_repository=product_repository, session=session)
 
 
 CatalogServiceDep = Annotated[CatalogService, Depends(get_catalog_service)]

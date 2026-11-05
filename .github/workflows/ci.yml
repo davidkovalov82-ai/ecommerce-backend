@@ -25,6 +25,7 @@ jobs:
       DB_USER: commerce
       DB_PASSWORD: commerce_ci
       DB_NAME: commerce
+      JWT_SECRET: "ci-test-jwt-secret-key-at-least-32-bytes-long!"
 
     services:
       postgres:

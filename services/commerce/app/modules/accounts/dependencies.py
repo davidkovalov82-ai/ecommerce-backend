@@ -1,11 +1,18 @@
 from typing import Annotated
 
-from fastapi import Depends
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pwdlib import PasswordHash
 
+from app.config import settings
 from app.dependencies import DbSession
+from app.modules.accounts.models import User
 from app.modules.accounts.repository import UserRepository
 from app.modules.accounts.service import AccountService
+from app.modules.accounts.tokens import InvalidToken, decode_access_token
+
+# Схема за Bearer автентикация в OpenAPI / Swagger UI
+oauth2_scheme = HTTPBearer(auto_error=False)
 
 # Инстанция на PasswordHash с препоръчаните настройки за Argon2
 _password_hasher = PasswordHash.recommended()
@@ -36,3 +43,69 @@ def get_account_service(
 
 
 AccountServiceDep = Annotated[AccountService, Depends(get_account_service)]
+
+
+def get_current_user(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(oauth2_scheme)],
+    user_repository: Annotated[UserRepository, Depends(get_user_repository)],
+) -> User:
+    """Зависимост за извличане и верифициране на текущия автентикиран потребител по JWT токен."""
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "AUTHENTICATION_REQUIRED",
+                "message": "Authentication required",
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        user_id = decode_access_token(
+            credentials.credentials,
+            secret=settings.jwt_secret,
+            algorithm=settings.jwt_algorithm,
+        )
+    except InvalidToken:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "INVALID_TOKEN",
+                "message": "Invalid or expired token",
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user = user_repository.get_by_id(user_id)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "USER_NOT_FOUND",
+                "message": "User not found",
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return user
+
+
+CurrentUserDep = Annotated[User, Depends(get_current_user)]
+
+
+def require_admin(
+    current_user: CurrentUserDep,
+) -> User:
+    """Зависимост, проверяваща дали текущият автентикиран потребител притежава администраторска роля (admin)."""
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "FORBIDDEN",
+                "message": "Admin privileges required",
+            },
+        )
+    return current_user
+
+
+AdminUserDep = Annotated[User, Depends(require_admin)]

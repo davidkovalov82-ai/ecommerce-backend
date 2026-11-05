@@ -1,5 +1,11 @@
+import os
 from collections.abc import Generator
 from typing import Any
+
+# Задаваме отделен тестов таен ключ за тестовата среда
+os.environ.setdefault(
+    "JWT_SECRET", "ci-and-test-jwt-secret-key-at-least-32-bytes-long!"
+)
 
 import pytest
 from alembic import command
@@ -49,13 +55,10 @@ def setup_test_database() -> Generator[None]:
         conn.execute(text(f"CREATE DATABASE {TEST_DB_NAME}"))
 
     # 2. Изпълняваме реалните Alembic миграции до последната (head)
+    # Последната миграция автоматично синхронизира sequence-а на products с id=1
     alembic_cfg = Config("alembic.ini")
     alembic_cfg.set_main_option("sqlalchemy.url", TEST_DATABASE_URL)
     command.upgrade(alembic_cfg, "head")
-
-    # 3. Синхронизираме sequence след първата миграция, която вече вмъква id=1
-    with test_engine.begin() as conn:
-        _sync_products_sequence(conn)
 
     yield
 
@@ -83,6 +86,7 @@ def db_session() -> Generator[Session]:
     finally:
         session.rollback()
         # Премахваме всички добавени от тестовете редове
+        session.execute(text("DELETE FROM cart_items"))
         session.execute(text("DELETE FROM users"))
         _sync_users_sequence(session)
         session.execute(text("DELETE FROM products WHERE id != 1"))
@@ -94,13 +98,15 @@ def db_session() -> Generator[Session]:
 
 @pytest.fixture(autouse=True)
 def clean_users_table() -> Generator[None]:
-    """Гарантира почистване на таблицата users преди и след всеки тест."""
+    """Гарантира почистване на таблицата users и cart_items преди и след всеки тест."""
     with TestingSessionLocal() as session:
+        session.execute(text("DELETE FROM cart_items"))
         session.execute(text("DELETE FROM users"))
         _sync_users_sequence(session)
         session.commit()
     yield
     with TestingSessionLocal() as session:
+        session.execute(text("DELETE FROM cart_items"))
         session.execute(text("DELETE FROM users"))
         _sync_users_sequence(session)
         session.commit()

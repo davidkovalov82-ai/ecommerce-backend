@@ -18,17 +18,49 @@ def test_openapi_registered_operations() -> None:
     schema = response.json()
     paths = schema.get("paths", {})
 
-    # 1. GET /products
+    # 1. GET & POST /products
     assert "/products" in paths
     assert "get" in paths["/products"]
     assert paths["/products"]["get"]["operationId"] is not None
+    assert "post" in paths["/products"]
+    assert paths["/products"]["post"]["operationId"] is not None
 
-    # 2. GET /products/{product_id}
+    # 2. GET & PATCH /products/{product_id}
     assert "/products/{product_id}" in paths
     assert "get" in paths["/products/{product_id}"]
     assert paths["/products/{product_id}"]["get"]["operationId"] is not None
+    assert "patch" in paths["/products/{product_id}"]
+    assert paths["/products/{product_id}"]["patch"]["operationId"] is not None
 
     # 3. POST /users
     assert "/users" in paths
     assert "post" in paths["/users"]
     assert paths["/users"]["post"]["operationId"] is not None
+
+    # 4. POST /auth/login
+    assert "/auth/login" in paths
+    assert "post" in paths["/auth/login"]
+    assert paths["/auth/login"]["post"]["operationId"] is not None
+
+    # 5. GET /users/me
+    assert "/users/me" in paths
+    assert "get" in paths["/users/me"]
+    assert paths["/users/me"]["get"]["operationId"] is not None
+
+    # 6. GET /cart
+    assert "/cart" in paths
+    assert "get" in paths["/cart"]
+    assert paths["/cart"]["get"]["operationId"] is not None
+
+    # 7. PUT & DELETE /cart/items/{product_id}
+    assert "/cart/items/{product_id}" in paths
+    assert "put" in paths["/cart/items/{product_id}"]
+    assert paths["/cart/items/{product_id}"]["put"]["operationId"] is not None
+    assert "delete" in paths["/cart/items/{product_id}"]
+    assert paths["/cart/items/{product_id}"]["delete"]["operationId"] is not None
+
+    # 8. Bearer сигурностна схема в компонентите
+    security_schemes = schema.get("components", {}).get("securitySchemes", {})
+    assert "HTTPBearer" in security_schemes
+    assert security_schemes["HTTPBearer"]["type"] == "http"
+    assert security_schemes["HTTPBearer"]["scheme"] == "bearer"

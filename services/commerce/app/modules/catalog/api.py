@@ -1,10 +1,55 @@
 from fastapi import APIRouter, HTTPException, Query, status
 
+from app.modules.accounts.dependencies import AdminUserDep
 from app.modules.catalog.dependencies import CatalogServiceDep
-from app.modules.catalog.schemas import ProductListResponse, ProductResponse
+from app.modules.catalog.schemas import (
+    ProductCreateRequest,
+    ProductListResponse,
+    ProductResponse,
+    ProductUpdateRequest,
+)
 from app.modules.catalog.service import ProductNotFound
 
 router = APIRouter(prefix="/products", tags=["catalog"])
+
+
+@router.post("", response_model=ProductResponse, status_code=status.HTTP_201_CREATED)
+def create_product(
+    data: ProductCreateRequest,
+    catalog_service: CatalogServiceDep,
+    _: AdminUserDep,
+) -> ProductResponse:
+    """HTTP обработчик за създаване на нов продукт (само за администратори)."""
+    product = catalog_service.create_product(
+        title=data.title,
+        price_minor=data.price_minor,
+        currency=data.currency,
+        stock=data.stock,
+        active=data.active,
+    )
+    return ProductResponse.model_validate(product)
+
+
+@router.patch("/{product_id}", response_model=ProductResponse)
+def update_product(
+    product_id: int,
+    data: ProductUpdateRequest,
+    catalog_service: CatalogServiceDep,
+    _: AdminUserDep,
+) -> ProductResponse:
+    """HTTP обработчик за частично обновяване на продукт (само за администратори)."""
+    update_data = data.model_dump(exclude_unset=True)
+    try:
+        product = catalog_service.update_product(
+            product_id=product_id,
+            update_data=update_data,
+        )
+        return ProductResponse.model_validate(product)
+    except ProductNotFound:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "PRODUCT_NOT_FOUND", "message": "Product not found"},
+        )
 
 
 @router.get("", response_model=ProductListResponse)

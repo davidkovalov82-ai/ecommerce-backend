@@ -7,7 +7,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.db import db
+from app.modules.accounts.api import auth_router
 from app.modules.accounts.api import router as accounts_router
+from app.modules.cart.api import router as cart_router
 from app.modules.catalog.api import router as catalog_router
 
 
@@ -62,6 +64,11 @@ def create_app() -> FastAPI:
         sanitized_errors = []
         for err in exc.errors():
             err_dict = dict(err)
+            if "ctx" in err_dict and isinstance(err_dict["ctx"], dict):
+                err_dict["ctx"] = {
+                    k: str(v) if isinstance(v, Exception) else v
+                    for k, v in err_dict["ctx"].items()
+                }
             loc = err_dict.get("loc", ())
 
             # 1. Ако локацията на грешката съдържа "password", премахваме input изцяло
@@ -88,6 +95,8 @@ def create_app() -> FastAPI:
 
     app.include_router(catalog_router)
     app.include_router(accounts_router)
+    app.include_router(auth_router)
+    app.include_router(cart_router)
     return app
 
 
