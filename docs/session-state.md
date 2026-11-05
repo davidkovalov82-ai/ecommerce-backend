@@ -1,15 +1,16 @@
 # Session State
 
-- **Текуща задача**: Подготовка на клона за вливане в main: укрепване на concurrency тест и форматиране.
+- **Текуща задача**: Реализация на завършен модул за поръчки (`orders`) с транзакционен checkout и идемпотентност.
 - **Реализирано**:
-  - Укрепен `test_put_cart_item_concurrency` със синхронизиран старт (`threading.Barrier`), отделна DB сесия за заявка, SQL lock/statement timeouts и future таймаути.
-  - Поправено форматиране на файловете в `app/modules/cart` и `tests/test_cart.py` чрез Ruff.
-  - Проведени успешни проверки: 142 теста в pytest (вкл. конкурентност и DB ограничения) и Ruff lint/format.
+  - Alembic миграция `568b759ac3a0`: таблици `orders` и `order_items` с BigInteger суми, UNIQUE, CHECK и FK ограничения (RESTRICT/CASCADE).
+  - Модели, схеми, repository, service и API: `POST /orders`, `GET /orders`, `GET /orders/{order_id}`.
+  - Транзакционен протокол: `FOR NO KEY UPDATE` върху потребителя, заключване на продуктите по възходящ ID с `FOR UPDATE`, проверка на наличности, исторически snapshot, намаляване на склад, изчистване на количката и rollback при грешка.
+  - Строга идемпотентност по `Idempotency-Key` (UUID) на ниво потребител.
+  - Изчерпателни тестове в `test_orders.py` (19 теста) и `test_migration_sequence.py`, актуализирана документация в `README.md`.
 - **Оставащи ограничения / Непроверено**:
-  - Бъдещ checkout модул: превръщане на количката в поръчка, заключване на склад и плащане.
+  - Резервациите остават в `pending_payment` без автоматично изтичане (плащания и auto-expiration предстоят).
 - **Работещи команди**:
-  - `cd services/commerce && uv run --locked ruff format app/modules/cart`
-  - `cd services/commerce && uv run --locked ruff check . && uv run --locked ruff format --check .`
   - `cd services/commerce && uv run --locked pytest -q`
-- **Засегнати файлове**: `app/modules/cart/*`, `tests/test_cart.py`, `docs/session-state.md`.
-- **Следваща стъпка**: Преглед и вливане на клона в main или стартиране на модул поръчки (`orders`).
+  - `cd services/commerce && uv run --locked ruff check . && uv run --locked ruff format --check .`
+- **Засегнати файлове**: `app/modules/orders/*`, `app/modules/cart/*`, `app/modules/catalog/*`, `app/modules/accounts/*`, `migrations/*`, `tests/*`, `README.md`.
+- **Следваща стъпка**: Модул за плащания и управление на жизнения цикъл на поръчката (плащане, отказ, изтичане на резервация).

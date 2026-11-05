@@ -1,5 +1,6 @@
 from sqlalchemy.orm import Session
 
+from app.modules.accounts.repository import UserRepository
 from app.modules.cart.repository import CartRepository
 from app.modules.cart.schemas import CartItemResponse, CartResponse
 from app.modules.catalog.repository import ProductRepository
@@ -18,10 +19,12 @@ class CartService:
         cart_repository: CartRepository,
         product_repository: ProductRepository,
         session: Session,
+        user_repository: UserRepository | None = None,
     ) -> None:
         self._cart_repository = cart_repository
         self._product_repository = product_repository
         self._session = session
+        self._user_repository = user_repository
 
     def get_cart(self, user_id: int) -> CartResponse:
         """Сценарий: извличане и изчисляване на текущата количка на потребител.
@@ -80,16 +83,19 @@ class CartService:
         Идемпотентна операция с атомарен upsert.
         Управлява транзакционната граница (commit/rollback).
         """
-        product = self._product_repository.get_by_id(product_id)
-        if product is None or not product.active:
-            raise ProductNotFound(f"Product with id {product_id} not found")
-
-        if quantity > product.stock:
-            raise InsufficientStock(
-                f"Requested quantity {quantity} exceeds available stock {product.stock}"
-            )
-
         try:
+            if self._user_repository is not None:
+                self._user_repository.lock_by_id(user_id)
+
+            product = self._product_repository.get_by_id(product_id)
+            if product is None or not product.active:
+                raise ProductNotFound(f"Product with id {product_id} not found")
+
+            if quantity > product.stock:
+                raise InsufficientStock(
+                    f"Requested quantity {quantity} exceeds available stock {product.stock}"
+                )
+
             self._cart_repository.upsert_item(
                 user_id=user_id,
                 product_id=product_id,
@@ -107,6 +113,9 @@ class CartService:
         Идемпотентна операция. Управлява транзакционната граница (commit/rollback).
         """
         try:
+            if self._user_repository is not None:
+                self._user_repository.lock_by_id(user_id)
+
             self._cart_repository.delete_item(user_id=user_id, product_id=product_id)
             self._session.commit()
         except Exception:

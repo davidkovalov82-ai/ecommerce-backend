@@ -46,3 +46,9 @@ class CartRepository:
         )
         result = self._session.execute(stmt)
         return bool(result.rowcount and result.rowcount > 0)
+
+    def clear_by_user_id(self, user_id: int) -> int:
+        """Изтрива всички позиции от количката на потребителя."""
+        stmt = delete(CartItem).where(CartItem.user_id == user_id)
+        result = self._session.execute(stmt)
+        return int(result.rowcount or 0)

@@ -23,6 +23,20 @@ class ProductRepository:
         stmt = select(Product).where(Product.id.in_(product_ids))
         return self._session.scalars(stmt).all()
 
+    def get_by_ids_for_update(self, product_ids: Sequence[int]) -> Sequence[Product]:
+        """Извлича и заключва продукти за промяна, сортирани по ID възходящо."""
+        if not product_ids:
+            return []
+        sorted_ids = sorted(set(product_ids))
+        stmt = (
+            select(Product)
+            .where(Product.id.in_(sorted_ids))
+            .order_by(Product.id.asc())
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return self._session.scalars(stmt).all()
+
     def list_active(self, limit: int, offset: int) -> Sequence[Product]:
         """Извлича списък с активни продукти, подредени по ID възходящо с пагинация."""
         stmt = (
