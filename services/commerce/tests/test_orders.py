@@ -4,6 +4,7 @@ from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -790,44 +791,68 @@ def test_parallel_checkout_and_cart_modification(
     p2 = _create_product(db_session, stock=10, price_minor=2000)
     _add_to_cart(db_session, user.id, p1.id, quantity=1)
 
-    def _timed_db() -> Generator[Session]:
+    def _sync_db(request: Request) -> Generator[Session]:
         with TestingSessionLocal() as session:
             session.execute(text("SET lock_timeout = '3000ms'"))
             session.execute(text("SET statement_timeout = '5000ms'"))
+            if request.method == "POST" and request.url.path.rstrip("/") == "/orders":
+                session.info["operation"] = "checkout"
+            elif request.method == "PUT" and request.url.path.startswith(
+                "/cart/items/"
+            ):
+                session.info["operation"] = "cart_put"
             yield session
 
     original_override = app.dependency_overrides.get(get_db_session)
-    app.dependency_overrides[get_db_session] = _timed_db
+    app.dependency_overrides[get_db_session] = _sync_db
 
-    put_locked = threading.Event()
-    checkout_started = threading.Event()
-    checkout_locked = threading.Event()
-    put_started = threading.Event()
+    first_op = "cart_put" if scenario == "put_first" else "checkout"
+    second_op = "checkout" if scenario == "put_first" else "cart_put"
+
+    op1_locked = threading.Event()
+    op2_about_to_lock = threading.Event()
+    op1_proceed = threading.Event()
 
     from app.modules.accounts.repository import UserRepository
 
     original_lock_by_id = UserRepository.lock_by_id
 
     def _sync_lock_by_id(self: UserRepository, user_id: int):
-        user_row = original_lock_by_id(self, user_id)
-        current_name = threading.current_thread().name
-        if scenario == "put_first" and current_name == "put_worker":
-            put_locked.set()
-            checkout_started.wait(timeout=5.0)
-        elif scenario == "checkout_first" and current_name == "checkout_worker":
-            checkout_locked.set()
-            put_started.wait(timeout=5.0)
-        return user_row
+        op = self._session.info.get("operation")
+        if op == first_op:
+            # 1. Първата операция действително придобива DB блокировката:
+            user_row = original_lock_by_id(self, user_id)
+            op1_locked.set()
+
+            # 3. Първата операция получава разрешение да продължи:
+            if not op1_proceed.wait(timeout=5.0):
+                raise TimeoutError(
+                    f"Operation 1 ({first_op}) timed out waiting for permission to proceed"
+                )
+            return user_row
+
+        if op == second_op:
+            # Изчакваме първата операция действително да придобие DB блокировката:
+            if not op1_locked.wait(timeout=5.0):
+                raise TimeoutError(
+                    f"Operation 2 ({second_op}) timed out waiting for operation 1 ({first_op}) to acquire DB lock"
+                )
+
+            # 2. Втората операция достига опита за придобиване на същата блокировка:
+            op2_about_to_lock.set()
+            # Разрешаваме на първата операция да продължи:
+            op1_proceed.set()
+
+            # Втората операция се опитва да придобие същата блокировка (блокира се в PostgreSQL):
+            return original_lock_by_id(self, user_id)
+
+        return original_lock_by_id(self, user_id)
 
     monkeypatch.setattr(UserRepository, "lock_by_id", _sync_lock_by_id)
 
     idempotency_key = str(uuid.uuid4())
 
     def _do_checkout() -> int:
-        threading.current_thread().name = "checkout_worker"
-        if scenario == "put_first":
-            put_locked.wait(timeout=5.0)
-            checkout_started.set()
         r = client.post(
             "/orders",
             json={},
@@ -839,10 +864,6 @@ def test_parallel_checkout_and_cart_modification(
         return r.status_code
 
     def _do_cart_put() -> int:
-        threading.current_thread().name = "put_worker"
-        if scenario == "checkout_first":
-            checkout_locked.wait(timeout=5.0)
-            put_started.set()
         r = client.put(
             f"/cart/items/{p2.id}",
             json={"quantity": 3},
@@ -857,11 +878,23 @@ def test_parallel_checkout_and_cart_modification(
             checkout_status = f_checkout.result(timeout=10.0)
             cart_status = f_cart.result(timeout=10.0)
     finally:
+        # Освобождаваме чакащи операции във finally при всякакви обстоятелства
+        op1_locked.set()
+        op2_about_to_lock.set()
+        op1_proceed.set()
+        monkeypatch.undo()
         if original_override:
             app.dependency_overrides[get_db_session] = original_override
         else:
             app.dependency_overrides.pop(get_db_session, None)
 
+    assert op1_locked.is_set(), f"Operation 1 ({first_op}) failed to acquire lock"
+    assert op2_about_to_lock.is_set(), (
+        f"Operation 2 ({second_op}) failed to reach lock attempt"
+    )
+    assert op1_proceed.is_set(), (
+        f"Operation 1 ({first_op}) never received permission to proceed"
+    )
     assert checkout_status == 201
     assert cart_status == 200
 
