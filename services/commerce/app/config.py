@@ -19,6 +19,20 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_access_token_expire_minutes: int = 15
 
+    stripe_secret_key: str | None = None
+    stripe_webhook_secret: str | None = None
+    stripe_success_url: str = "http://localhost:8000/orders/{order_id}?payment=success"
+    stripe_cancel_url: str = "http://localhost:8000/orders/{order_id}?payment=cancelled"
+
+    stripe_secret_key: str | None = None
+    stripe_webhook_secret: str | None = None
+    stripe_success_url: str = (
+        "http://localhost:8000/orders/{order_id}?payment=success"
+    )
+    stripe_cancel_url: str = (
+        "http://localhost:8000/orders/{order_id}?payment=cancelled"
+    )
+
     @field_validator("jwt_secret")
     @classmethod
     def validate_jwt_secret(cls, v: str) -> str:

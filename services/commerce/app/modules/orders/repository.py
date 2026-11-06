@@ -3,7 +3,13 @@ from collections.abc import Sequence
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.modules.orders.models import Order, OrderItem, PaymentAttempt
+from app.modules.orders.models import (
+    Order,
+    OrderItem,
+    PaymentAttempt,
+    StripeCheckoutSession,
+    StripeProcessedEvent,
+)
 
 
 class OrderRepository:
@@ -72,6 +78,17 @@ class OrderRepository:
         )
         return self._session.scalars(stmt).first()
 
+    def get_by_id_for_update(self, order_id: int) -> Order | None:
+        """Извлича и заключва ред от поръчката само по id с FOR UPDATE (за webhooks)."""
+        stmt = (
+            select(Order)
+            .where(Order.id == order_id)
+            .options(selectinload(Order.items))
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return self._session.scalars(stmt).first()
+
     def add_payment_attempt(self, attempt: PaymentAttempt) -> PaymentAttempt:
         """Добавя опит за плащане в сесията без commit."""
         self._session.add(attempt)
@@ -88,6 +105,58 @@ class OrderRepository:
             PaymentAttempt.idempotency_key == idempotency_key,
         )
         return self._session.scalars(stmt).first()
+
+    def add_stripe_session(
+        self, session_record: StripeCheckoutSession
+    ) -> StripeCheckoutSession:
+        """Добавя запис за Stripe Checkout сесия в сесията без commit."""
+        self._session.add(session_record)
+        return session_record
+
+    def get_open_or_initiated_stripe_session(
+        self, order_id: int
+    ) -> StripeCheckoutSession | None:
+        """Извлича последната отворена или инициирана Stripe сесия за поръчка."""
+        stmt = (
+            select(StripeCheckoutSession)
+            .where(
+                StripeCheckoutSession.order_id == order_id,
+                StripeCheckoutSession.status.in_(["open", "initiated"]),
+            )
+            .order_by(StripeCheckoutSession.id.desc())
+        )
+        return self._session.scalars(stmt).first()
+
+    def get_stripe_session_by_id(
+        self, session_db_id: int
+    ) -> StripeCheckoutSession | None:
+        """Извлича Stripe сесия по нейния първичен ключ в БД."""
+        return self._session.get(StripeCheckoutSession, session_db_id)
+
+    def get_stripe_session_by_stripe_id(
+        self, stripe_session_id: str
+    ) -> StripeCheckoutSession | None:
+        """Извлича запис за сесия по нейния публичен Stripe session ID."""
+        stmt = select(StripeCheckoutSession).where(
+            StripeCheckoutSession.stripe_session_id == stripe_session_id
+        )
+        return self._session.scalars(stmt).first()
+
+    def is_stripe_event_processed(self, stripe_event_id: str) -> bool:
+        """Проверява дали дадено webhook събитие вече е записано и обработено."""
+        stmt = select(
+            select(StripeProcessedEvent)
+            .where(StripeProcessedEvent.stripe_event_id == stripe_event_id)
+            .exists()
+        )
+        return bool(self._session.scalar(stmt))
+
+    def record_stripe_event(
+        self, event_record: StripeProcessedEvent
+    ) -> StripeProcessedEvent:
+        """Записва обработено Stripe webhook събитие за осигуряване на идемпотентност."""
+        self._session.add(event_record)
+        return event_record
 
     def list_by_user_id(
         self,

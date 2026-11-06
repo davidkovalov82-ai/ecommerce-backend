@@ -79,3 +79,12 @@ class PaymentAttemptResponse(BaseModel):
     status: str
     amount_minor: int
     currency: str
+
+
+class StripeCheckoutSessionResponse(BaseModel):
+    """Схема за отговор при създаване на Stripe Checkout сесия."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    checkout_url: str
+    session_id: str

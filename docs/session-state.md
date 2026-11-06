@@ -1,18 +1,18 @@
 # Session State
 
-- **Текуща задача**: Реализация на симулирано плащане и отказ от поръчка върху клон `feat/payments`.
+- **Текуща задача**: Stripe Checkout (sandbox), webhook и отказ от неплатена поръчка в `feat/payments`.
 - **Реализирано**:
-  - Модел `PaymentAttempt` и разширяване на `ck_orders_status_valid` към `pending_payment`, `paid`, `cancelled`.
-  - Alembic миграция `c74a9d821e5f` с частичен уникален индекс за 1 успешен опит на поръчка.
-  - Локален `PaymentSimulator` и service/repository транзакции със заключване `FOR UPDATE`.
-  - `POST /orders/{id}/payments` (идемпотентност с `Idempotency-Key`, 201/200/409) и `POST /orders/{id}/cancel` (възстановяване на stock вкл. за деактивирани продукти, 200/409).
-  - Написани 15 интеграционни и конкурентни теста в `test_payments.py` и миграционен тест за съществуващи поръчки.
-  - Успешни проверки: 179/179 теста в pytest и 100% Ruff lint & format check.
-- **Оставащи ограничения / Непроверено**:
-  - Липсва автоматично изтичане (auto-expiration) на неплатени поръчки (таймери/worker).
-  - GitHub CI предстои след личен push на потребителя.
+  - `stripe>=16.1.0` в dependencies; модели `StripeCheckoutSession` и `StripeProcessedEvent`.
+  - Alembic миграция `e2b83a741f90` за таблици `stripe_checkout_sessions` и `stripe_processed_events`.
+  - `POST /orders/{id}/checkout-session`: валидация на EUR лимити, връща Stripe Checkout URL, идемпотентно връщане на отворена сесия без задържане на DB lock при външен call.
+  - `POST /webhooks/stripe`: проверка на `Stripe-Signature` над raw bytes, маркиране `paid` при `checkout.session.completed` (без повторно сваляне на stock), дедупликация на събития.
+  - `POST /orders/{id}/cancel`: прекратяване на отворена Stripe сесия, защита от race condition (webhook побеждава -> 409), възстановяване на stock вкл. за деактивирани продукти.
+  - Добавени 19 теста в `test_stripe_checkout.py`, тестове в `test_openapi.py` и `test_migration_sequence.py`.
+- **Проверено / Резултати**:
+  - Всички 199 теста в пълния pytest suite преминават успешно.
+  - 100% успешен Ruff check и format check (`ruff check .`, `ruff format --check .`).
 - **Работещи команди**:
   - `cd services/commerce && uv run --locked pytest -q`
   - `cd services/commerce && uv run --locked ruff check . && uv run --locked ruff format --check .`
-- **Засегнати файлове**: `app/modules/orders/*`, `migrations/versions/c74a9d821e5f_*`, `tests/*`, `README.md`, `docs/session-state.md`.
-- **Следваща стъпка**: Личен преглед, git commit и push на промените от потребителя.
+- **Засегнати файлове**: `app/modules/orders/*`, `migrations/*`, `tests/*`, `README.md`, `docs/session-state.md`.
+- **Следваща стъпка**: Личен преглед, git commit и push от потребителя; ръчен тест със `stripe listen`.

@@ -80,6 +80,12 @@ class Order(Base):
         cascade="all, delete-orphan",
         order_by="PaymentAttempt.id.asc()",
     )
+    stripe_sessions: Mapped[list["StripeCheckoutSession"]] = relationship(
+        "StripeCheckoutSession",
+        back_populates="order",
+        cascade="all, delete-orphan",
+        order_by="StripeCheckoutSession.id.asc()",
+    )
 
 
 class OrderItem(Base):
@@ -189,3 +195,121 @@ class PaymentAttempt(Base):
         back_populates="payment_attempts",
     )
 
+
+class StripeCheckoutSession(Base):
+    """SQLAlchemy ORM модел за Stripe Checkout сесии."""
+
+    __tablename__ = "stripe_checkout_sessions"
+    __table_args__ = (
+        UniqueConstraint(
+            "stripe_session_id",
+            name="uq_stripe_checkout_sessions_session_id",
+        ),
+        UniqueConstraint(
+            "idempotency_key",
+            name="uq_stripe_checkout_sessions_idempotency_key",
+        ),
+        CheckConstraint(
+            "status IN ('initiated', 'open', 'completed', 'cancelling', 'expired', 'failed')",
+            name="ck_stripe_checkout_sessions_status_valid",
+        ),
+        CheckConstraint(
+            "amount_minor >= 0",
+            name="ck_stripe_checkout_sessions_amount_minor_non_negative",
+        ),
+        CheckConstraint(
+            "currency = 'EUR'",
+            name="ck_stripe_checkout_sessions_currency_eur",
+        ),
+        Index("ix_stripe_checkout_sessions_order_id", "order_id"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True,
+    )
+    order_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("orders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="initiated",
+    )
+    amount_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    currency: Mapped[str] = mapped_column(
+        String(3),
+        nullable=False,
+        default="EUR",
+    )
+    stripe_session_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    checkout_url: Mapped[str | None] = mapped_column(
+        String(1024),
+        nullable=True,
+    )
+    idempotency_key: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.datetime.now(datetime.UTC),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.datetime.now(datetime.UTC),
+        server_default=func.now(),
+        onupdate=lambda: datetime.datetime.now(datetime.UTC),
+    )
+
+    order: Mapped["Order"] = relationship(
+        "Order",
+        back_populates="stripe_sessions",
+    )
+
+
+class StripeProcessedEvent(Base):
+    """SQLAlchemy ORM модел за обработени Stripe webhook събития с цел идемпотентност."""
+
+    __tablename__ = "stripe_processed_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "stripe_event_id",
+            name="uq_stripe_processed_events_event_id",
+        ),
+        Index("ix_stripe_processed_events_order_id", "order_id"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True,
+    )
+    stripe_event_id: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+    event_type: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+    order_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("orders.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.datetime.now(datetime.UTC),
+        server_default=func.now(),
+    )

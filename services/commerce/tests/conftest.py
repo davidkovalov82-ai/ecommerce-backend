@@ -86,6 +86,8 @@ def db_session() -> Generator[Session]:
     finally:
         session.rollback()
         # Премахваме всички добавени от тестовете редове
+        session.execute(text("DELETE FROM stripe_checkout_sessions"))
+        session.execute(text("DELETE FROM stripe_processed_events"))
         session.execute(text("DELETE FROM payment_attempts"))
         session.execute(text("DELETE FROM cart_items"))
         session.execute(text("DELETE FROM order_items"))
@@ -103,6 +105,8 @@ def db_session() -> Generator[Session]:
 def clean_users_table() -> Generator[None]:
     """Гарантира почистване на таблиците преди и след всеки тест."""
     with TestingSessionLocal() as session:
+        session.execute(text("DELETE FROM stripe_checkout_sessions"))
+        session.execute(text("DELETE FROM stripe_processed_events"))
         session.execute(text("DELETE FROM payment_attempts"))
         session.execute(text("DELETE FROM cart_items"))
         session.execute(text("DELETE FROM order_items"))
@@ -112,6 +116,8 @@ def clean_users_table() -> Generator[None]:
         session.commit()
     yield
     with TestingSessionLocal() as session:
+        session.execute(text("DELETE FROM stripe_checkout_sessions"))
+        session.execute(text("DELETE FROM stripe_processed_events"))
         session.execute(text("DELETE FROM payment_attempts"))
         session.execute(text("DELETE FROM cart_items"))
         session.execute(text("DELETE FROM order_items"))
