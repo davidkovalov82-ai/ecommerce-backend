@@ -6,11 +6,20 @@ client = TestClient(app)
 
 
 def test_openapi_registered_operations() -> None:
-    """Проверка чрез /openapi.json, че и трите основни операции са коректно регистрирани:
+    """Проверка чрез /openapi.json, че всички основни операции са коректно регистрирани:
 
-    1. GET /products (публичен списък с пагинация)
-    2. GET /products/{product_id} (детайли за единичен продукт)
-    3. POST /users (регистрация на нов потребител)
+    1. GET & POST /products
+    2. GET & PATCH /products/{product_id}
+    3. POST /users
+    4. POST /auth/login
+    5. GET /users/me
+    6. GET /cart
+    7. PUT & DELETE /cart/items/{product_id}
+    8. GET & POST /orders
+    9. GET /orders/{order_id}
+    10. POST /orders/{order_id}/cancel
+    11. POST /orders/{order_id}/checkout-session
+    12. POST /webhooks/stripe
     """
     response = client.get("/openapi.json")
     assert response.status_code == 200
@@ -71,29 +80,27 @@ def test_openapi_registered_operations() -> None:
     assert "get" in paths["/orders/{order_id}"]
     assert paths["/orders/{order_id}"]["get"]["operationId"] is not None
 
-    # 10. POST /orders/{order_id}/payments
-    assert "/orders/{order_id}/payments" in paths
-    assert "post" in paths["/orders/{order_id}/payments"]
-    assert paths["/orders/{order_id}/payments"]["post"]["operationId"] is not None
+    # Симулаторният endpoint за директно плащане е премахнат
+    assert "/orders/{order_id}/payments" not in paths
 
-    # 11. POST /orders/{order_id}/cancel
+    # 10. POST /orders/{order_id}/cancel
     assert "/orders/{order_id}/cancel" in paths
     assert "post" in paths["/orders/{order_id}/cancel"]
     assert paths["/orders/{order_id}/cancel"]["post"]["operationId"] is not None
 
-    # 12. POST /orders/{order_id}/checkout-session
+    # 11. POST /orders/{order_id}/checkout-session
     assert "/orders/{order_id}/checkout-session" in paths
     assert "post" in paths["/orders/{order_id}/checkout-session"]
     assert (
         paths["/orders/{order_id}/checkout-session"]["post"]["operationId"] is not None
     )
 
-    # 13. POST /webhooks/stripe
+    # 12. POST /webhooks/stripe
     assert "/webhooks/stripe" in paths
     assert "post" in paths["/webhooks/stripe"]
     assert paths["/webhooks/stripe"]["post"]["operationId"] is not None
 
-    # 14. Bearer сигурностна схема в компонентите
+    # 13. Bearer сигурностна схема в компонентите
     security_schemes = schema.get("components", {}).get("securitySchemes", {})
     assert "HTTPBearer" in security_schemes
     assert security_schemes["HTTPBearer"]["type"] == "http"

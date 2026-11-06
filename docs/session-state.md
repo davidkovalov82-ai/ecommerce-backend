@@ -1,18 +1,19 @@
 # Session State
 
-- **Текуща задача**: Stripe Checkout (sandbox), webhook и отказ от неплатена поръчка в `feat/payments`.
+- **Текуща задача**: Модулна реорганизация на целия каталог services/commerce/tests във feat/payments.
 - **Реализирано**:
-  - `stripe>=16.1.0` в dependencies; модели `StripeCheckoutSession` и `StripeProcessedEvent`.
-  - Alembic миграция `e2b83a741f90` за таблици `stripe_checkout_sessions` и `stripe_processed_events`.
-  - `POST /orders/{id}/checkout-session`: валидация на EUR лимити, връща Stripe Checkout URL, идемпотентно връщане на отворена сесия без задържане на DB lock при външен call.
-  - `POST /webhooks/stripe`: проверка на `Stripe-Signature` над raw bytes, маркиране `paid` при `checkout.session.completed` (без повторно сваляне на stock), дедупликация на събития.
-  - `POST /orders/{id}/cancel`: прекратяване на отворена Stripe сесия, защита от race condition (webhook побеждава -> 409), възстановяване на stock вкл. за деактивирани продукти.
-  - Добавени 19 теста в `test_stripe_checkout.py`, тестове в `test_openapi.py` и `test_migration_sequence.py`.
+  - Разделени тестове в поддиректории: accounts, catalog, cart, orders, payments, infrastructure, contracts.
+  - Добавена conftest fixture session_factory (без директен импорт на TestingSessionLocal в тестовете).
+  - Премахнати 10 дублирани теста в payments; запазена 100% функционална съвместимост (211/211 теста).
+  - Актуализиран ci.yml с точния път до test_zero_price_and_zero_stock_allowed.
+  - Актуализиран README.md с новата структура и команди за модулно стартиране.
 - **Проверено / Резултати**:
-  - Всички 199 теста в пълния pytest suite преминават успешно.
-  - 100% успешен Ruff check и format check (`ruff check .`, `ruff format --check .`).
+  - `uv run --locked pytest -q`: 211 passed in 9.60s.
+  - `uv run --locked ruff check .` & `format --check .`: 100% чисти, 0 грешки.
+  - Проверена изолация на БД и идентичност на събраните тестове преди и след реорганизацията.
+  - Непроверено: няма (всички 211 теста и линтери преминаха успешно).
 - **Работещи команди**:
   - `cd services/commerce && uv run --locked pytest -q`
   - `cd services/commerce && uv run --locked ruff check . && uv run --locked ruff format --check .`
-- **Засегнати файлове**: `app/modules/orders/*`, `migrations/*`, `tests/*`, `README.md`, `docs/session-state.md`.
-- **Следваща стъпка**: Личен преглед, git commit и push от потребителя; ръчен тест със `stripe listen`.
+- **Засегнати файлове**: `services/commerce/tests/*`, `.github/workflows/ci.yml`, `README.md`, `docs/session-state.md`.
+- **Следваща стъпка**: Потребителски преглед, git commit и push от потребителя.

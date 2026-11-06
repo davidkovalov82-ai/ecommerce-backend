@@ -9,9 +9,9 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.modules.accounts.models import User
 from scripts.promote_admin import promote_user
-from tests.conftest import TEST_DB_NAME
 
-SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "promote_admin.py"
+TEST_DB_NAME = "commerce_test"
+SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "promote_admin.py"
 
 
 def _get_cli_test_env() -> dict[str, str]:

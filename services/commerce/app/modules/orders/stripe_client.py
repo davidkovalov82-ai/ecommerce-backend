@@ -24,14 +24,13 @@ class StripeClient:
         client_reference_id: str,
         idempotency_key: str,
     ) -> stripe.checkout.Session:
-        """Създава Stripe Checkout сесия в режим 'payment' само за карти."""
+        """Създава Stripe Checkout сесия в режим 'payment' с динамични платежни методи от Stripe."""
         if not self.api_key:
             raise StripeNotConfigured("STRIPE_SECRET_KEY не е конфигуриран")
 
         return stripe.checkout.Session.create(
             api_key=self.api_key,
             mode="payment",
-            payment_method_types=["card"],
             line_items=line_items,
             success_url=success_url,
             cancel_url=cancel_url,
@@ -78,4 +77,3 @@ class StripeClient:
             sig_header=sig_header,
             secret=webhook_secret,
         )
-

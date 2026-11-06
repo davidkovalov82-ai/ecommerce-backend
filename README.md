@@ -189,11 +189,33 @@ uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 Проектът разполага с пълен набор от автоматизирани тестове, използващи отделна изолирана тестова база (`commerce_test`):
 
-### Изпълнение на всички тестове
+### Структура на тестовете (`services/commerce/tests/`)
 
+- **`accounts/`** – регистрация, вход, профил (`/users/me`), повишаване на права (CLI).
+- **`catalog/`** – детайли, пагинация, създаване, обновяване, валидация на цени и наличности, seed.
+- **`cart/`** – преглед на количката, добавяне/редакция/изтриване, паралелни операции, DB ограничения.
+- **`orders/`** – оформяне (checkout), идемпотентност (UUID ключове), транзакции и rollback, конкурентност, отказ (cancellation), DB ограничения.
+- **`payments/`** – Stripe Checkout сесии, валидация на webhook (подпис, sandbox/live mode), жизнен цикъл на плащанията (completed, async, expired), отказ през Stripe, reconciliation услуга, конфигурация и скриване на секрети.
+- **`infrastructure/`** – свързаност и lifecycle на сесиите (`test_database.py`), домейнови тестове на Alembic миграциите (`migrations/`).
+- **`contracts/`** – валидация на OpenAPI схемата (`test_openapi.py`).
+
+### Изпълнение на тестовете
+
+Всички тестове:
 ```bash
 cd services/commerce
 uv run pytest
+```
+
+Изпълнение по отделни модули:
+```bash
+uv run pytest tests/accounts/
+uv run pytest tests/catalog/
+uv run pytest tests/cart/
+uv run pytest tests/orders/
+uv run pytest tests/payments/
+uv run pytest tests/infrastructure/
+uv run pytest tests/contracts/
 ```
 
 ### Проверка за форматиране и статичен анализ (Ruff)
@@ -630,50 +652,13 @@ curl -s http://localhost:8000/orders/$ORDER_ID \
   -H "Authorization: Bearer $CUSTOMER_TOKEN"
 ```
 
-### 6. Симулирано плащане и отказ от поръчка (Payments & Cancellation Walkthrough)
-
-#### Демонстрация 1: Отказано плащане → успешен повторен опит
-
-```bash
-# 1. Първи опит с отказан фиктивен метод (test_declined) -> 201 Created (status: declined)
-PAY_KEY_1=$(python3 -c "import uuid; print(uuid.uuid4())")
-curl -i -X POST http://localhost:8000/orders/$ORDER_ID/payments \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $CUSTOMER_TOKEN" \
-  -H "Idempotency-Key: $PAY_KEY_1" \
-  -d '{"payment_method": "test_declined"}'
-
-# Поръчката остава в pending_payment и резервацията на stock е запазена:
-curl -s http://localhost:8000/orders/$ORDER_ID \
-  -H "Authorization: Bearer $CUSTOMER_TOKEN" | grep status
-
-# 2. Повторение със СЪЩИЯ ключ и същия метод -> 200 OK (връща същия declined опит без симулация)
-curl -i -X POST http://localhost:8000/orders/$ORDER_ID/payments \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $CUSTOMER_TOKEN" \
-  -H "Idempotency-Key: $PAY_KEY_1" \
-  -d '{"payment_method": "test_declined"}'
-
-# 3. Успешен повторен опит с НОВ ключ (test_success) -> 201 Created (status: succeeded)
-PAY_KEY_2=$(python3 -c "import uuid; print(uuid.uuid4())")
-curl -i -X POST http://localhost:8000/orders/$ORDER_ID/payments \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $CUSTOMER_TOKEN" \
-  -H "Idempotency-Key: $PAY_KEY_2" \
-  -d '{"payment_method": "test_success"}'
-
-# Поръчката преминава в статус 'paid', наличността в склада НЕ се намалява повторно:
-curl -s http://localhost:8000/orders/$ORDER_ID \
-  -H "Authorization: Bearer $CUSTOMER_TOKEN" | grep status
-```
-
-#### Демонстрация 2: Отделна поръчка → отказ от клиента и възстановена наличност
+### 6. Отказ от поръчка и възстановяване на наличност (Order Cancellation Walkthrough)
 
 ```bash
 # 1. Проверка на началната наличност на продукт #1
 curl -s http://localhost:8000/products/1 | grep stock
 
-# 2. Добавяне в количката и оформяне на нова отделна поръчка (за 2 бр.)
+# 2. Добавяне в количката и оформяне на нова поръчка (за 2 бр.)
 curl -s -X PUT http://localhost:8000/cart/items/1 \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $CUSTOMER_TOKEN" \
@@ -703,26 +688,129 @@ curl -i -X POST http://localhost:8000/orders/$CANCEL_ORDER_ID/cancel \
 curl -s http://localhost:8000/products/1 | grep stock
 ```
 
-### 7. Плащане чрез Stripe Checkout (Sandbox) и отказ от неплатена поръчка
+### 7. Плащане чрез Stripe Checkout (Sandbox / Live), отложени методи и сверка
 
-Модулът поддържа интеграция със Stripe чрез официалния Stripe Python SDK и хоствана платежна страница (Stripe Checkout) в режим `mode="payment"` (само карти).
+Модулът поддържа пълна интеграция със Stripe чрез официалния Stripe Python SDK и хоствана платежна страница (Stripe Checkout) в режим `mode="payment"` с поддръжка както на мигновени плащания (карти), така и на отложени методи (напр. SEPA Direct Debit, банкови преводи).
 
-#### Архитектура на интеграцията:
-- **`POST /orders/{order_id}/checkout-session`**: Изисква JWT автентикация, разрешено само за собствена поръчка със статус `pending_payment`. Генерира Stripe Checkout сесия със запазените заглавия, цени и количества от `OrderItem`. Проверява допустимите лимити на Stripe за EUR (минимум 50 цента, максимум 99 999 999 цента). Идемпотентно: повторно извикване за същата поръчка връща съществуващата отворена сесия без нов Stripe call.
-- **Връзка PostgreSQL ↔ Stripe (`stripe_checkout_sessions`)**: Свързва `order_id` със `stripe_session_id`. Базовата транзакция се освобождава преди мрежовото обръщение към Stripe API, предотвратявайки блокиране на редове или висящи връзки при забавяне на мрежата.
-- **Webhook (`POST /webhooks/stripe`)**: Публичен краен път (без JWT). Проверява криптографския подпис `Stripe-Signature` върху суровите байтове на входящата заявка чрез `stripe.Webhook.construct_event`. При събитие `checkout.session.completed` с `payment_status="paid"` проверява пълното съответствие на `amount_total`, `currency` и `session_id`, след което маркира поръчката като `paid`. Стоката НЕ се намалява отново. Всяко събитие се записва атомарно в таблица `stripe_processed_events` (`stripe_event_id` с уникален индекс) за защита от дублирани събития.
-- **Отказ от поръчка (`POST /orders/{order_id}/cancel`)**: Ако има активна отворена сесия в Stripe, бекендът първо я прекратява в Stripe (`stripe.checkout.Session.expire`), след което преминава към отмяна в базата данни. При състезание (race condition): ако плащането през webhook завърши успешно, докато тече отказът, плащането побеждава (поръчката остава `paid`, стоката не се връща в склада, а отказът връща `409 ORDER_ALREADY_PAID`). При потвърден отказ поръчката става `cancelled`, сесията `expired`, а резервираните бройки се връщат точно в `stock` на каталога (включително за продукт, деактивиран след checkout).
+#### 1. Таблица на състоянията и преходите
 
-#### Ръчна демонстрация в Swagger с тестова карта от Stripe
+| Начален статус на поръчката | Статус на опита (`attempt`) | Събитие / Действие | Краен статус на поръчката | Краен статус на опита | Складова наличност (`stock`) | Забележка |
+|---|---|---|---|---|---|---|
+| `pending_payment` | — / `expired` / `failed` | `POST /checkout-session` | `pending_payment` | `open` (след `initiated`) | Запазва се резерва | Нов опит се позволява само ако няма активна сесия и срокът не е изтекъл. |
+| `pending_payment` | `open` | `POST /checkout-session` | `pending_payment` | `open` | Запазва се резерва | Идемпотентно връща съществуващия `checkout_url`. |
+| `pending_payment` | `open` | Webhook `checkout.session.completed` (`paid`) | **`paid`** | **`completed`** | Запазва се резерва | Мигновено потвърдено плащане (карта). Наличност НЕ се намалява втори път. |
+| `pending_payment` | `open` | Webhook `checkout.session.completed` (`unpaid`) | **`payment_processing`** | **`processing`** | Запазва се резерва | Клиентът завършва Checkout с отложен метод. Отказът и втори линк се блокират (409). |
+| `payment_processing` | `processing` | Webhook `checkout.session.async_payment_succeeded` | **`paid`** | **`completed`** | Запазва се резерва | Парите са потвърдени асинхронно. Дори `completed` да е дошъл със закъснение. |
+| `payment_processing` | `processing` | Webhook `checkout.session.async_payment_failed` (срокът не е изтекъл) | **`pending_payment`** | **`failed`** | Запазва се резерва | Клиентът може да опита отново да плати с нов линк преди изтичане на срока. |
+| `payment_processing` | `processing` | Webhook `checkout.session.async_payment_failed` (срокът е изтекъл) | **`expired`** | **`failed`** | **Възстановява се (+qty)** | Резервацията е изтекла и плащането е отказано -> стоката се връща в склада. |
+| `pending_payment` | `open` | Webhook `checkout.session.expired` (срокът е изтекъл) | **`expired`** | **`expired`** | **Възстановява се (+qty)** | Stripe сесията е изтекла и срокът на поръчката е минал. |
+| `pending_payment` | `open` | `POST /orders/{id}/cancel` | **`cancelled`** | **`expired`** | **Възстановява се (+qty)** | Сесията се прекратява в Stripe, поръчката става `cancelled`, стоката се връща веднъж. |
+| `payment_processing` | `processing` | `POST /orders/{id}/cancel` | `payment_processing` | `processing` | Запазва се резерва | **409 ORDER_STATUS_CONFLICT**: Забранен отказ, докато банката обработва превода. |
+| `cancelled` / `expired` | `open` / `processing` | Закъсняло плащане (`paid`) | `cancelled` / `expired` | `completed` | Запазва се (не се пипа) | **Разхождение (`discrepancy`)**: Плащането се записва за ръчен одит, stock не се променя. |
 
-##### 1. Конфигурация на Stripe Sandbox и Webhook Forwarding
-В `services/commerce/.env` задайте вашия тестов таен ключ от Stripe:
-```env
-STRIPE_SECRET_KEY=sk_test_...
+#### 2. Архитектура на транзакциите и блокировките
+
+- **Ред на заключване**: За пълна защита от мъртви хватки (deadlocks), редът е строго:  
+  `Order` (`FOR UPDATE`) → `StripeCheckoutSession` (`FOR UPDATE`) → `Product` (сортирани възходящо по `id ASC`, `FOR UPDATE`).
+- **Изолирани мрежови повиквания**: DB транзакцията винаги се комитва преди мрежово повикване към Stripe API и се отваря нова транзакция със заключване след получаване на резултата.
+- **Идемпотентност и селективен IntegrityError**: Всяко webhook събитие се записва атомарно в `stripe_processed_events`. При паралелна доставка, `IntegrityError` се лови само при потвърден конфликт по `stripe_event_id`, като чужди грешки за цялост водят до rollback и 500.
+
+#### 3. Периодична сверка и управление на резервите (`scripts/reconcile_orders.py`)
+
+Всяка поръчка има срок на валидност на резерва (`expires_at`, конфигуриран чрез `ORDER_RESERVE_TIMEOUT_MINUTES`, по подразбиране 30 минути).
+Правило: **Истичането на срока е повод за проверка, а не повод за директно освобождаване на стока.**
+- Ако няма сесия в Stripe: резервът се освобождава локално (`expired`).
+- Ако сесията е `open` в Stripe: първо се извиква Stripe API за потвърдено прекратяване (`expire`), и едва след това стоката се освобождава.
+- Ако плащането е `paid`: поръчката преминава в `paid`.
+- Ако плащането все още се обработва асинхронно (`processing`) или Stripe API е недостъпен: **резервът се запазва**.
+
+Команда за ръчно или cron изпълнение:
+```bash
+cd services/commerce
+uv run python scripts/reconcile_orders.py
 ```
+
+#### 4. Stripe CLI команди за 4-те webhook събития
+
+Стартирайте препредаване на всички 4 събития:
+```bash
+stripe listen --events checkout.session.completed,checkout.session.async_payment_succeeded,checkout.session.async_payment_failed,checkout.session.expired --forward-to http://localhost:8000/webhooks/stripe
+```
+
+Симулиране на всяко от събитията чрез Stripe CLI (за бърз диспечерски тест):
+1. **Успешно приключване на Checkout**:
+   ```bash
+   stripe trigger checkout.session.completed
+   ```
+2. **Асинхронно потвърдено плащане (отложен метод)**:
+   ```bash
+   stripe trigger checkout.session.async_payment_succeeded
+   ```
+3. **Неуспешно асинхронно плащане**:
+   ```bash
+   stripe trigger checkout.session.async_payment_failed
+   ```
+4. **Изтичане на платежна сесия**:
+   ```bash
+   stripe trigger checkout.session.expired
+   ```
+
+#### 5. Ръчна демонстрация в Swagger на отложено плащане (SEPA / Deferred)
+
+1. **Конфигурация на средата (`services/commerce/.env`)**:
+   ```env
+   STRIPE_MODE=test
+   STRIPE_SECRET_KEY=sk_test_...
+   STRIPE_WEBHOOK_SECRET=whsec_...
+   ```
+2. **Стартирайте Stripe CLI слушалтеля**:
+   ```bash
+   stripe listen --events checkout.session.completed,checkout.session.async_payment_succeeded,checkout.session.async_payment_failed,checkout.session.expired --forward-to http://localhost:8000/webhooks/stripe
+   ```
+3. **Оформете поръчка**:
+   - Влезте в `http://localhost:8000/docs`, автентикирайте се с клиентски JWT токен.
+   - Добавете артикул в количката (`PUT /cart/items/{product_id}`).
+   - Създайте поръчка чрез `POST /orders` с хедър `Idempotency-Key: <UUID>`. Запомнете върнатия `id`.
+4. **Генерирайте платежен линк**:
+   - Извикайте `POST /orders/{order_id}/checkout-session`.
+   - Отворете върнатия `checkout_url` в браузъра си.
+5. **Изберете отложен платежен метод в Stripe Checkout**:
+   - Изберете **SEPA Direct Debit** (или друг наличен отложен метод в тестовия ви Stripe акаунт).
+   - Въведете тестови IBAN: `DE89 3704 0044 0532 0130 00` и произволно име.
+   - Потвърдете плащането. Stripe ще ви пренасочи към информационния success URL.
+6. **Проверете междинния статус в бекенда**:
+   - Webhook-ът получава `checkout.session.completed` с `payment_status="unpaid"`.
+   - Проверете `GET /orders/{order_id}` в Swagger: статусът е **`payment_processing`**.
+   - Опитайте `POST /orders/{order_id}/cancel`: бекендът връща **`409 ORDER_STATUS_CONFLICT`** (отказът е блокиран).
+   - Опитайте `POST /orders/{order_id}/checkout-session`: бекендът връща **`409 ORDER_STATUS_CONFLICT`** (втори линк е блокиран).
+   - Наличността в каталога остава резервирана.
+7. **Симулирайте финално асинхронно потвърждение**:
+   - През Stripe Dashboard (Payments → Incomplete / Processing) или Stripe CLI маркирайте плащането като успешно:
+     ```bash
+     stripe trigger checkout.session.async_payment_succeeded
+     ```
+   - След обработка на събитието проверете `GET /orders/{order_id}`: статусът става **`paid`**.
+
+#### 6. Инструкция за преминаване към Live среда
+
+За работа с реални разплащания се изисква:
+1. **Променлива на средата**:
+   ```env
+   STRIPE_MODE=live
+   ```
+2. **Валидирани live ключове**:
+   - `STRIPE_SECRET_KEY`: задължително започва с префикс `sk_live_`. Приложението ще отхвърли стартиране или зареждане на настройки с тестов ключ в live режим.
+   - `STRIPE_WEBHOOK_SECRET`: реален webhook secret от Stripe Production Dashboard (`whsec_...`).
+   - `STRIPE_SUCCESS_URL` и `STRIPE_CANCEL_URL`: задължително започват с **`https://`** (криптографски защитени публични адреси).
+3. **Валидация на входящи събития**:
+   - Бекендът сравнява `event.livemode == True`. Ако събитие от sandbox попадне в live бекенд (или обратно), то се отхвърля със статус `ignored` и причина `mode_mismatch`.
+4. **База данни**:
+   - Всички създавани опити се маркират автоматично с `mode = 'live'` в колоната `mode` на `stripe_checkout_sessions`.
+5. **Миграции**:
+   - Уверете се, че базата данни е обновена до последната миграция: `uv run alembic upgrade head`.
 Стартирайте локално препредаване на уебхуци чрез Stripe CLI:
 ```bash
-stripe listen --forward-to localhost:8000/webhooks/stripe
+stripe listen --events checkout.session.completed --forward-to http://localhost:8000/webhooks/stripe
 ```
 Копирайте изписания webhook secret (напр. `whsec_...`) и го въведете в `services/commerce/.env`:
 ```env

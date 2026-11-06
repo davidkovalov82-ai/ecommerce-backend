@@ -28,7 +28,7 @@ class Order(Base):
             name="uq_orders_user_id_idempotency_key",
         ),
         CheckConstraint(
-            "status IN ('pending_payment', 'paid', 'cancelled')",
+            "status IN ('pending_payment', 'payment_processing', 'paid', 'cancelled', 'expired')",
             name="ck_orders_status_valid",
         ),
         CheckConstraint("currency = 'EUR'", name="ck_orders_currency_eur"),
@@ -66,6 +66,10 @@ class Order(Base):
         nullable=False,
         default=lambda: datetime.datetime.now(datetime.UTC),
         server_default=func.now(),
+    )
+    expires_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )
 
     items: Mapped[list["OrderItem"]] = relationship(
@@ -210,8 +214,12 @@ class StripeCheckoutSession(Base):
             name="uq_stripe_checkout_sessions_idempotency_key",
         ),
         CheckConstraint(
-            "status IN ('initiated', 'open', 'completed', 'cancelling', 'expired', 'failed')",
+            "status IN ('initiated', 'open', 'processing', 'completed', 'cancelling', 'expired', 'failed')",
             name="ck_stripe_checkout_sessions_status_valid",
+        ),
+        CheckConstraint(
+            "mode IN ('test', 'live')",
+            name="ck_stripe_checkout_sessions_mode_valid",
         ),
         CheckConstraint(
             "amount_minor >= 0",
@@ -256,6 +264,12 @@ class StripeCheckoutSession(Base):
     idempotency_key: Mapped[str] = mapped_column(
         String(100),
         nullable=False,
+    )
+    mode: Mapped[str] = mapped_column(
+        String(10),
+        nullable=False,
+        default="test",
+        server_default="test",
     )
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True),

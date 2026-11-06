@@ -35,6 +35,9 @@ services:
       DB_PASSWORD: commerce
       DB_NAME: commerce
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set and non-empty}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_MODE: ${STRIPE_MODE:-test}
     ports:
       - "8000:8000"
     command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
