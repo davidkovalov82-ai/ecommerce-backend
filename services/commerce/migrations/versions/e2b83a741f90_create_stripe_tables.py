@@ -125,4 +125,3 @@ def downgrade() -> None:
         table_name="stripe_checkout_sessions",
     )
     op.drop_table("stripe_checkout_sessions")
-

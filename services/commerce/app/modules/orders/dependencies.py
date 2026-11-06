@@ -11,18 +11,12 @@ from app.modules.catalog.dependencies import get_product_repository
 from app.modules.catalog.repository import ProductRepository
 from app.modules.orders.repository import OrderRepository
 from app.modules.orders.service import OrderService
-from app.modules.orders.simulator import PaymentSimulator
 from app.modules.orders.stripe_client import StripeClient
 
 
 def get_stripe_client() -> StripeClient:
     """Фабрика за StripeClient."""
     return StripeClient()
-
-
-def get_payment_simulator() -> PaymentSimulator:
-    """Фабрика за локален симулатор на плащания."""
-    return PaymentSimulator()
 
 
 def get_order_repository(session: DbSession) -> OrderRepository:
@@ -36,7 +30,6 @@ def get_order_service(
     cart_repository: Annotated[CartRepository, Depends(get_cart_repository)],
     product_repository: Annotated[ProductRepository, Depends(get_product_repository)],
     user_repository: Annotated[UserRepository, Depends(get_user_repository)],
-    payment_simulator: Annotated[PaymentSimulator, Depends(get_payment_simulator)],
     stripe_client: Annotated[StripeClient, Depends(get_stripe_client)],
 ) -> OrderService:
     """Фабрика за OrderService, осигуряваща споделена сесия за всички участващи хранилища."""
@@ -46,7 +39,6 @@ def get_order_service(
         product_repository=product_repository,
         user_repository=user_repository,
         session=session,
-        payment_simulator=payment_simulator,
         stripe_client=stripe_client,
     )
 

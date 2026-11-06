@@ -2,24 +2,21 @@ import uuid
 from typing import Annotated, Any
 
 import stripe
-from fastapi import APIRouter, Header, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from starlette.concurrency import run_in_threadpool
 
 from app.modules.accounts.dependencies import CurrentUserDep
 from app.modules.orders.dependencies import OrderServiceDep
 from app.modules.orders.schemas import (
     CreateOrderRequest,
-    CreatePaymentRequest,
     OrderDetailResponse,
     OrderListResponse,
     OrderSummaryResponse,
-    PaymentAttemptResponse,
     StripeCheckoutSessionResponse,
 )
 from app.modules.orders.service import (
     CartEmpty,
     CartProductUnavailable,
-    IdempotencyConflict,
     InsufficientStock,
     InvalidOrderAmount,
     OrderAlreadyPaid,
@@ -118,53 +115,6 @@ def get_order(
 
 
 @router.post(
-    "/{order_id}/payments",
-    response_model=PaymentAttemptResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-def create_payment(
-    order_id: int,
-    payload: CreatePaymentRequest,
-    current_user: CurrentUserDep,
-    order_service: OrderServiceDep,
-    idempotency_key: Annotated[uuid.UUID, Header(alias="Idempotency-Key")],
-    response: Response,
-) -> PaymentAttemptResponse:
-    """HTTP обработчик за симулирано плащане на поръчка с идемпотентност."""
-    try:
-        attempt, is_new = order_service.create_payment(
-            order_id=order_id,
-            user_id=current_user.id,
-            idempotency_key=str(idempotency_key),
-            payment_method=payload.payment_method,
-        )
-        if not is_new:
-            response.status_code = status.HTTP_200_OK
-        return PaymentAttemptResponse.model_validate(attempt)
-    except OrderNotFound:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"code": "ORDER_NOT_FOUND", "message": "Order not found"},
-        )
-    except IdempotencyConflict:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": "IDEMPOTENCY_CONFLICT",
-                "message": "Idempotency key already used with different payment method",
-            },
-        )
-    except OrderStateConflict as e:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": "ORDER_STATUS_CONFLICT",
-                "message": f"Cannot pay order with status '{e.current_status}'",
-            },
-        )
-
-
-@router.post(
     "/{order_id}/checkout-session",
     response_model=StripeCheckoutSessionResponse,
     status_code=status.HTTP_200_OK,
@@ -254,6 +204,11 @@ def cancel_order(
                 "code": "ORDER_STATUS_CONFLICT",
                 "message": f"Cannot cancel order with status '{e.current_status}'",
             },
+        )
+    except StripeNotConfigured as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "STRIPE_NOT_CONFIGURED", "message": str(e)},
         )
     except StripeServiceError:
         raise HTTPException(

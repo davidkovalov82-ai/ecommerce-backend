@@ -127,11 +127,34 @@ class OrderRepository:
         )
         return self._session.scalars(stmt).first()
 
+    def get_latest_stripe_session_by_order_id_for_update(
+        self, order_id: int
+    ) -> StripeCheckoutSession | None:
+        """Извлича последната Stripe сесия за поръчка със заключване FOR UPDATE."""
+        stmt = (
+            select(StripeCheckoutSession)
+            .where(StripeCheckoutSession.order_id == order_id)
+            .order_by(StripeCheckoutSession.id.desc())
+            .with_for_update()
+        )
+        return self._session.scalars(stmt).first()
+
     def get_stripe_session_by_id(
         self, session_db_id: int
     ) -> StripeCheckoutSession | None:
         """Извлича Stripe сесия по нейния първичен ключ в БД."""
         return self._session.get(StripeCheckoutSession, session_db_id)
+
+    def get_stripe_session_by_id_for_update(
+        self, session_db_id: int
+    ) -> StripeCheckoutSession | None:
+        """Извлича Stripe сесия по ID със заключване FOR UPDATE."""
+        stmt = (
+            select(StripeCheckoutSession)
+            .where(StripeCheckoutSession.id == session_db_id)
+            .with_for_update()
+        )
+        return self._session.scalars(stmt).first()
 
     def get_stripe_session_by_stripe_id(
         self, stripe_session_id: str
@@ -139,6 +162,17 @@ class OrderRepository:
         """Извлича запис за сесия по нейния публичен Stripe session ID."""
         stmt = select(StripeCheckoutSession).where(
             StripeCheckoutSession.stripe_session_id == stripe_session_id
+        )
+        return self._session.scalars(stmt).first()
+
+    def get_stripe_session_by_stripe_id_for_update(
+        self, stripe_session_id: str
+    ) -> StripeCheckoutSession | None:
+        """Извлича запис за сесия по Stripe session ID със заключване FOR UPDATE."""
+        stmt = (
+            select(StripeCheckoutSession)
+            .where(StripeCheckoutSession.stripe_session_id == stripe_session_id)
+            .with_for_update()
         )
         return self._session.scalars(stmt).first()
 

@@ -71,24 +71,22 @@ def test_openapi_registered_operations() -> None:
     assert "get" in paths["/orders/{order_id}"]
     assert paths["/orders/{order_id}"]["get"]["operationId"] is not None
 
-    # 10. POST /orders/{order_id}/payments
-    assert "/orders/{order_id}/payments" in paths
-    assert "post" in paths["/orders/{order_id}/payments"]
-    assert paths["/orders/{order_id}/payments"]["post"]["operationId"] is not None
+    # Симулаторният endpoint за директно плащане е премахнат
+    assert "/orders/{order_id}/payments" not in paths
 
-    # 11. POST /orders/{order_id}/cancel
+    # 10. POST /orders/{order_id}/cancel
     assert "/orders/{order_id}/cancel" in paths
     assert "post" in paths["/orders/{order_id}/cancel"]
     assert paths["/orders/{order_id}/cancel"]["post"]["operationId"] is not None
 
-    # 12. POST /orders/{order_id}/checkout-session
+    # 11. POST /orders/{order_id}/checkout-session
     assert "/orders/{order_id}/checkout-session" in paths
     assert "post" in paths["/orders/{order_id}/checkout-session"]
     assert (
         paths["/orders/{order_id}/checkout-session"]["post"]["operationId"] is not None
     )
 
-    # 13. POST /webhooks/stripe
+    # 12. POST /webhooks/stripe
     assert "/webhooks/stripe" in paths
     assert "post" in paths["/webhooks/stripe"]
     assert paths["/webhooks/stripe"]["post"]["operationId"] is not None

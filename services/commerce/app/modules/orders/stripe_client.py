@@ -31,7 +31,6 @@ class StripeClient:
         return stripe.checkout.Session.create(
             api_key=self.api_key,
             mode="payment",
-            payment_method_types=["card"],
             line_items=line_items,
             success_url=success_url,
             cancel_url=cancel_url,
@@ -78,4 +77,3 @@ class StripeClient:
             sig_header=sig_header,
             secret=webhook_secret,
         )
-

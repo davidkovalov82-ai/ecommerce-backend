@@ -630,50 +630,13 @@ curl -s http://localhost:8000/orders/$ORDER_ID \
   -H "Authorization: Bearer $CUSTOMER_TOKEN"
 ```
 
-### 6. Симулирано плащане и отказ от поръчка (Payments & Cancellation Walkthrough)
-
-#### Демонстрация 1: Отказано плащане → успешен повторен опит
-
-```bash
-# 1. Първи опит с отказан фиктивен метод (test_declined) -> 201 Created (status: declined)
-PAY_KEY_1=$(python3 -c "import uuid; print(uuid.uuid4())")
-curl -i -X POST http://localhost:8000/orders/$ORDER_ID/payments \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $CUSTOMER_TOKEN" \
-  -H "Idempotency-Key: $PAY_KEY_1" \
-  -d '{"payment_method": "test_declined"}'
-
-# Поръчката остава в pending_payment и резервацията на stock е запазена:
-curl -s http://localhost:8000/orders/$ORDER_ID \
-  -H "Authorization: Bearer $CUSTOMER_TOKEN" | grep status
-
-# 2. Повторение със СЪЩИЯ ключ и същия метод -> 200 OK (връща същия declined опит без симулация)
-curl -i -X POST http://localhost:8000/orders/$ORDER_ID/payments \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $CUSTOMER_TOKEN" \
-  -H "Idempotency-Key: $PAY_KEY_1" \
-  -d '{"payment_method": "test_declined"}'
-
-# 3. Успешен повторен опит с НОВ ключ (test_success) -> 201 Created (status: succeeded)
-PAY_KEY_2=$(python3 -c "import uuid; print(uuid.uuid4())")
-curl -i -X POST http://localhost:8000/orders/$ORDER_ID/payments \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $CUSTOMER_TOKEN" \
-  -H "Idempotency-Key: $PAY_KEY_2" \
-  -d '{"payment_method": "test_success"}'
-
-# Поръчката преминава в статус 'paid', наличността в склада НЕ се намалява повторно:
-curl -s http://localhost:8000/orders/$ORDER_ID \
-  -H "Authorization: Bearer $CUSTOMER_TOKEN" | grep status
-```
-
-#### Демонстрация 2: Отделна поръчка → отказ от клиента и възстановена наличност
+### 6. Отказ от поръчка и възстановяване на наличност (Order Cancellation Walkthrough)
 
 ```bash
 # 1. Проверка на началната наличност на продукт #1
 curl -s http://localhost:8000/products/1 | grep stock
 
-# 2. Добавяне в количката и оформяне на нова отделна поръчка (за 2 бр.)
+# 2. Добавяне в количката и оформяне на нова поръчка (за 2 бр.)
 curl -s -X PUT http://localhost:8000/cart/items/1 \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $CUSTOMER_TOKEN" \
@@ -722,7 +685,7 @@ STRIPE_SECRET_KEY=sk_test_...
 ```
 Стартирайте локално препредаване на уебхуци чрез Stripe CLI:
 ```bash
-stripe listen --forward-to localhost:8000/webhooks/stripe
+stripe listen --events checkout.session.completed --forward-to http://localhost:8000/webhooks/stripe
 ```
 Копирайте изписания webhook secret (напр. `whsec_...`) и го въведете в `services/commerce/.env`:
 ```env
