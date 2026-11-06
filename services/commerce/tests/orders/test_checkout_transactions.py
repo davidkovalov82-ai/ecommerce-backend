@@ -105,4 +105,3 @@ def test_late_rollback_on_simulated_error_before_commit(
     r_idempotent = client.post("/orders", json={}, headers=headers)
     assert r_idempotent.status_code == 201
     assert r_idempotent.json()["id"] == order_data["id"]
-

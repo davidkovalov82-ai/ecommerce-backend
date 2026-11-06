@@ -95,4 +95,3 @@ def test_payment_attempts_database_constraints(db_session: Session) -> None:
     with pytest.raises(IntegrityError):
         db_session.commit()
     db_session.rollback()
-

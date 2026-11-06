@@ -371,4 +371,3 @@ def test_order_processing_and_stripe_mode_migration() -> None:
         with admin_engine.connect() as conn:
             conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
         admin_engine.dispose()
-

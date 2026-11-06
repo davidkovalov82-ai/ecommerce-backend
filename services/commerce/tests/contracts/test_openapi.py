@@ -105,4 +105,3 @@ def test_openapi_registered_operations() -> None:
     assert "HTTPBearer" in security_schemes
     assert security_schemes["HTTPBearer"]["type"] == "http"
     assert security_schemes["HTTPBearer"]["scheme"] == "bearer"
-

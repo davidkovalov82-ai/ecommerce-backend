@@ -294,4 +294,3 @@ def test_webhook_mode_mismatch_rejection(db_session: Session) -> None:
         assert resp.status_code == 200
         assert resp.json()["status"] == "ignored"
         assert resp.json()["reason"] == "mode_mismatch"
-

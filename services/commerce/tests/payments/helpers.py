@@ -97,4 +97,3 @@ def _generate_stripe_signature(
     signed_payload = f"{ts}.".encode() + payload_bytes
     sig = hmac.new(secret.encode(), signed_payload, hashlib.sha256).hexdigest()
     return f"t={ts},v1={sig}"
-

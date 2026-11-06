@@ -323,4 +323,3 @@ def test_cannot_cancel_or_create_checkout_in_payment_processing(
     )
     assert resp_checkout.status_code == 409
     assert resp_checkout.json()["detail"]["code"] == "ORDER_STATUS_CONFLICT"
-

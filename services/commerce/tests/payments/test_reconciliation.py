@@ -151,4 +151,3 @@ def test_reconciliation_service_and_rules(db_session: Session) -> None:
     # Повторна сверка не променя нищо допълнително (идемпотентност)
     stats2 = service.reconcile_unresolved_orders(now=now)
     assert stats2["expired"] == 0
-

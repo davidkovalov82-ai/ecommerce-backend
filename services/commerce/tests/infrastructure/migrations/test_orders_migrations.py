@@ -85,4 +85,3 @@ def test_orders_migration_upgrade_with_existing_data() -> None:
         with admin_engine.connect() as conn:
             conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
         admin_engine.dispose()
-

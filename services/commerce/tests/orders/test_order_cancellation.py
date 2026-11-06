@@ -134,4 +134,3 @@ def test_cancel_paid_order_returns_409(db_session: Session) -> None:
     )
     assert r.status_code == 409
     assert r.json()["detail"]["code"] == "ORDER_ALREADY_PAID"
-
