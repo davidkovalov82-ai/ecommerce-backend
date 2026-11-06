@@ -76,9 +76,10 @@ docker compose --env-file services/commerce/.env up --build
 
 Compose автоматично:
 1. Стартира PostgreSQL контейнер и изчаква готовността му (healthcheck).
-2. Построява контейнера на Commerce API чрез `Dockerfile`.
-3. Прилага автоматично последните Alembic миграции (`alembic upgrade head`).
-4. Стартира API сървъра на адрес `http://localhost:8000`.
+2. Стартира **Mailpit** (локален SMTP сървър на порт `1025` и Web пощенска кутия на `http://localhost:8025`).
+3. Построява контейнера на Commerce API чрез `Dockerfile`.
+4. Прилага автоматично последните Alembic миграции (`alembic upgrade head`).
+5. Стартира API сървъра на адрес `http://localhost:8000`.
 
 ### Преминаване от предишния запуск (`services/commerce`)
 
@@ -117,10 +118,11 @@ docker compose --env-file services/commerce/.env exec api python scripts/promote
 cd services/commerce && uv run python scripts/promote_admin.py admin@example.com
 ```
 
-### Интерактивна документация
+### Интерактивна документация и локална пощенска кутия
 Отворете браузъра си на:
 - **Swagger UI**: [http://localhost:8000/docs](http://localhost:8000/docs)
 - **OpenAPI JSON**: [http://localhost:8000/openapi.json](http://localhost:8000/openapi.json)
+- **Mailpit Web UI (пощенска кутия)**: [http://localhost:8025](http://localhost:8025)
 
 ---
 
@@ -152,10 +154,10 @@ DB_NAME=commerce
 JWT_SECRET=вашият_генериран_ключ_поне_32_байта
 ```
 
-### 2. Стартиране само на базата данни (от корена на хранилището)
+### 2. Стартиране на базата данни и Mailpit (от корена на хранилището)
 
 ```bash
-docker compose --env-file services/commerce/.env up -d db
+docker compose --env-file services/commerce/.env up -d db mailpit
 ```
 
 ### 3. Инсталиране на зависимостите
@@ -183,6 +185,27 @@ uv run python scripts/seed_products.py
 uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
+### 7. Обработка на имейл известия за платени поръчки (Transactional Outbox Worker)
+
+При всяко преминаване на поръчка в статус `paid` (през Stripe Checkout webhook, асинхронно банково потвърждение или сверка) в същата транзакция се записва събитие в outbox таблицата. За да обработите чакащите събития и да изпратите имейли:
+
+```bash
+# Локално:
+cd services/commerce && uv run python scripts/process_outbox.py
+
+# С изричен лимит за брой събития (по подразбиране 50):
+uv run python scripts/process_outbox.py --limit 100
+
+# В работещ Docker контейнер (от корена на хранилището):
+docker compose --env-file services/commerce/.env exec api python scripts/process_outbox.py
+```
+
+Изпратените съобщения могат да се прегледат веднага в локалната пощенска кутия:
+- **Mailpit Web UI**: [http://localhost:8025](http://localhost:8025)
+
+> [!NOTE]
+> **Ограничение на модела (At-least-once доставка)**: Webhook handler-ът не извиква SMTP и не държи DB заключване по време на мрежови заявки. Worker-ът чете събитията, затваря сесията преди изпращане по SMTP и в отделна кратка транзакция маркира събитието като `sent`. Ако SMTP сървърът (Mailpit) приеме писмото, но процесът спре преди запис в БД, събитието остава със статус `pending` (или `failed`) и при следващо изпълнение ще бъде изпратено отново.
+
 ---
 
 ## Тестване и проверка на кода
@@ -194,7 +217,7 @@ uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - **`accounts/`** – регистрация, вход, профил (`/users/me`), повишаване на права (CLI).
 - **`catalog/`** – детайли, пагинация, създаване, обновяване, валидация на цени и наличности, seed.
 - **`cart/`** – преглед на количката, добавяне/редакция/изтриване, паралелни операции, DB ограничения.
-- **`orders/`** – оформяне (checkout), идемпотентност (UUID ключове), транзакции и rollback, конкурентност, отказ (cancellation), DB ограничения.
+- **`orders/`** – оформяне (checkout), идемпотентност (UUID ключове), транзакции и rollback, конкурентност, отказ (cancellation), Transactional Outbox известия (`order.paid`), DB ограничения.
 - **`payments/`** – Stripe Checkout сесии, валидация на webhook (подпис, sandbox/live mode), жизнен цикъл на плащанията (completed, async, expired), отказ през Stripe, reconciliation услуга, конфигурация и скриване на секрети.
 - **`infrastructure/`** – свързаност и lifecycle на сесиите (`test_database.py`), домейнови тестове на Alembic миграциите (`migrations/`).
 - **`contracts/`** – валидация на OpenAPI схемата (`test_openapi.py`).
@@ -217,6 +240,22 @@ uv run pytest tests/payments/
 uv run pytest tests/infrastructure/
 uv run pytest tests/contracts/
 ```
+
+### Автоматизиран тест на сценария за известия и retry (`make test-notifications-retry`)
+
+От **корена на хранилището** можете да стартирате цялостния тест за известия и retry цикъл (при недостъпен SMTP сървър и последващо възстановяване). Командата автоматично вдига тестови контейнери за PostgreSQL и Mailpit през Docker Compose, изчаква тяхната готовност и изпълнява теста в изолирана база данни (`commerce_test`):
+
+```bash
+# От корена на проекта:
+make test-notifications-retry
+```
+
+При грешка командата:
+1. Завършва с ненулев код за грешка (`exit code != 0`).
+2. Показва на коя конкретна стъпка е възникнал сривът:
+   - **Стъпка 1**: Неуспешно стартиране на Docker контейнерите (`db`, `mailpit`).
+   - **Стъпка 2**: Изтичане на времето за изчакване на готовност на PostgreSQL (порт 5432) или Mailpit (портове 1025 и 8025).
+   - **Стъпка 3**: Неуспешен assert в теста (поръчка в статус `paid`, събитие `pending` с записан `last_error` при срив, преход към `sent` при възстановен Mailpit, проверка на реално полученото съобщение през Mailpit REST API и липса на дубликати).
 
 ### Проверка за форматиране и статичен анализ (Ruff)
 
@@ -841,6 +880,18 @@ STRIPE_WEBHOOK_SECRET=whsec_...
 8. В Swagger проверете `GET /orders/{order_id}`:
    - Статусът на поръчката вече е **`paid`**.
    - В каталога (`GET /products/{id}`) складовата наличност не е намалявана втори път.
+   - В същата база данни транзакция е записано събитие `order.paid` със статус `pending` в таблицата `order_outbox_events`.
+9. Стартирайте скрипта за обработка на Outbox събития:
+   ```bash
+   # В работещ Docker контейнер (от корена на хранилището):
+   docker compose --env-file services/commerce/.env exec api python scripts/process_outbox.py
+
+   # Или локално:
+   cd services/commerce && uv run python scripts/process_outbox.py
+   ```
+10. Отворете пощенската кутия в браузъра: **[http://localhost:8025](http://localhost:8025)**:
+   - Ще видите полученото имейл потвърждение с номер на поръчката, обща сума и валута.
+   - В базата данни събитието вече е маркирано със статус `sent`.
 
 ##### 4. Сценарий B: Отхвърлена карта (Declined Card)
 1. Оформете нова поръчка (`POST /orders`) и генерирайте платежен линк (`POST /orders/{order_id}/checkout-session`).
@@ -873,6 +924,10 @@ STRIPE_WEBHOOK_SECRET=whsec_...
   - Плащането и отказът заключват един и същи ред на поръчката с `SELECT ... FOR UPDATE` в PostgreSQL преди решение за промяна.
   - При отказ засегнатите продукти се заключват във възходящ ред по ID, а запазените количества се връщат точно в `stock` (включително за продукт, деактивиран след checkout). Количката не се възстановява.
   - На ниво PostgreSQL уникалността се гарантира с `(order_id, idempotency_key)` и частичен уникален индекс за най-много един успешен опит на поръчка (`WHERE status = 'succeeded'`).
+- **Transactional Outbox за известия**:
+  - При преход към `paid` събитието `order.paid` се записва в същата PostgreSQL транзакция в таблицата `order_outbox_events` с уникално ограничение `(order_id, event_type)`.
+  - Webhook заявките не извършват SMTP мрежови повиквания и не държат отворени DB транзакции.
+  - Изпращането се извършва асинхронно от worker (`scripts/process_outbox.py`), който чете чакащите събития, освобождава връзката към БД преди изпращането през SMTP и обновява статуса в отделна транзакция.
 - **Кратковременни токени**: Access токенът е валиден 15 минути. В тази стъпка нарочно **не са** включени refresh tokens или списък за оттегляне (token revocation / denylist), за да се запази архитектурата проста и без излишен овърхед.
 - **Stateless проверка с актуалност от БД**: Токенът се проверява криптографски с HMAC-SHA256 (`HS256`). Потребителският запис се зарежда директно от базата данни при всяка защитена заявка, което гарантира, че незабавно се отчита всяка промяна на ролята дори със съществуващ токен.
 - **Изисквания за продукционна среда**:

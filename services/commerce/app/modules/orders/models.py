@@ -1,6 +1,8 @@
 import datetime
+from typing import Any
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     CheckConstraint,
     DateTime,
@@ -326,4 +328,67 @@ class StripeProcessedEvent(Base):
         nullable=False,
         default=lambda: datetime.datetime.now(datetime.UTC),
         server_default=func.now(),
+    )
+
+
+class OrderOutboxEvent(Base):
+    """SQLAlchemy ORM модел за Outbox събития (Transactional Outbox)."""
+
+    __tablename__ = "order_outbox_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "order_id",
+            "event_type",
+            name="uq_order_outbox_order_id_event_type",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'sent', 'failed')",
+            name="ck_order_outbox_status_valid",
+        ),
+        Index("ix_order_outbox_status_created", "status", "created_at"),
+        Index("ix_order_outbox_order_id", "order_id"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True,
+    )
+    order_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("orders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    event_type: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="order.paid",
+    )
+    payload: Mapped[dict[str, Any]] = mapped_column(
+        JSON,
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="pending",
+    )
+    retry_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+    last_error: Mapped[str | None] = mapped_column(
+        String(1000),
+        nullable=True,
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.datetime.now(datetime.UTC),
+        server_default=func.now(),
+    )
+    processed_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )

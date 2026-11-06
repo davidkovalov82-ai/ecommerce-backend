@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     stripe_cancel_url: str = "http://localhost:8000/orders/{order_id}?payment=cancelled"
     order_reserve_timeout_minutes: int = 30
 
+    smtp_host: str = "localhost"
+    smtp_port: int = 1025
+    smtp_from: str = "noreply@example.com"
+    mailpit_web_url: str = "http://localhost:8025"
+
     @field_validator("jwt_secret")
     @classmethod
     def validate_jwt_secret(cls, v: str) -> str:
