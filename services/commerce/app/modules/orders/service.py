@@ -5,8 +5,9 @@ from sqlalchemy.orm import Session
 from app.modules.accounts.repository import UserRepository
 from app.modules.cart.repository import CartRepository
 from app.modules.catalog.repository import ProductRepository
-from app.modules.orders.models import Order, OrderItem
+from app.modules.orders.models import Order, OrderItem, PaymentAttempt
 from app.modules.orders.repository import OrderRepository
+from app.modules.orders.simulator import PaymentSimulator
 
 
 class CartEmpty(Exception):
@@ -33,6 +34,24 @@ class OrderNotFound(Exception):
     """Сигнализира, че търсената поръчка не съществува или принадлежи на друг потребител."""
 
 
+class OrderAlreadyPaid(Exception):
+    """Сигнализира за опит за отмяна на вече платена поръчка."""
+
+
+class OrderStateConflict(Exception):
+    """Сигнализира за невалиден статус на поръчката при опит за преход."""
+
+    def __init__(
+        self, current_status: str, message: str = "Order status conflict"
+    ) -> None:
+        super().__init__(message)
+        self.current_status = current_status
+
+
+class IdempotencyConflict(Exception):
+    """Сигнализира за повторно използване на същия idempotency key с различен метод."""
+
+
 class OrderService:
     """Услуга за управление на жизнения цикъл на поръчките."""
 
@@ -43,12 +62,14 @@ class OrderService:
         product_repository: ProductRepository,
         user_repository: UserRepository,
         session: Session,
+        payment_simulator: PaymentSimulator | None = None,
     ) -> None:
         self._order_repository = order_repository
         self._cart_repository = cart_repository
         self._product_repository = product_repository
         self._user_repository = user_repository
         self._session = session
+        self._payment_simulator = payment_simulator or PaymentSimulator()
 
     def create_order(self, user_id: int, idempotency_key: str) -> Order:
         """Сценарий: оформяне на цялата текуща количка в нова поръчка.
@@ -183,3 +204,146 @@ class OrderService:
             limit=limit,
             offset=offset,
         )
+
+    def create_payment(
+        self,
+        order_id: int,
+        user_id: int,
+        idempotency_key: str,
+        payment_method: str,
+    ) -> tuple[PaymentAttempt, bool]:
+        """Сценарий: симулирано плащане на поръчка с идемпотентност и заключване.
+
+        Транзакционен протокол:
+        1. Заключване на реда на поръчката с FOR UPDATE.
+        2. Проверка за собственост и съществуване (OrderNotFound при чужда/липсваща).
+        3. Проверка за съществуващ опит с този ключ ПРЕДИ проверка на статуса:
+           - Различен payment_method -> 409 (IdempotencyConflict).
+           - Същият payment_method -> 200 (връща съществуващия запис без повторен симулатор).
+        4. Проверка на текущия статус на поръчката (само pending_payment се допуска).
+        5. Извикване на симулатора:
+           - succeeded -> статусът на поръчката става paid (без повторна промяна на stock).
+           - declined -> поръчката остава pending_payment.
+        6. Записване на PaymentAttempt.
+        7. Flush и commit на транзакцията.
+        """
+        try:
+            # 1. Заключваме реда на поръчката
+            order = self._order_repository.get_by_id_and_user_id_for_update(
+                order_id=order_id,
+                user_id=user_id,
+            )
+            if order is None:
+                raise OrderNotFound(f"Order with id {order_id} not found")
+
+            # 2. Проверка за повторение ПРЕДИ проверка на статуса
+            existing_attempt = (
+                self._order_repository.get_payment_attempt_by_order_and_key(
+                    order_id=order.id,
+                    idempotency_key=idempotency_key,
+                )
+            )
+            if existing_attempt is not None:
+                if existing_attempt.payment_method != payment_method:
+                    raise IdempotencyConflict(
+                        "Idempotency key already used with different payment method"
+                    )
+                return existing_attempt, False
+
+            # 3. Нов опит за плащане: поръчката трябва да е в pending_payment
+            if order.status != "pending_payment":
+                raise OrderStateConflict(
+                    current_status=order.status,
+                    message=f"Cannot pay order with status '{order.status}'",
+                )
+
+            # 4. Локален симулатор определя резултата
+            sim_result = self._payment_simulator.simulate(payment_method)
+            if sim_result == "succeeded":
+                order.status = "paid"
+                # Stock не се променя: количествата вече са резервирани при checkout
+
+            # 5. Създаваме запис за опита
+            attempt = PaymentAttempt(
+                order_id=order.id,
+                payment_method=payment_method,
+                status=sim_result,
+                amount_minor=order.total_minor,
+                currency=order.currency,
+                idempotency_key=idempotency_key,
+            )
+            self._order_repository.add_payment_attempt(attempt)
+            self._session.flush()
+            self._session.commit()
+            self._session.refresh(attempt)
+            return attempt, True
+        except Exception:
+            self._session.rollback()
+            raise
+
+    def cancel_order(self, order_id: int, user_id: int) -> Order:
+        """Сценарий: отказ от поръчка от клиента и възстановяване на резервирания stock.
+
+        Транзакционен протокол:
+        1. Заключване на реда на поръчката с FOR UPDATE.
+        2. Проверка за собственост и съществуване (OrderNotFound при чужда/липсваща).
+        3. Ако вече е cancelled -> 200 (идемпотентно без повторно връщане на stock).
+        4. Ако е paid -> 409 (OrderAlreadyPaid).
+        5. Ако е pending_payment:
+           - Променя статуса на cancelled.
+           - Заключва засегнатите продукти във възходящ ред по ID.
+           - Възстановява точните количества от запазените OrderItem (вкл. за деактивирани продукти).
+        6. Flush и commit на транзакцията.
+        """
+        try:
+            # 1. Заключваме реда на поръчката
+            order = self._order_repository.get_by_id_and_user_id_for_update(
+                order_id=order_id,
+                user_id=user_id,
+            )
+            if order is None:
+                raise OrderNotFound(f"Order with id {order_id} not found")
+
+            # 2. Идемпотентен отговор при вече отказана поръчка
+            if order.status == "cancelled":
+                return order
+
+            # 3. Отказ на платена поръчка е забранен (възстановяване на средства е извън обхват)
+            if order.status == "paid":
+                raise OrderAlreadyPaid("Cannot cancel paid order")
+
+            if order.status != "pending_payment":
+                raise OrderStateConflict(
+                    current_status=order.status,
+                    message=f"Cannot cancel order with status '{order.status}'",
+                )
+
+            # 4. Преминаване към cancelled
+            order.status = "cancelled"
+
+            # 5. Възстановяване на количествата в stock
+            product_quantities: dict[int, int] = {}
+            for item in order.items:
+                product_quantities[item.product_id] = (
+                    product_quantities.get(item.product_id, 0) + item.quantity
+                )
+
+            sorted_product_ids = sorted(product_quantities.keys())
+            locked_products = self._product_repository.get_by_ids_for_update(
+                sorted_product_ids
+            )
+            products_by_id = {p.id: p for p in locked_products}
+
+            for pid, qty in product_quantities.items():
+                product = products_by_id.get(pid)
+                if product is not None:
+                    product.stock += qty
+
+            self._session.flush()
+            self._session.commit()
+            self._session.refresh(order)
+            _ = order.items
+            return order
+        except Exception:
+            self._session.rollback()
+            raise

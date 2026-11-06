@@ -1,15 +1,18 @@
 # Session State
 
-- **Текуща задача**: Завършване на проверките и поправките по модул `orders` върху клон `feat/orders`.
+- **Текуща задача**: Реализация на симулирано плащане и отказ от поръчка върху клон `feat/payments`.
 - **Реализирано**:
-  - Поправено форматиране на `app/modules/accounts/repository.py` чрез Ruff.
-  - Укрепен `test_parallel_checkout_and_cart_modification`: маркер в `Session.info` чрез `Request` override вместо имена на нишки, координация с `threading.Event`, проверка на timeout и безопасно освобождане във `finally`.
-  - Преминаха локално: 163/163 pytest теста, Ruff lint и Ruff format check.
+  - Модел `PaymentAttempt` и разширяване на `ck_orders_status_valid` към `pending_payment`, `paid`, `cancelled`.
+  - Alembic миграция `c74a9d821e5f` с частичен уникален индекс за 1 успешен опит на поръчка.
+  - Локален `PaymentSimulator` и service/repository транзакции със заключване `FOR UPDATE`.
+  - `POST /orders/{id}/payments` (идемпотентност с `Idempotency-Key`, 201/200/409) и `POST /orders/{id}/cancel` (възстановяване на stock вкл. за деактивирани продукти, 200/409).
+  - Написани 15 интеграционни и конкурентни теста в `test_payments.py` и миграционен тест за съществуващи поръчки.
+  - Успешни проверки: 179/179 теста в pytest и 100% Ruff lint & format check.
 - **Оставащи ограничения / Непроверено**:
-  - Резервациите остават в `pending_payment` без автоматично изтичане (плащания и auto-expiration предстоят).
-  - GitHub CI за новите локални промени предстои след commit и push.
+  - Липсва автоматично изтичане (auto-expiration) на неплатени поръчки (таймери/worker).
+  - GitHub CI предстои след личен push на потребителя.
 - **Работещи команди**:
   - `cd services/commerce && uv run --locked pytest -q`
   - `cd services/commerce && uv run --locked ruff check . && uv run --locked ruff format --check .`
-- **Засегнати файлове**: `app/modules/accounts/repository.py`, `tests/test_orders.py`, `docs/session-state.md`.
-- **Следваща стъпка**: Личен преглед, commit и push на промените от потребителя.
+- **Засегнати файлове**: `app/modules/orders/*`, `migrations/versions/c74a9d821e5f_*`, `tests/*`, `README.md`, `docs/session-state.md`.
+- **Следваща стъпка**: Личен преглед, git commit и push на промените от потребителя.

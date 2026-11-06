@@ -3,7 +3,7 @@ from collections.abc import Sequence
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.modules.orders.models import Order, OrderItem
+from app.modules.orders.models import Order, OrderItem, PaymentAttempt
 
 
 class OrderRepository:
@@ -51,6 +51,41 @@ class OrderRepository:
                 Order.user_id == user_id,
             )
             .options(selectinload(Order.items))
+        )
+        return self._session.scalars(stmt).first()
+
+    def get_by_id_and_user_id_for_update(
+        self,
+        order_id: int,
+        user_id: int,
+    ) -> Order | None:
+        """Извлича и заключва ред от поръчката по id и user_id с FOR UPDATE."""
+        stmt = (
+            select(Order)
+            .where(
+                Order.id == order_id,
+                Order.user_id == user_id,
+            )
+            .options(selectinload(Order.items))
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return self._session.scalars(stmt).first()
+
+    def add_payment_attempt(self, attempt: PaymentAttempt) -> PaymentAttempt:
+        """Добавя опит за плащане в сесията без commit."""
+        self._session.add(attempt)
+        return attempt
+
+    def get_payment_attempt_by_order_and_key(
+        self,
+        order_id: int,
+        idempotency_key: str,
+    ) -> PaymentAttempt | None:
+        """Извлича опит за плащане по order_id и idempotency_key."""
+        stmt = select(PaymentAttempt).where(
+            PaymentAttempt.order_id == order_id,
+            PaymentAttempt.idempotency_key == idempotency_key,
         )
         return self._session.scalars(stmt).first()
 

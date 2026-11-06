@@ -630,6 +630,79 @@ curl -s http://localhost:8000/orders/$ORDER_ID \
   -H "Authorization: Bearer $CUSTOMER_TOKEN"
 ```
 
+### 6. Симулирано плащане и отказ от поръчка (Payments & Cancellation Walkthrough)
+
+#### Демонстрация 1: Отказано плащане → успешен повторен опит
+
+```bash
+# 1. Първи опит с отказан фиктивен метод (test_declined) -> 201 Created (status: declined)
+PAY_KEY_1=$(python3 -c "import uuid; print(uuid.uuid4())")
+curl -i -X POST http://localhost:8000/orders/$ORDER_ID/payments \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN" \
+  -H "Idempotency-Key: $PAY_KEY_1" \
+  -d '{"payment_method": "test_declined"}'
+
+# Поръчката остава в pending_payment и резервацията на stock е запазена:
+curl -s http://localhost:8000/orders/$ORDER_ID \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN" | grep status
+
+# 2. Повторение със СЪЩИЯ ключ и същия метод -> 200 OK (връща същия declined опит без симулация)
+curl -i -X POST http://localhost:8000/orders/$ORDER_ID/payments \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN" \
+  -H "Idempotency-Key: $PAY_KEY_1" \
+  -d '{"payment_method": "test_declined"}'
+
+# 3. Успешен повторен опит с НОВ ключ (test_success) -> 201 Created (status: succeeded)
+PAY_KEY_2=$(python3 -c "import uuid; print(uuid.uuid4())")
+curl -i -X POST http://localhost:8000/orders/$ORDER_ID/payments \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN" \
+  -H "Idempotency-Key: $PAY_KEY_2" \
+  -d '{"payment_method": "test_success"}'
+
+# Поръчката преминава в статус 'paid', наличността в склада НЕ се намалява повторно:
+curl -s http://localhost:8000/orders/$ORDER_ID \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN" | grep status
+```
+
+#### Демонстрация 2: Отделна поръчка → отказ от клиента и възстановена наличност
+
+```bash
+# 1. Проверка на началната наличност на продукт #1
+curl -s http://localhost:8000/products/1 | grep stock
+
+# 2. Добавяне в количката и оформяне на нова отделна поръчка (за 2 бр.)
+curl -s -X PUT http://localhost:8000/cart/items/1 \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN" \
+  -d '{"quantity": 2}'
+
+NEW_ORDER_KEY=$(python3 -c "import uuid; print(uuid.uuid4())")
+NEW_ORDER=$(curl -s -X POST http://localhost:8000/orders \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN" \
+  -H "Idempotency-Key: $NEW_ORDER_KEY" \
+  -d '{}')
+CANCEL_ORDER_ID=$(python3 -c "import json; print(json.loads('''$NEW_ORDER''')['id'])")
+
+# Наличността на продукт #1 е намалена с 2 (резервирана за новата поръчка):
+curl -s http://localhost:8000/products/1 | grep stock
+
+# 3. Отказ от поръчката от клиента (POST /orders/{id}/cancel) -> 200 OK (status: cancelled)
+curl -i -X POST http://localhost:8000/orders/$CANCEL_ORDER_ID/cancel \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN"
+
+# Наличността в каталога е точно възстановена с +2 (вкл. за деактивирани продукти):
+curl -s http://localhost:8000/products/1 | grep stock
+
+# 4. Двоен отказ -> 200 OK (идемпотентен, без повторно връщане на stock):
+curl -i -X POST http://localhost:8000/orders/$CANCEL_ORDER_ID/cancel \
+  -H "Authorization: Bearer $CUSTOMER_TOKEN"
+curl -s http://localhost:8000/products/1 | grep stock
+```
+
 ---
 
 ## Архитектурни бележки и технически ограничения
@@ -640,9 +713,11 @@ curl -s http://localhost:8000/orders/$ORDER_ID \
   - Всяка мутация (checkout, добавяне или премахване от количка) придобива ред-блокировка върху потребителя с `FOR NO KEY UPDATE` в PostgreSQL преди каквито и да е други четения или промени.
   - При оформяне на поръчка продуктите се заключват с `FOR UPDATE` в строго възходящ ред по ID (`ORDER BY id ASC`), което напълно елиминира риска от deadlocks между конкурентни процеси.
   - Намаляването на складовата наличност при статус `pending_payment` представлява резервация на стоката.
-- **Жизнен цикъл на резервациите**:
-  - **В тази версия резервациите остават в статус `pending_payment` без автоматично изтичане (auto-expiration)**.
-  - Интеграцията с плащания, асинхронни таймери, фоново освобождаване на изтекли резервации и последващи статуси (`paid`, `cancelled`) ще бъдат реализирани в следващ етап.
+- **Жизнен цикъл на поръчките и симулирани плащания**:
+  - Разграничение на концепциите: резултат от опит за плащане е `succeeded` или `declined`; статус на поръчката е `pending_payment`, `paid` или `cancelled`.
+  - Плащането и отказът заключват един и същи ред на поръчката с `SELECT ... FOR UPDATE` в PostgreSQL преди решение за промяна.
+  - При отказ засегнатите продукти се заключват във възходящ ред по ID, а запазените количества се връщат точно в `stock` (включително за продукт, деактивиран след checkout). Количката не се възстановява.
+  - На ниво PostgreSQL уникалността се гарантира с `(order_id, idempotency_key)` и частичен уникален индекс за най-много един успешен опит на поръчка (`WHERE status = 'succeeded'`).
 - **Кратковременни токени**: Access токенът е валиден 15 минути. В тази стъпка нарочно **не са** включени refresh tokens или списък за оттегляне (token revocation / denylist), за да се запази архитектурата проста и без излишен овърхед.
 - **Stateless проверка с актуалност от БД**: Токенът се проверява криптографски с HMAC-SHA256 (`HS256`). Потребителският запис се зарежда директно от базата данни при всяка защитена заявка, което гарантира, че незабавно се отчита всяка промяна на ролята дори със съществуващ токен.
 - **Изисквания за продукционна среда**:

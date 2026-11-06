@@ -1,4 +1,5 @@
 import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -58,3 +59,23 @@ class OrderListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class CreatePaymentRequest(BaseModel):
+    """Схема за заявка за симулирано плащане на поръчка."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    payment_method: Literal["test_success", "test_declined"]
+
+
+class PaymentAttemptResponse(BaseModel):
+    """Схема за отговор от опит за плащане на поръчка."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    order_id: int
+    status: str
+    amount_minor: int
+    currency: str

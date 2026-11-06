@@ -1,6 +1,7 @@
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -100,8 +101,8 @@ def test_orders_migration_upgrade_with_existing_data() -> None:
             )
             session.commit()
 
-        # 3. Обновяване до head (orders и order_items)
-        command.upgrade(alembic_cfg, "head")
+        # 3. Обновяване до 568b759ac3a0 (orders и order_items)
+        command.upgrade(alembic_cfg, "568b759ac3a0")
 
         # 4. Проверка, че съществуващите данни са непокътнати и новите таблици са налични
         with Session(temp_engine) as session:
@@ -132,6 +133,116 @@ def test_orders_migration_upgrade_with_existing_data() -> None:
                 )
             ).scalar()
             assert res_cart_after == 2
+    finally:
+        temp_engine.dispose()
+        with admin_engine.connect() as conn:
+            conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
+        admin_engine.dispose()
+
+
+def test_payments_migration_upgrade_with_existing_orders() -> None:
+    """Проверка за обновяване от 568b759ac3a0 с вече съществуваща поръчка и безопасно връщане назад."""
+    temp_db_name = "commerce_temp_payments_mig_test"
+    admin_engine = create_engine(settings.database_url, isolation_level="AUTOCOMMIT")
+
+    with admin_engine.connect() as conn:
+        conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
+        conn.execute(text(f"CREATE DATABASE {temp_db_name}"))
+
+    temp_db_url = (
+        f"postgresql+psycopg://{settings.db_user}:{settings.db_password}"
+        f"@{settings.db_host}:{settings.db_port}/{temp_db_name}"
+    )
+
+    temp_engine = create_engine(temp_db_url)
+    try:
+        alembic_cfg = Config("alembic.ini")
+        alembic_cfg.set_main_option("sqlalchemy.url", temp_db_url)
+
+        # 1. Миграция до 568b759ac3a0 (създаване на orders с pending_payment CHECK)
+        command.upgrade(alembic_cfg, "568b759ac3a0")
+
+        # 2. Вмъкване на потребител и съществуваща поръчка с pending_payment
+        with Session(temp_engine) as session:
+            session.execute(
+                text(
+                    "INSERT INTO users (id, email, password_hash, role) "
+                    "VALUES (200, 'buyer@example.com', 'dummy_hash', 'customer')"
+                )
+            )
+            session.execute(
+                text(
+                    "INSERT INTO orders (id, user_id, status, currency, total_minor, idempotency_key) "
+                    "VALUES (500, 200, 'pending_payment', 'EUR', 3500, 'existing-key-1')"
+                )
+            )
+            session.commit()
+
+        # 3. Обновяване до head (разширяване на статуса и таблица payment_attempts)
+        command.upgrade(alembic_cfg, "head")
+
+        # 4. Проверка: съществуващата поръчка е непокътната и може да стане 'paid'
+        with Session(temp_engine) as session:
+            status = session.execute(
+                text("SELECT status FROM orders WHERE id = 500")
+            ).scalar()
+            assert status == "pending_payment"
+
+            # Можем да променим статуса на 'paid' благодарение на разширеното ограничение
+            session.execute(text("UPDATE orders SET status = 'paid' WHERE id = 500"))
+            session.commit()
+
+            new_status = session.execute(
+                text("SELECT status FROM orders WHERE id = 500")
+            ).scalar()
+            assert new_status == "paid"
+
+            # Таблица payment_attempts съществува и записва опит
+            session.execute(
+                text(
+                    "INSERT INTO payment_attempts (id, order_id, payment_method, status, amount_minor, currency, idempotency_key) "
+                    "VALUES (1, 500, 'test_success', 'succeeded', 3500, 'EUR', 'pay-key-1')"
+                )
+            )
+            session.commit()
+
+            # Втори успешен опит за същата поръчка трябва да гръмне заради частичния уникален индекс
+            try:
+                session.execute(
+                    text(
+                        "INSERT INTO payment_attempts (id, order_id, payment_method, status, amount_minor, currency, idempotency_key) "
+                        "VALUES (2, 500, 'test_success', 'succeeded', 3500, 'EUR', 'pay-key-2')"
+                    )
+                )
+                session.commit()
+                assert False, "Очакваше се грешка за втори succeeded опит"
+            except IntegrityError:
+                session.rollback()
+
+        # Връщаме статуса на pending_payment и почистваме payment_attempts за чист downgrade
+        with Session(temp_engine) as session:
+            session.execute(text("DELETE FROM payment_attempts"))
+            session.execute(
+                text("UPDATE orders SET status = 'pending_payment' WHERE id = 500")
+            )
+            session.commit()
+
+        # 5. Downgrade обратно до 568b759ac3a0
+        command.downgrade(alembic_cfg, "568b759ac3a0")
+
+        with Session(temp_engine) as session:
+            # payment_attempts е премахната
+            table_exists = session.execute(
+                text(
+                    "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'payment_attempts')"
+                )
+            ).scalar()
+            assert table_exists is False
+            # Съществуващата поръчка остава запазена
+            rem_status = session.execute(
+                text("SELECT status FROM orders WHERE id = 500")
+            ).scalar()
+            assert rem_status == "pending_payment"
     finally:
         temp_engine.dispose()
         with admin_engine.connect() as conn:
