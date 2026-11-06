@@ -69,7 +69,7 @@ jobs:
       - name: Check standalone product insertion
         run: >-
           uv run --locked pytest
-          tests/test_product_constraints.py::test_zero_price_and_zero_stock_allowed
+          tests/catalog/test_product_constraints.py::test_zero_price_and_zero_stock_allowed
           -q
 
       - name: Run all tests

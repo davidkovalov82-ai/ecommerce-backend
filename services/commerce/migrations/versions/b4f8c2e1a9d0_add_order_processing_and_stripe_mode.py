@@ -87,4 +87,3 @@ def downgrade() -> None:
         "status IN ('pending_payment', 'paid', 'cancelled')",
     )
     op.drop_column("orders", "expires_at")
-

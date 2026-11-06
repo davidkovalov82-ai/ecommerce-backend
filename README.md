@@ -189,11 +189,33 @@ uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 Проектът разполага с пълен набор от автоматизирани тестове, използващи отделна изолирана тестова база (`commerce_test`):
 
-### Изпълнение на всички тестове
+### Структура на тестовете (`services/commerce/tests/`)
 
+- **`accounts/`** – регистрация, вход, профил (`/users/me`), повишаване на права (CLI).
+- **`catalog/`** – детайли, пагинация, създаване, обновяване, валидация на цени и наличности, seed.
+- **`cart/`** – преглед на количката, добавяне/редакция/изтриване, паралелни операции, DB ограничения.
+- **`orders/`** – оформяне (checkout), идемпотентност (UUID ключове), транзакции и rollback, конкурентност, отказ (cancellation), DB ограничения.
+- **`payments/`** – Stripe Checkout сесии, валидация на webhook (подпис, sandbox/live mode), жизнен цикъл на плащанията (completed, async, expired), отказ през Stripe, reconciliation услуга, конфигурация и скриване на секрети.
+- **`infrastructure/`** – свързаност и lifecycle на сесиите (`test_database.py`), домейнови тестове на Alembic миграциите (`migrations/`).
+- **`contracts/`** – валидация на OpenAPI схемата (`test_openapi.py`).
+
+### Изпълнение на тестовете
+
+Всички тестове:
 ```bash
 cd services/commerce
 uv run pytest
+```
+
+Изпълнение по отделни модули:
+```bash
+uv run pytest tests/accounts/
+uv run pytest tests/catalog/
+uv run pytest tests/cart/
+uv run pytest tests/orders/
+uv run pytest tests/payments/
+uv run pytest tests/infrastructure/
+uv run pytest tests/contracts/
 ```
 
 ### Проверка за форматиране и статичен анализ (Ruff)

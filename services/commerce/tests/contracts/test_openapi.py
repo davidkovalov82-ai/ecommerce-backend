@@ -6,11 +6,20 @@ client = TestClient(app)
 
 
 def test_openapi_registered_operations() -> None:
-    """Проверка чрез /openapi.json, че и трите основни операции са коректно регистрирани:
+    """Проверка чрез /openapi.json, че всички основни операции са коректно регистрирани:
 
-    1. GET /products (публичен списък с пагинация)
-    2. GET /products/{product_id} (детайли за единичен продукт)
-    3. POST /users (регистрация на нов потребител)
+    1. GET & POST /products
+    2. GET & PATCH /products/{product_id}
+    3. POST /users
+    4. POST /auth/login
+    5. GET /users/me
+    6. GET /cart
+    7. PUT & DELETE /cart/items/{product_id}
+    8. GET & POST /orders
+    9. GET /orders/{order_id}
+    10. POST /orders/{order_id}/cancel
+    11. POST /orders/{order_id}/checkout-session
+    12. POST /webhooks/stripe
     """
     response = client.get("/openapi.json")
     assert response.status_code == 200
@@ -91,8 +100,9 @@ def test_openapi_registered_operations() -> None:
     assert "post" in paths["/webhooks/stripe"]
     assert paths["/webhooks/stripe"]["post"]["operationId"] is not None
 
-    # 14. Bearer сигурностна схема в компонентите
+    # 13. Bearer сигурностна схема в компонентите
     security_schemes = schema.get("components", {}).get("securitySchemes", {})
     assert "HTTPBearer" in security_schemes
     assert security_schemes["HTTPBearer"]["type"] == "http"
     assert security_schemes["HTTPBearer"]["scheme"] == "bearer"
+

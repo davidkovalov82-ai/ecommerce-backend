@@ -100,3 +100,4 @@ async def test_fastapi_lifespan_closes_db_on_exception() -> None:
             async with lifespan(app):
                 raise RuntimeError("Lifespan test exception")
         assert mock_close.call_count == 1
+

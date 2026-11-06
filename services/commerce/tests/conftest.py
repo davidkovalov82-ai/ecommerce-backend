@@ -35,6 +35,12 @@ TestingSessionLocal = sessionmaker(
 )
 
 
+@pytest.fixture
+def session_factory() -> sessionmaker[Session]:
+    """Фабрика за нови независими сесии към тестовата база данни."""
+    return TestingSessionLocal
+
+
 def _sync_products_sequence(conn: Any) -> None:
     """Синхронизира PostgreSQL sequence-а на products с текущото максимално ID."""
     conn.execute(
