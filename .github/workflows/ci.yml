@@ -26,6 +26,10 @@ jobs:
       DB_PASSWORD: commerce_ci
       DB_NAME: commerce
       JWT_SECRET: "ci-test-jwt-secret-key-at-least-32-bytes-long!"
+      SMTP_HOST: 127.0.0.1
+      SMTP_PORT: "1025"
+      SMTP_FROM: "noreply@example.com"
+      MAILPIT_WEB_URL: "http://127.0.0.1:8025"
 
     services:
       postgres:
@@ -38,6 +42,17 @@ jobs:
           - 5432:5432
         options: >-
           --health-cmd "pg_isready -U commerce -d commerce"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      mailpit:
+        image: axllent/mailpit:latest
+        ports:
+          - 1025:1025
+          - 8025:8025
+        options: >-
+          --health-cmd "/mailpit readyz"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10

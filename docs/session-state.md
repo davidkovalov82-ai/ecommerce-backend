@@ -1,19 +1,20 @@
 # Session State
 
-- **Текуща задача**: Модулна реорганизация на целия каталог services/commerce/tests във feat/payments.
+- **Текуща задача**: Завършване на проверката на известия (Mailpit в CI, уникален получател, deadline).
 - **Реализирано**:
-  - Разделени тестове в поддиректории: accounts, catalog, cart, orders, payments, infrastructure, contracts.
-  - Добавена conftest fixture session_factory (без директен импорт на TestingSessionLocal в тестовете).
-  - Премахнати 10 дублирани теста в payments; запазена 100% функционална съвместимост (211/211 теста).
-  - Актуализиран ci.yml с точния път до test_zero_price_and_zero_stock_allowed.
-  - Актуализиран README.md с новата структура и команди за модулно стартиране.
+  - Mailpit добавен като service контейнер в `.github/workflows/ci.yml` с healthcheck.
+  - Липсата на Mailpit проваля проверката (без pytest.skip) и в CI, и при `make test-notifications-retry`.
+  - Премахнато глобално изтриване; уникален получател за всеки тест, изчакване с deadline (5s).
+  - Проверени номер на поръчка, форматирана сума и валута в полученото писмо.
+  - Сценарий: webhook -> отказан SMTP -> поръчката остава paid -> успешен retry -> точно 1 писмо и след 3-то пускане.
 - **Проверено / Резултати**:
-  - `uv run --locked pytest -q`: 211 passed in 9.60s.
-  - `uv run --locked ruff check .` & `format --check .`: 100% чисти, 0 грешки.
-  - Проверена изолация на БД и идентичност на събраните тестове преди и след реорганизацията.
-  - Непроверено: няма (всички 211 теста и линтери преминаха успешно).
+  - Локално: `make test-notifications-retry` и `pytest -q`: 225/225 passed (100%).
+  - Тест при спрян Mailpit: проваля се с AssertionError (без skip).
+  - Ruff check & format: 100% чисти, 0 грешки.
+  - CI: конфигуриран service container за автоматичен пуск в GitHub Actions.
 - **Работещи команди**:
+  - `make test-notifications-retry`
   - `cd services/commerce && uv run --locked pytest -q`
   - `cd services/commerce && uv run --locked ruff check . && uv run --locked ruff format --check .`
-- **Засегнати файлове**: `services/commerce/tests/*`, `.github/workflows/ci.yml`, `README.md`, `docs/session-state.md`.
+- **Засегнати файлове**: `.github/workflows/ci.yml`, `test_order_notifications.py`, `docs/session-state.md`.
 - **Следваща стъпка**: Потребителски преглед, git commit и push от потребителя.

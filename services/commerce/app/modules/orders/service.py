@@ -13,6 +13,7 @@ from app.modules.catalog.repository import ProductRepository
 from app.modules.orders.models import (
     Order,
     OrderItem,
+    OrderOutboxEvent,
     StripeCheckoutSession,
     StripeProcessedEvent,
 )
@@ -246,6 +247,40 @@ class OrderService:
             product = products_by_id.get(pid)
             if product is not None:
                 product.stock += qty
+
+    def _transition_order_to_paid(self, order: Order) -> None:
+        """Превежда поръчката в статус paid и записва outbox събитие order.paid в същата транзакция.
+
+        Ако събитие order.paid за тази поръчка вече съществува (напр. повторен webhook или сверка),
+        не се създава нов дубликат.
+        """
+        if order.status != "paid":
+            order.status = "paid"
+        self._record_order_paid_outbox_event(order)
+
+    def _record_order_paid_outbox_event(self, order: Order) -> None:
+        """Записва order.paid събитие в outbox таблицата в същата PostgreSQL транзакция."""
+        existing = self._order_repository.get_outbox_event(order.id, "order.paid")
+        if existing is not None:
+            return
+
+        user = self._user_repository.get_by_id(order.user_id)
+        customer_email = user.email if user else ""
+
+        payload = {
+            "order_id": order.id,
+            "customer_email": customer_email,
+            "total_minor": order.total_minor,
+            "currency": order.currency,
+            "created_at": order.created_at.isoformat() if order.created_at else None,
+        }
+        event = OrderOutboxEvent(
+            order_id=order.id,
+            event_type="order.paid",
+            payload=payload,
+            status="pending",
+        )
+        self._order_repository.record_outbox_event(event)
 
     def create_stripe_checkout_session(
         self,
@@ -752,7 +787,7 @@ class OrderService:
                             "event_id": event_id,
                         }
 
-                    order.status = "paid"
+                    self._transition_order_to_paid(order)
                     self._order_repository.record_stripe_event(
                         StripeProcessedEvent(
                             stripe_event_id=event_id,
@@ -827,7 +862,7 @@ class OrderService:
                         "event_id": event_id,
                     }
 
-                order.status = "paid"
+                self._transition_order_to_paid(order)
                 self._order_repository.record_stripe_event(
                     StripeProcessedEvent(
                         stripe_event_id=event_id,
@@ -1084,7 +1119,7 @@ class OrderService:
 
             # Случай 2: Опитът вече е завършен (платен)
             if latest_session.status == "completed":
-                order.status = "paid"
+                self._transition_order_to_paid(order)
                 self._session.commit()
                 return "paid"
 
@@ -1144,7 +1179,7 @@ class OrderService:
                     attempt_id
                 )
                 if order:
-                    order.status = "paid"
+                    self._transition_order_to_paid(order)
                 if s_rec:
                     s_rec.status = "completed"
                 self._session.commit()

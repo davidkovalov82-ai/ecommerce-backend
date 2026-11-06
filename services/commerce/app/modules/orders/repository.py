@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.modules.orders.models import (
     Order,
     OrderItem,
+    OrderOutboxEvent,
     PaymentAttempt,
     StripeCheckoutSession,
     StripeProcessedEvent,
@@ -225,3 +226,39 @@ class OrderRepository:
         )
         orders = self._session.scalars(stmt).all()
         return orders, total
+
+    def record_outbox_event(self, event: OrderOutboxEvent) -> OrderOutboxEvent:
+        """Записва събитие в outbox таблицата в същата транзакция."""
+        self._session.add(event)
+        return event
+
+    def get_outbox_event(
+        self, order_id: int, event_type: str = "order.paid"
+    ) -> OrderOutboxEvent | None:
+        """Извлича outbox събитие за поръчка по тип събитие."""
+        stmt = select(OrderOutboxEvent).where(
+            OrderOutboxEvent.order_id == order_id,
+            OrderOutboxEvent.event_type == event_type,
+        )
+        return self._session.scalars(stmt).first()
+
+    def list_pending_outbox_events(self, limit: int = 50) -> Sequence[OrderOutboxEvent]:
+        """Извлича чакащи изпращане outbox събития (status = 'pending')."""
+        stmt = (
+            select(OrderOutboxEvent)
+            .where(OrderOutboxEvent.status == "pending")
+            .order_by(OrderOutboxEvent.created_at.asc(), OrderOutboxEvent.id.asc())
+            .limit(limit)
+        )
+        return self._session.scalars(stmt).all()
+
+    def get_outbox_event_by_id_for_update(
+        self, event_id: int
+    ) -> OrderOutboxEvent | None:
+        """Извлича outbox събитие по ID със заключване FOR UPDATE."""
+        stmt = (
+            select(OrderOutboxEvent)
+            .where(OrderOutboxEvent.id == event_id)
+            .with_for_update()
+        )
+        return self._session.scalars(stmt).first()
