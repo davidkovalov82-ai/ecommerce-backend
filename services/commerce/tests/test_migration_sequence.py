@@ -368,3 +368,135 @@ def test_stripe_migration_upgrade_and_downgrade() -> None:
         with admin_engine.connect() as conn:
             conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
         admin_engine.dispose()
+
+
+def test_order_processing_and_stripe_mode_migration() -> None:
+    """Тества миграция b4f8c2e1a9d0:
+
+    - Добавяне на expires_at в orders
+    - Разширяване на валидните статуси на orders (payment_processing, expired)
+    - Добавяне на колона mode в stripe_checkout_sessions (по подразбиране 'test')
+    - Разширяване на валидните статуси на stripe_checkout_sessions (processing)
+    - Ограничение за mode ('test', 'live')
+    - Безопасен downgrade назад до e2b83a741f90
+    """
+    temp_db_name = "commerce_temp_mode_mig_test"
+    admin_engine = create_engine(settings.database_url, isolation_level="AUTOCOMMIT")
+
+    with admin_engine.connect() as conn:
+        conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
+        conn.execute(text(f"CREATE DATABASE {temp_db_name}"))
+
+    temp_db_url = (
+        f"postgresql+psycopg://{settings.db_user}:{settings.db_password}"
+        f"@{settings.db_host}:{settings.db_port}/{temp_db_name}"
+    )
+
+    temp_engine = create_engine(temp_db_url)
+    try:
+        alembic_cfg = Config("alembic.ini")
+        alembic_cfg.set_main_option("sqlalchemy.url", temp_db_url)
+
+        # 1. Миграция до предишната ревизия e2b83a741f90
+        command.upgrade(alembic_cfg, "e2b83a741f90")
+
+        with Session(temp_engine) as session:
+            session.execute(
+                text(
+                    "INSERT INTO users (id, email, password_hash, role) "
+                    "VALUES (700, 'mode_user@example.com', 'dummy_hash', 'customer')"
+                )
+            )
+            session.execute(
+                text(
+                    "INSERT INTO orders (id, user_id, status, total_minor, currency, idempotency_key) "
+                    "VALUES (700, 700, 'pending_payment', 5000, 'EUR', 'idemp_order_700')"
+                )
+            )
+            # Вмъкваме сесия без колона mode (тя все още не съществува)
+            session.execute(
+                text(
+                    "INSERT INTO stripe_checkout_sessions (id, order_id, status, amount_minor, currency, idempotency_key) "
+                    "VALUES (700, 700, 'open', 5000, 'EUR', 'idemp-old-700')"
+                )
+            )
+            session.commit()
+
+        # 2. Upgrade до b4f8c2e1a9d0
+        command.upgrade(alembic_cfg, "b4f8c2e1a9d0")
+
+        with Session(temp_engine) as session:
+            # Проверяваме, че старата сесия е получила mode = 'test'
+            existing_mode = session.execute(
+                text("SELECT mode FROM stripe_checkout_sessions WHERE id = 700")
+            ).scalar()
+            assert existing_mode == "test"
+
+            # Проверяваме новите статуси на поръчки: payment_processing и expired
+            session.execute(
+                text("UPDATE orders SET status = 'payment_processing' WHERE id = 700")
+            )
+            session.commit()
+
+            session.execute(text("UPDATE orders SET status = 'expired' WHERE id = 700"))
+            session.commit()
+
+            # Проверяваме новия статус на сесия: processing
+            session.execute(
+                text(
+                    "UPDATE stripe_checkout_sessions SET status = 'processing' WHERE id = 700"
+                )
+            )
+            session.commit()
+
+            # Проверяваме ограничението за mode (само test или live)
+            try:
+                session.execute(
+                    text(
+                        "INSERT INTO stripe_checkout_sessions (id, order_id, status, amount_minor, currency, idempotency_key, mode) "
+                        "VALUES (701, 700, 'open', 5000, 'EUR', 'idemp-inv-mode', 'invalid')"
+                    )
+                )
+                session.commit()
+                assert False, "Очакваше се IntegrityError за невалиден mode"
+            except IntegrityError:
+                session.rollback()
+
+        # Почистваме преди downgrade
+        with Session(temp_engine) as session:
+            session.execute(text("DELETE FROM stripe_checkout_sessions"))
+            session.execute(
+                text("UPDATE orders SET status = 'pending_payment' WHERE id = 700")
+            )
+            session.commit()
+
+        # 3. Downgrade обратно до e2b83a741f90
+        command.downgrade(alembic_cfg, "e2b83a741f90")
+
+        with Session(temp_engine) as session:
+            # Проверяваме, че колоната mode вече не съществува в stripe_checkout_sessions
+            col_mode_exists = session.execute(
+                text(
+                    "SELECT EXISTS ("
+                    "  SELECT 1 FROM information_schema.columns "
+                    "  WHERE table_name = 'stripe_checkout_sessions' AND column_name = 'mode'"
+                    ")"
+                )
+            ).scalar()
+            assert col_mode_exists is False
+
+            # Проверяваме, че колоната expires_at вече не съществува в orders
+            col_exp_exists = session.execute(
+                text(
+                    "SELECT EXISTS ("
+                    "  SELECT 1 FROM information_schema.columns "
+                    "  WHERE table_name = 'orders' AND column_name = 'expires_at'"
+                    ")"
+                )
+            ).scalar()
+            assert col_exp_exists is False
+    finally:
+        temp_engine.dispose()
+        with admin_engine.connect() as conn:
+            conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
+        admin_engine.dispose()

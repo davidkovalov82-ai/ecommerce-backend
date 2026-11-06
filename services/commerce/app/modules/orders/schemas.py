@@ -36,6 +36,7 @@ class OrderSummaryResponse(BaseModel):
     currency: str
     total_minor: int
     created_at: datetime.datetime
+    expires_at: datetime.datetime | None = None
 
 
 class OrderDetailResponse(BaseModel):
@@ -48,6 +49,7 @@ class OrderDetailResponse(BaseModel):
     currency: str
     total_minor: int
     created_at: datetime.datetime
+    expires_at: datetime.datetime | None = None
     items: list[OrderItemResponse]
 
 

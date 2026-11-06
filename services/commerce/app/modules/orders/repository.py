@@ -185,6 +185,15 @@ class OrderRepository:
         )
         return bool(self._session.scalar(stmt))
 
+    def list_unresolved_order_ids(self) -> Sequence[int]:
+        """Извлича ID-тата на поръчки в pending_payment или payment_processing за сверка."""
+        stmt = (
+            select(Order.id)
+            .where(Order.status.in_(["pending_payment", "payment_processing"]))
+            .order_by(Order.id.asc())
+        )
+        return self._session.scalars(stmt).all()
+
     def record_stripe_event(
         self, event_record: StripeProcessedEvent
     ) -> StripeProcessedEvent:
