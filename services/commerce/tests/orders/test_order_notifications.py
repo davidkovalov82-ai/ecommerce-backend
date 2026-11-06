@@ -1,7 +1,9 @@
 import datetime
 import json
+import time
 import urllib.request
 import uuid
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -697,25 +699,71 @@ def _is_mailpit_live() -> bool:
         return False
 
 
+def _get_messages_for_recipient(recipient_email: str) -> list[dict[str, Any]]:
+    """Извлича съобщенията от Mailpit API само за конкретен получател."""
+    req = urllib.request.Request("http://127.0.0.1:8025/api/v1/messages")
+    with urllib.request.urlopen(req, timeout=2) as r:
+        data = json.loads(r.read().decode())
+    return [
+        m
+        for m in data.get("messages", [])
+        if any(to.get("Address") == recipient_email for to in m.get("To", []))
+    ]
+
+
+def _wait_for_messages_for_recipient(
+    recipient_email: str,
+    expected_count: int,
+    timeout_seconds: float = 5.0,
+    poll_interval: float = 0.1,
+) -> list[dict[str, Any]]:
+    """Изчаква с краен срок (deadline) получените писма за даден получател."""
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        msgs = _get_messages_for_recipient(recipient_email)
+        if len(msgs) == expected_count:
+            return msgs
+        time.sleep(poll_interval)
+    return _get_messages_for_recipient(recipient_email)
+
+
+def _get_message_detail(message_id: str) -> dict[str, Any]:
+    """Извлича детайлно съдържание на писмо (заглавие, текст) от Mailpit по ID."""
+    req = urllib.request.Request(f"http://127.0.0.1:8025/api/v1/message/{message_id}")
+    with urllib.request.urlopen(req, timeout=2) as r:
+        return json.loads(r.read().decode())
+
+
 def test_notifications_retry_e2e_live_mailpit(
     db_session: Session,
     session_factory: sessionmaker[Session],
 ) -> None:
-    """E2E интеграционен тест с реален Mailpit и retry цикъл при SMTP срив и възстановяване."""
-    if not _is_mailpit_live():
-        pytest.skip("Mailpit не е активен на http://127.0.0.1:8025")
+    """E2E интеграционен тест с реален Mailpit и retry цикъл при SMTP срив и възстановяване.
 
-    # Изчистване на стари писма в Mailpit преди теста
-    clear_req = urllib.request.Request(
-        "http://127.0.0.1:8025/api/v1/messages", method="DELETE"
+    Сценарий:
+    1. Един подписан Stripe webhook превежда поръчката в 'paid' и записва outbox събитие.
+    2. Отказана SMTP връзка: поръчката остава 'paid', събитието 'pending' с грешка, 0 писма за получателя.
+    3. Успешен повторен опит: писмото е доставено (проверка на номер на поръчка, сума и валута).
+    4. Точно едно писмо за този получател и след третото пускане на обработката.
+    """
+    # 1. Липсата на Mailpit проваля теста (в CI и локално), без skip
+    assert _is_mailpit_live(), (
+        "Mailpit услугата не е достъпна на http://127.0.0.1:8025 - проверката се проваля. "
+        "Уверете се, че Mailpit работи (напр. през 'make test-notifications-retry' или като service в CI)."
     )
-    with urllib.request.urlopen(clear_req, timeout=2):
-        pass
 
-    # Стъпка 1: Създаване на поръчка и преход в paid през Stripe webhook
-    user, _ = _create_user_and_token(db_session, email="retry_e2e@example.com")
+    # 2. Уникален получател за теста (без глобално изтриване на пощенската кутия)
+    customer_email = f"order_retry_{uuid.uuid4().hex[:12]}@example.com"
+    assert len(_get_messages_for_recipient(customer_email)) == 0, (
+        f"Кутията вече съдържа писма за новия уникален получател {customer_email}"
+    )
+
+    # Стъпка 1: Един подписан Stripe webhook
+    user, _ = _create_user_and_token(db_session, email=customer_email)
     product = _create_product(db_session, "Retry Product", price_minor=4500)
-    order = _create_order(db_session, user.id, product, quantity=1)
+    order = _create_order(
+        db_session, user.id, product, quantity=1
+    )  # 4500 EUR (45.00 EUR)
 
     event_id = f"evt_retry_{uuid.uuid4().hex[:12]}"
     session_id = f"cs_retry_{uuid.uuid4().hex[:12]}"
@@ -773,10 +821,11 @@ def test_notifications_retry_e2e_live_mailpit(
         assert event.status == "pending", (
             f"Стъпка 1 пропадна: Очаква се статус pending, получен {event.status}"
         )
+        assert event.retry_count == 0
         outbox_id = event.id
 
-    # Стъпка 2: Симулация на недостъпен SMTP сървър (порт 19999)
-    failing_mailer = EmailSender(host="127.0.0.1", port=19999)
+    # Стъпка 2: Отказана SMTP връзка (недостъпен порт 19999)
+    failing_mailer = EmailSender(host="127.0.0.1", port=19999, timeout=2.0)
     failing_processor = OutboxProcessor(
         session_factory=session_factory,
         email_sender=failing_mailer,
@@ -792,12 +841,14 @@ def test_notifications_retry_e2e_live_mailpit(
         "Стъпка 2 пропадна: Не бива да се изпращат писма при срив"
     )
 
+    # Поръчката остава paid, събитието остава pending с увеличен retry_count
     with session_factory() as s:
         db_order = s.get(Order, order.id)
-        assert db_order.status == "paid", (
+        assert db_order is not None and db_order.status == "paid", (
             "Стъпка 2 пропадна: Поръчката не остана в статус 'paid' след SMTP срив"
         )
         db_event = s.get(OrderOutboxEvent, outbox_id)
+        assert db_event is not None
         assert db_event.status == "pending", (
             "Стъпка 2 пропадна: Събитието не остана в статус 'pending' за повторен опит"
         )
@@ -808,16 +859,12 @@ def test_notifications_retry_e2e_live_mailpit(
             "Стъпка 2 пропадна: Липсва записана грешка в last_error"
         )
 
-    # Проверка, че Mailpit няма съобщения при грешка
-    with urllib.request.urlopen(
-        "http://127.0.0.1:8025/api/v1/messages", timeout=2
-    ) as r:
-        data = json.loads(r.read().decode())
-        assert data["total"] == 0, (
-            "Стъпка 2 пропадна: Mailpit не трябва да съдържа съобщения след неуспешен опит"
-        )
+    # Проверка, че няма изпратени писма за този получател
+    assert len(_get_messages_for_recipient(customer_email)) == 0, (
+        "Стъпка 2 пропадна: Mailpit съдържа писма за получателя след неуспешен опит"
+    )
 
-    # Стъпка 3: Възстановяване на SMTP (реален Mailpit порт 1025) и успешен retry
+    # Стъпка 3: Възстановяване на SMTP (реален Mailpit порт 1025) и успешен повторен опит
     live_mailer = EmailSender(host="127.0.0.1", port=1025)
     live_processor = OutboxProcessor(
         session_factory=session_factory,
@@ -833,6 +880,7 @@ def test_notifications_retry_e2e_live_mailpit(
 
     with session_factory() as s:
         db_event = s.get(OrderOutboxEvent, outbox_id)
+        assert db_event is not None
         assert db_event.status == "sent", (
             f"Стъпка 3 пропадна: Събитието не е 'sent', текущ статус: {db_event.status}"
         )
@@ -840,31 +888,48 @@ def test_notifications_retry_e2e_live_mailpit(
             "Стъпка 3 пропадна: Липсва processed_at timestamp"
         )
 
-    # Проверка в Mailpit за получено писмо
-    with urllib.request.urlopen(
-        "http://127.0.0.1:8025/api/v1/messages", timeout=2
-    ) as r:
-        data = json.loads(r.read().decode())
-        assert data["total"] == 1, (
-            f"Стъпка 3 пропадна: Очаква се точно 1 съобщение в Mailpit, намерени {data['total']}"
-        )
-        msg = data["messages"][0]
-        assert msg["To"][0]["Address"] == "retry_e2e@example.com", (
-            f"Стъпка 3 пропадна: Неправилен получател {msg['To']}"
-        )
-        assert str(order.id) in msg["Subject"], (
-            f"Стъпка 3 пропадна: Липсва номер на поръчка #{order.id} в заглавието"
-        )
-
-    # Стъпка 4: Идемпотентност – повторен запуск не изпраща нови писма
-    stats_idempotent = live_processor.process_pending_events()
-    assert stats_idempotent["sent"] == 0, (
-        "Стъпка 4 пропадна: Изпратено е дублирано писмо при последваща обработка"
+    # Изчакваме доставката с краен срок (краен срок 5.0s)
+    delivered_msgs = _wait_for_messages_for_recipient(
+        customer_email, expected_count=1, timeout_seconds=5.0
     )
-    with urllib.request.urlopen(
-        "http://127.0.0.1:8025/api/v1/messages", timeout=2
-    ) as r:
-        data = json.loads(r.read().decode())
-        assert data["total"] == 1, (
-            f"Стъпка 4 пропадна: Mailpit съдържа дублирани писма ({data['total']})"
-        )
+    assert len(delivered_msgs) == 1, (
+        f"Стъпка 3 пропадна: Очаква се точно 1 писмо за {customer_email}, намерени {len(delivered_msgs)}"
+    )
+
+    # Проверяваме номер на поръчката, сума и валута
+    msg_summary = delivered_msgs[0]
+    assert f"#{order.id}" in msg_summary["Subject"], (
+        f"Стъпка 3 пропадна: Липсва номер на поръчка #{order.id} в заглавието: {msg_summary['Subject']}"
+    )
+    assert any(
+        to.get("Address") == customer_email for to in msg_summary.get("To", [])
+    ), (
+        f"Стъпка 3 пропадна: Получателят {customer_email} не съвпада: {msg_summary.get('To')}"
+    )
+
+    detail = _get_message_detail(msg_summary["ID"])
+    text_body = detail.get("Text", "")
+    assert f"#{order.id}" in text_body, (
+        f"Стъпка 3 пропадна: Липсва номер на поръчка #{order.id} в тялото: {text_body}"
+    )
+    assert "45.00" in text_body, (
+        f"Стъпка 3 пропадна: Липсва форматирана сума 45.00 в тялото: {text_body}"
+    )
+    assert "EUR" in text_body, (
+        f"Стъпка 3 пропадна: Липсва валута EUR в тялото: {text_body}"
+    )
+
+    # Стъпка 4: Трето пускане на обработката – точно едно писмо за този получател
+    stats_3rd = live_processor.process_pending_events()
+    assert stats_3rd["sent"] == 0, (
+        "Стъпка 4 пропадна: Изпратено е дублирано писмо при 3-тото пускане"
+    )
+    assert stats_3rd["processed"] == 0, (
+        "Стъпка 4 пропадна: Обработено е събитие при 3-тото пускане"
+    )
+
+    # Проверяваме, че писмата за този получател остават точно 1 и след третото пускане
+    final_msgs = _get_messages_for_recipient(customer_email)
+    assert len(final_msgs) == 1, (
+        f"Стъпка 4 пропадна: След третото пускане писмата за {customer_email} не са точно 1 ({len(final_msgs)})"
+    )

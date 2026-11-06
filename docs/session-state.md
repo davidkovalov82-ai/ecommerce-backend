@@ -1,20 +1,20 @@
 # Session State
 
-- **Текуща задача**: Команда `make test-notifications-retry` и E2E retry тест във feat/order-paid-notifications.
+- **Текуща задача**: Завършване на проверката на известия (Mailpit в CI, уникален получател, deadline).
 - **Реализирано**:
-  - `Makefile` в корена с `make test-notifications-retry` (Docker Compose up, wait, runner).
-  - Проверка за готовност на PostgreSQL (5432) и Mailpit (1025/8025) с ясна индикация при срив на всяка стъпка.
-  - E2E тест `test_notifications_retry_e2e_live_mailpit` с реален Mailpit (срив, retry, проверка на писмо, липса на дубликати).
-  - Използване на изолирана тестова база данни (`commerce_test`).
-  - Документирана команда в `README.md` с описание на етапите на проверка.
+  - Mailpit добавен като service контейнер в `.github/workflows/ci.yml` с healthcheck.
+  - Липсата на Mailpit проваля проверката (без pytest.skip) и в CI, и при `make test-notifications-retry`.
+  - Премахнато глобално изтриване; уникален получател за всеки тест, изчакване с deadline (5s).
+  - Проверени номер на поръчка, форматирана сума и валута в полученото писмо.
+  - Сценарий: webhook -> отказан SMTP -> поръчката остава paid -> успешен retry -> точно 1 писмо и след 3-то пускане.
 - **Проверено / Резултати**:
-  - `make test-notifications-retry`: 13/13 теста успешни, 100% готовност.
-  - `uv run --locked pytest -q`: 225 passed (100% от пълния suite).
-  - `uv run --locked ruff check .` & `format --check .`: 100% чисти, 0 грешки.
-  - Симулиран неуспех: ненулев код (Error 5) и точен отчет за неуспешния етап.
+  - Локално: `make test-notifications-retry` и `pytest -q`: 225/225 passed (100%).
+  - Тест при спрян Mailpit: проваля се с AssertionError (без skip).
+  - Ruff check & format: 100% чисти, 0 грешки.
+  - CI: конфигуриран service container за автоматичен пуск в GitHub Actions.
 - **Работещи команди**:
   - `make test-notifications-retry`
   - `cd services/commerce && uv run --locked pytest -q`
   - `cd services/commerce && uv run --locked ruff check . && uv run --locked ruff format --check .`
-- **Засегнати файлове**: `Makefile`, `services/commerce/Makefile`, `README.md`, `test_order_notifications.py`.
+- **Засегнати файлове**: `.github/workflows/ci.yml`, `test_order_notifications.py`, `docs/session-state.md`.
 - **Следваща стъпка**: Потребителски преглед, git commit и push от потребителя.
