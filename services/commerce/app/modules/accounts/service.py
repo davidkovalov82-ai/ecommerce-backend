@@ -15,6 +15,10 @@ class InvalidCredentials(Exception):
     """Сигнализира за невалиден имейл или парола при опит за автентикация."""
 
 
+class UserNotFound(Exception):
+    """Сигнализира, че потребител с посочения идентификатор не съществува."""
+
+
 # Предварително изчислен валиден Argon2 хеш за предотвратяване на timing attacks при несъществуващ потребител
 _DUMMY_HASH: str = PasswordHash.recommended().hash(
     "timing_attack_mitigation_dummy_password"
@@ -101,6 +105,25 @@ class AccountService:
                     f"User with email '{email}' already exists"
                 ) from exc
             raise
+        except Exception:
+            self._session.rollback()
+            raise
+
+    def update_user_profile(self, user_id: int, display_name: str | None) -> User:
+        """Сценарий: обновяване на профила на потребителя (display_name).
+
+        Управлява жизнения цикъл на транзакцията (commit/rollback).
+        Хвърля UserNotFound при несъществуващ потребител.
+        """
+        user = self._user_repository.get_by_id(user_id)
+        if user is None:
+            raise UserNotFound(f"User with id {user_id} not found")
+
+        user.display_name = display_name
+        try:
+            self._session.commit()
+            self._session.refresh(user)
+            return user
         except Exception:
             self._session.rollback()
             raise

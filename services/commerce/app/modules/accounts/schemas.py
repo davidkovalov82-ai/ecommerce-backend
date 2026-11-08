@@ -51,3 +51,27 @@ class UserResponse(BaseModel):
     id: int
     email: str
     role: str
+    display_name: str | None = None
+
+
+class UserUpdateRequest(BaseModel):
+    """Схема за редактиране на потребителски профил (display_name)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: str | None
+
+    @field_validator("display_name")
+    @classmethod
+    def validate_display_name(cls, v: str | None) -> str | None:
+        """Нормализира и валидира display_name.
+
+        Явен null връща None (изчистване на името).
+        За низове премахва външните интервали и изисква дължина между 1 и 80 знака.
+        """
+        if v is None:
+            return None
+        cleaned = v.strip()
+        if not (1 <= len(cleaned) <= 80):
+            raise ValueError("display_name must be between 1 and 80 characters")
+        return cleaned

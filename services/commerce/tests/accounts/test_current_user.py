@@ -30,6 +30,7 @@ def test_get_current_user_profile_successful() -> None:
         "id": user_id,
         "email": email,
         "role": "customer",
+        "display_name": None,
     }
 
 

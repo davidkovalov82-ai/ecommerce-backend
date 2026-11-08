@@ -7,8 +7,13 @@ from app.modules.accounts.schemas import (
     UserLoginRequest,
     UserRegisterRequest,
     UserResponse,
+    UserUpdateRequest,
 )
-from app.modules.accounts.service import EmailAlreadyExists, InvalidCredentials
+from app.modules.accounts.service import (
+    EmailAlreadyExists,
+    InvalidCredentials,
+    UserNotFound,
+)
 from app.modules.accounts.tokens import create_access_token
 from app.modules.catalog.dependencies import CatalogServiceDep
 from app.modules.catalog.schemas import ProductListResponse, ProductResponse
@@ -75,6 +80,29 @@ def get_me(
 ) -> UserResponse:
     """HTTP обработчик за извличане на данните на текущия автентикиран потребител."""
     return UserResponse.model_validate(current_user)
+
+
+@router.patch("/me", response_model=UserResponse)
+def update_me(
+    request: UserUpdateRequest,
+    current_user: CurrentUserDep,
+    account_service: AccountServiceDep,
+) -> UserResponse:
+    """HTTP обработчик за редактиране на профила (display_name) на текущия потребител."""
+    try:
+        user = account_service.update_user_profile(
+            user_id=current_user.id,
+            display_name=request.display_name,
+        )
+        return UserResponse.model_validate(user)
+    except UserNotFound:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "USER_NOT_FOUND",
+                "message": "User not found",
+            },
+        )
 
 
 @router.get("/me/products", response_model=ProductListResponse)

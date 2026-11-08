@@ -14,3 +14,6 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[str] = mapped_column(String(32), nullable=False, default="customer")
+    display_name: Mapped[str | None] = mapped_column(
+        String(80), nullable=True, default=None
+    )

@@ -8,6 +8,7 @@ from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.dependencies import get_db_session
 from app.main import app
 from app.modules.accounts.models import User
 from app.modules.accounts.tokens import create_access_token
@@ -320,17 +321,25 @@ def test_migration_on_database_with_existing_product() -> None:
             assert tech_user.password_hash == "!disabled"
             assert tech_user.role == "customer"
 
-        # 5. Опит за вход като legacy-catalog@internal.ecommerce.com трябва да върне 401
+        # 5. Опит за вход като legacy-catalog@internal.ecommerce.com през временната БД трябва да върне 401
         # (входът е напълно невъзможен)
-        login_res = client.post(
-            "/auth/login",
-            json={
-                "email": "legacy-catalog@internal.ecommerce.com",
-                "password": "any_attempted_password",
-            },
-        )
-        assert login_res.status_code == 401
-        assert login_res.json()["detail"]["code"] == "INVALID_CREDENTIALS"
+        def override_db_session():
+            with Session(temp_engine) as session:
+                yield session
+
+        app.dependency_overrides[get_db_session] = override_db_session
+        try:
+            login_res = client.post(
+                "/auth/login",
+                json={
+                    "email": "legacy-catalog@internal.ecommerce.com",
+                    "password": "any_attempted_password",
+                },
+            )
+            assert login_res.status_code == 401
+            assert login_res.json()["detail"]["code"] == "INVALID_CREDENTIALS"
+        finally:
+            app.dependency_overrides.pop(get_db_session, None)
 
         # 6. Проверяваме downgrade: seller_id се премахва, но потребителят не се изтрива
         command.downgrade(alembic_cfg, "bd4c339e0dfa")
