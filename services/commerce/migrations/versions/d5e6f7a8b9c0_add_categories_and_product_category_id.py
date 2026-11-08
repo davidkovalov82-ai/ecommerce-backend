@@ -57,4 +57,3 @@ def downgrade() -> None:
     op.drop_column("products", "category_id")
     op.drop_index("uq_categories_name_lower", table_name="categories")
     op.drop_table("categories")
-

@@ -1,20 +1,19 @@
 # Session State
 
-- **Текуща задача**: Завършване на Етап К2: възстановяване на парола, модерация на акаунти и поведение на маркетплейса при модерирани продавачи.
+- **Текуща задача**: Етап К2: продуктови категории (справочник, привързване към стоки, филтриране и права).
 - **Реализирано**:
-  - Възстановяване на парола (`POST /auth/password-reset/request`, `POST /auth/password-reset/confirm`): 202 отговор без изтичане на данни при грешки/SMTP срив, SHA-256 хеш на токен в DB, 15 мин валидност, Mailpit интеграция, rate limiting, атомарно инвалидиране на сесии (`token_version += 1`).
-  - Единен ред на блокировки: винаги първо `users` (lock_by_id), след това `password_reset_tokens`. Погасяване на линкове при обикновена смяна на парола.
-  - Модерация на акаунти: състояния `active`, `blocked`, `closed`, Alembic миграция `f3c8a91b4d2e`, одит журнал `account_moderation_logs`.
-  - Маркетплейс: скриване на стоки на блокирани/закрити продавачи в каталог и детайли (404), `PUT /cart/items/{id}` дава 404, отхвърляне на checkout (409) без промяна на склад и количка; запазване на историята на платени поръчки.
-  - Поправени тестове: реални SHA-256 хешове за изтекли токени, премахнати дубликати, тестове за конкурентност и SMTP устойчивост.
+  - Справочник категории: `GET /categories` (публичен), `POST /categories`, `PATCH /categories/{id}`, `DELETE /categories/{id}` (само админ: 401/403). Уникалност по `lower(trim(name))` в PostgreSQL и 409 при дубликат. Защита при триене на категория със стоки (409 `CATEGORY_IN_USE`).
+  - Стоки: `products.category_id` (FK `categories.id` RESTRICT, nullable). 3 случая в `PATCH /products/{id}`: липсващ ключ (без промяна), валидно ID (обновяване), явен `null` (изчистване). 422 при невалидно ID без частични промени. Всички схеми връщат `category_id: int | None`.
+  - Филтриране: `GET /products?category_id=...` филтрира в SQL преди limit/offset, запазва сортировката по ID и правилата за видимост (активна стока и активен продавач). Празен `items: []` при липса на активни стоки.
+  - Миграция `d5e6f7a8b9c0_add_categories_and_product_category_id.py` и 9 интеграционни теста в `tests/catalog/test_categories.py`.
 - **Проверено / Резултати**:
-  - `uv run --locked pytest -q`: 262 passed, 0 failed, 0 skipped (100% успех на пълния suite).
-  - `uv run --locked ruff check .` и `uv run --locked ruff format --check .`: 0 грешки (101 файла форматирани).
-  - Alembic: успешно тестван upgrade head и downgrade -1.
-- **Непроверено**: Няма (всички изисквания на етап К2 са напълно проверени).
+  - `uv run --locked pytest -q`: 271 passed, 0 failed (100% успех на пълния suite).
+  - `uv run --locked ruff check .` и `uv run --locked ruff format --check .`: 0 грешки.
+  - `alembic upgrade head`: успешно приложена миграция на реална PostgreSQL база.
+- **Непроверено**: Няма.
 - **Работещи команди**:
   - `cd services/commerce && uv run --locked ruff check . && uv run --locked ruff format --check .`
   - `cd services/commerce && uv run --locked alembic upgrade head`
   - `cd services/commerce && uv run --locked pytest -q`
-- **Засегнати файлове**: `app/modules/accounts/*`, `app/modules/catalog/*`, `app/modules/cart/*`, `app/modules/orders/*`, `migrations/.../f3c8a91b4d2e_*.py`, `tests/*`.
-- **Следваща стъпка**: Потребителски преглед и ръчен commit / push.
+- **Засегнати файлове**: `app/modules/catalog/*`, `app/main.py`, `migrations/.../d5e6f7a8b9c0_*.py`, `tests/conftest.py`, `tests/catalog/test_categories.py`.
+- **Следваща стъпка**: Потребителски преглед и ръчен commit / push на тестовия модул и обновения session state.
