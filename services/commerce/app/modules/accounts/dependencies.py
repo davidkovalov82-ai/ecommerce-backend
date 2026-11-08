@@ -97,6 +97,16 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    if user.status != "active":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "ACCOUNT_INACTIVE",
+                "message": "Account is blocked or closed",
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     return user
 
 

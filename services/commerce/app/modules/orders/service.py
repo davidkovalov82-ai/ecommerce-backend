@@ -129,13 +129,21 @@ class OrderService:
             )
             products_by_id = {p.id: p for p in locked_products}
 
-            # 5. Проверка на актуалните active, stock и price_minor
+            # 5. Проверка на актуалните active, stock и price_minor, както и статуса на продавача
+            seller_ids = [p.seller_id for p in locked_products]
+            sellers = self._user_repository.get_by_ids(seller_ids)
+            sellers_by_id = {u.id: u for u in sellers}
+
             order_items_data: list[tuple[int, str, int, int, int]] = []
             total_minor = 0
 
             for item in cart_items:
                 product = products_by_id.get(item.product_id)
                 if product is None or not product.active:
+                    raise CartProductUnavailable(item.product_id)
+
+                seller = sellers_by_id.get(product.seller_id)
+                if seller is None or seller.status != "active":
                     raise CartProductUnavailable(item.product_id)
 
                 if product.stock < item.quantity:

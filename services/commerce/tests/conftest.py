@@ -101,6 +101,8 @@ def db_session() -> Generator[Session]:
         session.execute(text("DELETE FROM products WHERE id != 1"))
         session.execute(text("UPDATE products SET active = true WHERE id = 1"))
         _sync_products_sequence(session)
+        session.execute(text("DELETE FROM password_reset_tokens"))
+        session.execute(text("DELETE FROM account_moderation_logs"))
         session.execute(
             text(
                 "DELETE FROM users WHERE email != 'legacy-catalog@internal.ecommerce.com'"
@@ -124,6 +126,8 @@ def clean_users_table() -> Generator[None]:
         session.execute(text("DELETE FROM products WHERE id != 1"))
         session.execute(text("UPDATE products SET active = true WHERE id = 1"))
         _sync_products_sequence(session)
+        session.execute(text("DELETE FROM password_reset_tokens"))
+        session.execute(text("DELETE FROM account_moderation_logs"))
         session.execute(
             text(
                 "DELETE FROM users WHERE email != 'legacy-catalog@internal.ecommerce.com'"
@@ -142,6 +146,8 @@ def clean_users_table() -> Generator[None]:
         session.execute(text("DELETE FROM products WHERE id != 1"))
         session.execute(text("UPDATE products SET active = true WHERE id = 1"))
         _sync_products_sequence(session)
+        session.execute(text("DELETE FROM password_reset_tokens"))
+        session.execute(text("DELETE FROM account_moderation_logs"))
         session.execute(
             text(
                 "DELETE FROM users WHERE email != 'legacy-catalog@internal.ecommerce.com'"

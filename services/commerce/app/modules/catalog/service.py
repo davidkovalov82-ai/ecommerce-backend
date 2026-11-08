@@ -76,10 +76,10 @@ class CatalogService:
     def get_product_by_id(self, product_id: int) -> Product:
         """Сценарий: намиране на активен продукт по ID за публичния каталог.
 
-        Хвърля ProductNotFound, ако продуктът липсва в базата данни или не е активен.
+        Хвърля ProductNotFound, ако продуктът липсва в базата данни, не е активен или продавачът не е активен.
         """
-        product = self._product_repository.get_by_id(product_id)
-        if product is None or not product.active:
+        product = self._product_repository.get_active_by_id(product_id)
+        if product is None:
             raise ProductNotFound(f"Product with id {product_id} not found")
         return product
 

@@ -101,3 +101,51 @@ class ChangePasswordRequest(BaseModel):
         if self.current_password == self.new_password:
             raise ValueError("New password must be different from current password")
         return self
+
+
+class PasswordResetRequest(BaseModel):
+    """Схема за заявка за изпращане на имейл за възстановяване на парола."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def normalize_email(cls, v: object) -> object:
+        """Нормализира имейл адреса: премахва празни пространства и прави буквите малки."""
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
+
+
+class PasswordResetConfirmRequest(BaseModel):
+    """Схема за потвърждаване на възстановяването на парола с еднократен токен."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: str
+    new_password: str = Field(min_length=15, max_length=128)
+
+
+class PasswordResetRequestResponse(BaseModel):
+    """Схема за отговор при заявка за възстановяване на парола (202 Accepted)."""
+
+    message: str
+
+
+class ModerationRequest(BaseModel):
+    """Схема за входни данни при администраторска модерация (блокиране/затваряне)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = None
+
+
+class ModerationActionResponse(BaseModel):
+    """Схема за резултат от административно модераторско действие."""
+
+    id: int
+    email: str
+    status: str
+    message: str

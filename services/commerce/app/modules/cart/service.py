@@ -40,6 +40,10 @@ class CartService:
         products = self._product_repository.get_by_ids(product_ids)
         products_by_id = {product.id: product for product in products}
 
+        seller_ids = [p.seller_id for p in products]
+        sellers = self._user_repository.get_by_ids(seller_ids)
+        sellers_by_id = {u.id: u for u in sellers}
+
         item_responses: list[CartItemResponse] = []
         total_minor = 0
 
@@ -48,9 +52,14 @@ class CartService:
             if product is None:
                 continue
 
+            seller = sellers_by_id.get(product.seller_id)
+            is_seller_active = bool(seller is not None and seller.status == "active")
+
             subtotal_minor = product.price_minor * item.quantity
             total_minor += subtotal_minor
-            available = bool(product.active and product.stock >= item.quantity)
+            available = bool(
+                product.active and is_seller_active and product.stock >= item.quantity
+            )
 
             item_responses.append(
                 CartItemResponse(
