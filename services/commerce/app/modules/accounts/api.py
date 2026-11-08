@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 
 from app.config import settings
 from app.modules.accounts.dependencies import AccountServiceDep, CurrentUserDep
@@ -10,6 +10,8 @@ from app.modules.accounts.schemas import (
 )
 from app.modules.accounts.service import EmailAlreadyExists, InvalidCredentials
 from app.modules.accounts.tokens import create_access_token
+from app.modules.catalog.dependencies import CatalogServiceDep
+from app.modules.catalog.schemas import ProductListResponse, ProductResponse
 
 router = APIRouter(prefix="/users", tags=["accounts"])
 auth_router = APIRouter(prefix="/auth", tags=["auth"])
@@ -73,3 +75,23 @@ def get_me(
 ) -> UserResponse:
     """HTTP обработчик за извличане на данните на текущия автентикиран потребител."""
     return UserResponse.model_validate(current_user)
+
+
+@router.get("/me/products", response_model=ProductListResponse)
+def get_my_products(
+    current_user: CurrentUserDep,
+    catalog_service: CatalogServiceDep,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> ProductListResponse:
+    """HTTP обработчик за получаване на собствените продукти на потребителя (вкл. неактивни)."""
+    products = catalog_service.list_products_by_seller(
+        seller_id=current_user.id,
+        limit=limit,
+        offset=offset,
+    )
+    return ProductListResponse(
+        items=[ProductResponse.model_validate(p) for p in products],
+        limit=limit,
+        offset=offset,
+    )

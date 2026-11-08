@@ -98,11 +98,15 @@ def db_session() -> Generator[Session]:
         session.execute(text("DELETE FROM cart_items"))
         session.execute(text("DELETE FROM order_items"))
         session.execute(text("DELETE FROM orders"))
-        session.execute(text("DELETE FROM users"))
-        _sync_users_sequence(session)
         session.execute(text("DELETE FROM products WHERE id != 1"))
         session.execute(text("UPDATE products SET active = true WHERE id = 1"))
         _sync_products_sequence(session)
+        session.execute(
+            text(
+                "DELETE FROM users WHERE email != 'legacy-catalog@internal.ecommerce.com'"
+            )
+        )
+        _sync_users_sequence(session)
         session.commit()
         session.close()
 
@@ -117,7 +121,14 @@ def clean_users_table() -> Generator[None]:
         session.execute(text("DELETE FROM cart_items"))
         session.execute(text("DELETE FROM order_items"))
         session.execute(text("DELETE FROM orders"))
-        session.execute(text("DELETE FROM users"))
+        session.execute(text("DELETE FROM products WHERE id != 1"))
+        session.execute(text("UPDATE products SET active = true WHERE id = 1"))
+        _sync_products_sequence(session)
+        session.execute(
+            text(
+                "DELETE FROM users WHERE email != 'legacy-catalog@internal.ecommerce.com'"
+            )
+        )
         _sync_users_sequence(session)
         session.commit()
     yield
@@ -128,7 +139,14 @@ def clean_users_table() -> Generator[None]:
         session.execute(text("DELETE FROM cart_items"))
         session.execute(text("DELETE FROM order_items"))
         session.execute(text("DELETE FROM orders"))
-        session.execute(text("DELETE FROM users"))
+        session.execute(text("DELETE FROM products WHERE id != 1"))
+        session.execute(text("UPDATE products SET active = true WHERE id = 1"))
+        _sync_products_sequence(session)
+        session.execute(
+            text(
+                "DELETE FROM users WHERE email != 'legacy-catalog@internal.ecommerce.com'"
+            )
+        )
         _sync_users_sequence(session)
         session.commit()
 

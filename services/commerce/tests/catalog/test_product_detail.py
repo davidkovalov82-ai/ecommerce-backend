@@ -8,17 +8,17 @@ client = TestClient(app)
 
 
 def test_get_existing_product() -> None:
-    """Критерий 1: GET /products/1 връща 200 и шестте полета на продукта."""
+    """Критерий 1: GET /products/1 връща 200 и полетата на продукта."""
     response = client.get("/products/1")
     assert response.status_code == 200
-    assert response.json() == {
-        "id": 1,
-        "title": "Notebook",
-        "price_minor": 1299,
-        "currency": "EUR",
-        "stock": 10,
-        "active": True,
-    }
+    data = response.json()
+    assert data["id"] == 1
+    assert data["title"] == "Notebook"
+    assert data["price_minor"] == 1299
+    assert data["currency"] == "EUR"
+    assert data["stock"] == 10
+    assert data["active"] is True
+    assert isinstance(data["seller_id"], int)
 
 
 def test_get_missing_product() -> None:

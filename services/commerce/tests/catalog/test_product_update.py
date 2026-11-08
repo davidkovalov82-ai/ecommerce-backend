@@ -37,8 +37,10 @@ def test_patch_product_without_token_returns_401() -> None:
     assert res.json()["detail"]["code"] == "AUTHENTICATION_REQUIRED"
 
 
-def test_patch_product_as_customer_returns_403(db_session: Session) -> None:
-    """PATCH /products/{id} от потребител с роля customer връща 403 FORBIDDEN и не променя БД."""
+def test_patch_product_as_customer_on_foreign_product_returns_404(
+    db_session: Session,
+) -> None:
+    """PATCH /products/{id} за чужд продукт от customer връща 404 PRODUCT_NOT_FOUND и не променя БД."""
     _, customer_token = _create_user_with_role(
         db_session, "customer_patch@example.com", "customer"
     )
@@ -52,8 +54,8 @@ def test_patch_product_as_customer_returns_403(db_session: Session) -> None:
         json={"price_minor": 99999},
         headers={"Authorization": f"Bearer {customer_token}"},
     )
-    assert res.status_code == 403
-    assert res.json()["detail"]["code"] == "FORBIDDEN"
+    assert res.status_code == 404
+    assert res.json()["detail"]["code"] == "PRODUCT_NOT_FOUND"
 
     db_session.expire_all()
     reloaded = db_session.get(Product, 1)
@@ -61,45 +63,85 @@ def test_patch_product_as_customer_returns_403(db_session: Session) -> None:
     assert reloaded.price_minor == initial_price
 
 
-def test_patch_product_price_only_keeps_other_fields(db_session: Session) -> None:
-    """PATCH /products/{id} обновява само подадената цена, като запазва останалите полета."""
+def test_patch_product_as_admin_on_foreign_product_returns_404(
+    db_session: Session,
+) -> None:
+    """Администраторските права сами по себе си не дават право за редакция на чужд продукт (връща 404)."""
     _, admin_token = _create_user_with_role(
-        db_session, "admin_patch_price@example.com", "admin"
+        db_session, "admin_foreign@example.com", "admin"
     )
 
     res = client.patch(
         "/products/1",
-        json={"price_minor": 2500},
+        json={"price_minor": 99999},
         headers={"Authorization": f"Bearer {admin_token}"},
+    )
+    assert res.status_code == 404
+    assert res.json()["detail"]["code"] == "PRODUCT_NOT_FOUND"
+
+
+def test_patch_product_price_only_keeps_other_fields(db_session: Session) -> None:
+    """PATCH /products/{id} обновява само подадената цена на собствен продукт, като запазва останалите полета."""
+    owner, token = _create_user_with_role(
+        db_session, "owner_patch_price@example.com", "customer"
+    )
+    product = Product(
+        title="Custom Item",
+        price_minor=1200,
+        currency="EUR",
+        stock=10,
+        active=True,
+        seller_id=owner.id,
+    )
+    db_session.add(product)
+    db_session.commit()
+    db_session.refresh(product)
+
+    res = client.patch(
+        f"/products/{product.id}",
+        json={"price_minor": 2500},
+        headers={"Authorization": f"Bearer {token}"},
     )
     assert res.status_code == 200
     data = res.json()
-    assert data["id"] == 1
+    assert data["id"] == product.id
     assert data["price_minor"] == 2500
-    assert data["title"] == "Notebook"  # непроменено
+    assert data["title"] == "Custom Item"  # непроменено
     assert data["currency"] == "EUR"  # непроменено
     assert data["stock"] == 10  # непроменено
     assert data["active"] is True  # непроменено
+    assert data["seller_id"] == owner.id
 
     db_session.expire_all()
-    p = db_session.get(Product, 1)
+    p = db_session.get(Product, product.id)
     assert p is not None
     assert p.price_minor == 2500
-    assert p.title == "Notebook"
+    assert p.title == "Custom Item"
 
 
 def test_patch_product_zero_and_false_values_applied_correctly(
     db_session: Session,
 ) -> None:
     """Стойности 0 и false се прилагат правилно и не се третират като липсващи."""
-    _, admin_token = _create_user_with_role(
-        db_session, "admin_patch_zeros@example.com", "admin"
+    owner, token = _create_user_with_role(
+        db_session, "owner_patch_zeros@example.com", "customer"
     )
+    product = Product(
+        title="Zero Item",
+        price_minor=1000,
+        currency="EUR",
+        stock=10,
+        active=True,
+        seller_id=owner.id,
+    )
+    db_session.add(product)
+    db_session.commit()
+    db_session.refresh(product)
 
     res = client.patch(
-        "/products/1",
+        f"/products/{product.id}",
         json={"price_minor": 0, "stock": 0, "active": False},
-        headers={"Authorization": f"Bearer {admin_token}"},
+        headers={"Authorization": f"Bearer {token}"},
     )
     assert res.status_code == 200
     data = res.json()
@@ -108,7 +150,7 @@ def test_patch_product_zero_and_false_values_applied_correctly(
     assert data["active"] is False
 
     db_session.expire_all()
-    p = db_session.get(Product, 1)
+    p = db_session.get(Product, product.id)
     assert p is not None
     assert p.price_minor == 0
     assert p.stock == 0
@@ -118,26 +160,37 @@ def test_patch_product_zero_and_false_values_applied_correctly(
 def test_patch_deactivate_product_hides_from_public_get(
     db_session: Session,
 ) -> None:
-    """Деактивирането на продукт (active=False) го скрива от публичните GET операции."""
-    _, admin_token = _create_user_with_role(
-        db_session, "admin_deactivate@example.com", "admin"
+    """Деактивирането на собствен продукт (active=False) го скрива от публичните GET операции."""
+    owner, token = _create_user_with_role(
+        db_session, "owner_deactivate@example.com", "customer"
     )
+    product = Product(
+        title="Deactivatable Item",
+        price_minor=1500,
+        currency="EUR",
+        stock=5,
+        active=True,
+        seller_id=owner.id,
+    )
+    db_session.add(product)
+    db_session.commit()
+    db_session.refresh(product)
 
-    # 1. Проверяваме, че продукт 1 е видим публично
-    get_before = client.get("/products/1")
+    # 1. Проверяваме, че продуктът е видим публично
+    get_before = client.get(f"/products/{product.id}")
     assert get_before.status_code == 200
 
     # 2. Деактивираме го през PATCH
     patch_res = client.patch(
-        "/products/1",
+        f"/products/{product.id}",
         json={"active": False},
-        headers={"Authorization": f"Bearer {admin_token}"},
+        headers={"Authorization": f"Bearer {token}"},
     )
     assert patch_res.status_code == 200
     assert patch_res.json()["active"] is False
 
-    # 3. Публичният GET /products/1 връща 404
-    get_after = client.get("/products/1")
+    # 3. Публичният GET /products/{id} връща 404
+    get_after = client.get(f"/products/{product.id}")
     assert get_after.status_code == 404
     assert get_after.json()["detail"]["code"] == "PRODUCT_NOT_FOUND"
 
@@ -145,54 +198,59 @@ def test_patch_deactivate_product_hides_from_public_get(
     list_res = client.get("/products")
     assert list_res.status_code == 200
     ids = [item["id"] for item in list_res.json()["items"]]
-    assert 1 not in ids
+    assert product.id not in ids
 
 
 def test_patch_reactivate_product_makes_visible_again(
     db_session: Session,
 ) -> None:
     """Повторното активиране на продукт (active=True) го прави видим за публичните GET операции."""
-    _, admin_token = _create_user_with_role(
-        db_session, "admin_reactivate@example.com", "admin"
+    owner, token = _create_user_with_role(
+        db_session, "owner_reactivate@example.com", "customer"
     )
-
-    # 1. Първо деактивираме продукта
-    p = db_session.get(Product, 1)
-    assert p is not None
-    p.active = False
+    product = Product(
+        title="Reactivatable Item",
+        price_minor=2000,
+        currency="EUR",
+        stock=5,
+        active=False,
+        seller_id=owner.id,
+    )
+    db_session.add(product)
     db_session.commit()
+    db_session.refresh(product)
 
     # Проверка, че е скрит
-    assert client.get("/products/1").status_code == 404
+    assert client.get(f"/products/{product.id}").status_code == 404
 
     # 2. Активираме го отново през PATCH
     patch_res = client.patch(
-        "/products/1",
+        f"/products/{product.id}",
         json={"active": True},
-        headers={"Authorization": f"Bearer {admin_token}"},
+        headers={"Authorization": f"Bearer {token}"},
     )
     assert patch_res.status_code == 200
     assert patch_res.json()["active"] is True
 
-    # 3. Публичният GET /products/1 отново връща 200
-    get_res = client.get("/products/1")
+    # 3. Публичният GET /products/{id} отново връща 200
+    get_res = client.get(f"/products/{product.id}")
     assert get_res.status_code == 200
-    assert get_res.json()["id"] == 1
+    assert get_res.json()["id"] == product.id
     assert get_res.json()["active"] is True
 
     # 4. Включен е в публичния списък
     list_res = client.get("/products")
     assert list_res.status_code == 200
     ids = [item["id"] for item in list_res.json()["items"]]
-    assert 1 in ids
+    assert product.id in ids
 
 
-def test_patch_inactive_product_can_be_edited_by_admin(
+def test_patch_inactive_product_can_be_edited_by_owner(
     db_session: Session,
 ) -> None:
-    """Администраторът може да редактира заглавие и цена на неактивен продукт, без да го активира."""
-    _, admin_token = _create_user_with_role(
-        db_session, "admin_edit_inactive@example.com", "admin"
+    """Собственикът може да редактира заглавие и цена на неактивен продукт, без да го активира."""
+    owner, token = _create_user_with_role(
+        db_session, "owner_edit_inactive@example.com", "customer"
     )
 
     inactive_prod = Product(
@@ -201,6 +259,7 @@ def test_patch_inactive_product_can_be_edited_by_admin(
         currency="EUR",
         stock=0,
         active=False,
+        seller_id=owner.id,
     )
     db_session.add(inactive_prod)
     db_session.commit()
@@ -209,7 +268,7 @@ def test_patch_inactive_product_can_be_edited_by_admin(
     res = client.patch(
         f"/products/{inactive_prod.id}",
         json={"title": "  Updated Vintage Mouse  ", "price_minor": 2999},
-        headers={"Authorization": f"Bearer {admin_token}"},
+        headers={"Authorization": f"Bearer {token}"},
     )
     assert res.status_code == 200
     data = res.json()
@@ -219,6 +278,33 @@ def test_patch_inactive_product_can_be_edited_by_admin(
 
     # Публичният GET все още връща 404 за него
     assert client.get(f"/products/{inactive_prod.id}").status_code == 404
+
+
+def test_patch_cannot_transfer_ownership_returns_422(
+    db_session: Session,
+) -> None:
+    """Опит за предаване на владение чрез seller_id в PATCH връща 422."""
+    owner, token = _create_user_with_role(
+        db_session, "owner_transfer@example.com", "customer"
+    )
+    product = Product(
+        title="Untransferable Item",
+        price_minor=1000,
+        currency="EUR",
+        stock=5,
+        active=True,
+        seller_id=owner.id,
+    )
+    db_session.add(product)
+    db_session.commit()
+    db_session.refresh(product)
+
+    res = client.patch(
+        f"/products/{product.id}",
+        json={"seller_id": 9999},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert res.status_code == 422
 
 
 def test_patch_nonexistent_product_returns_404(db_session: Session) -> None:

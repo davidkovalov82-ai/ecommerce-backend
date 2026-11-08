@@ -48,6 +48,19 @@ class ProductRepository:
         )
         return self._session.scalars(stmt).all()
 
+    def list_by_seller(
+        self, seller_id: int, limit: int, offset: int
+    ) -> Sequence[Product]:
+        """Извлича списък с продукти на конкретен продавач (вкл. неактивни), подредени по ID възходящо."""
+        stmt = (
+            select(Product)
+            .where(Product.seller_id == seller_id)
+            .order_by(Product.id.asc())
+            .limit(limit)
+            .offset(offset)
+        )
+        return self._session.scalars(stmt).all()
+
     def create(self, product: Product) -> Product:
         """Добавя продукт в текущата сесия и прави flush, за да получи автоматично генерирано ID."""
         self._session.add(product)

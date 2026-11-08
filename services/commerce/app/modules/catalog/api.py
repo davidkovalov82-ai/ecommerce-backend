@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Query, status
 
-from app.modules.accounts.dependencies import AdminUserDep
+from app.modules.accounts.dependencies import CurrentUserDep
 from app.modules.catalog.dependencies import CatalogServiceDep
 from app.modules.catalog.schemas import (
     ProductCreateRequest,
@@ -17,10 +17,11 @@ router = APIRouter(prefix="/products", tags=["catalog"])
 def create_product(
     data: ProductCreateRequest,
     catalog_service: CatalogServiceDep,
-    _: AdminUserDep,
+    current_user: CurrentUserDep,
 ) -> ProductResponse:
-    """HTTP обработчик за създаване на нов продукт (само за администратори)."""
+    """HTTP обработчик за създаване на нов продукт от автентикиран потребител."""
     product = catalog_service.create_product(
+        seller_id=current_user.id,
         title=data.title,
         price_minor=data.price_minor,
         currency=data.currency,
@@ -35,13 +36,14 @@ def update_product(
     product_id: int,
     data: ProductUpdateRequest,
     catalog_service: CatalogServiceDep,
-    _: AdminUserDep,
+    current_user: CurrentUserDep,
 ) -> ProductResponse:
-    """HTTP обработчик за частично обновяване на продукт (само за администратори)."""
+    """HTTP обработчик за частично обновяване на собствен продукт (само за собственика)."""
     update_data = data.model_dump(exclude_unset=True)
     try:
         product = catalog_service.update_product(
             product_id=product_id,
+            seller_id=current_user.id,
             update_data=update_data,
         )
         return ProductResponse.model_validate(product)
@@ -72,7 +74,7 @@ def get_product(
     product_id: int,
     catalog_service: CatalogServiceDep,
 ) -> ProductResponse:
-    """HTTP обработчик за получаване на продукт по ID от базата данни."""
+    """HTTP обработчик за получаване на продукт по ID от базата данни (само активни)."""
     try:
         product = catalog_service.get_product_by_id(product_id)
         return ProductResponse.model_validate(product)
