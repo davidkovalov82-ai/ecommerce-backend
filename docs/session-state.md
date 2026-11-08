@@ -1,20 +1,20 @@
 # Session State
 
-- **Текуща задача**: Етап К2 — POST /users/me/change-password и инвалидиране на сесии.
+- **Текуща задача**: Завършване на Етап К2: възстановяване на парола, модерация на акаунти и поведение на маркетплейса при модерирани продавачи.
 - **Реализирано**:
-  - `POST /users/me/change-password` (204 No Content); грешна текуща парола -> 400.
-  - Токен версиониране: колона `token_version` в `users` и Alembic миграция `09ee8360d8c2`.
-  - При смяна на парола `token_version` се инкрементира атомарно; старите JWT губят достъп (401).
-  - Валидация: 15–128 знака без strip; съвпадение със старата парола -> 422; липса на пароли в 422 отговора.
-  - Защита от race conditions чрез `lock_by_id` (FOR UPDATE с `populate_existing=True`).
-  - Поправки от ревю: отхвърляне на `\0` в display_name (422), възстановяване на предишен get_db_session override в К1.
+  - Възстановяване на парола (`POST /auth/password-reset/request`, `POST /auth/password-reset/confirm`): 202 отговор без изтичане на данни при грешки/SMTP срив, SHA-256 хеш на токен в DB, 15 мин валидност, Mailpit интеграция, rate limiting, атомарно инвалидиране на сесии (`token_version += 1`).
+  - Единен ред на блокировки: винаги първо `users` (lock_by_id), след това `password_reset_tokens`. Погасяване на линкове при обикновена смяна на парола.
+  - Модерация на акаунти: състояния `active`, `blocked`, `closed`, Alembic миграция `f3c8a91b4d2e`, одит журнал `account_moderation_logs`.
+  - Маркетплейс: скриване на стоки на блокирани/закрити продавачи в каталог и детайли (404), `PUT /cart/items/{id}` дава 404, отхвърляне на checkout (409) без промяна на склад и количка; запазване на историята на платени поръчки.
+  - Поправени тестове: реални SHA-256 хешове за изтекли токени, премахнати дубликати, тестове за конкурентност и SMTP устойчивост.
 - **Проверено / Резултати**:
-  - `uv run --locked pytest`: 241 passed (100% успех, включително 7 теста в `test_profile_k2.py`).
-  - `uv run --locked ruff check .` и `uv run --locked ruff format --check .`: 0 грешки.
-- **Непроверено**: Интеграция с външен пощенски клиент за reset password (отделна задача).
+  - `uv run --locked pytest -q`: 262 passed, 0 failed, 0 skipped (100% успех на пълния suite).
+  - `uv run --locked ruff check .` и `uv run --locked ruff format --check .`: 0 грешки (101 файла форматирани).
+  - Alembic: успешно тестван upgrade head и downgrade -1.
+- **Непроверено**: Няма (всички изисквания на етап К2 са напълно проверени).
 - **Работещи команди**:
-  - `cd services/commerce && uv run --locked pytest tests/accounts/test_profile_k2.py`
-  - `cd services/commerce && uv run --locked pytest`
   - `cd services/commerce && uv run --locked ruff check . && uv run --locked ruff format --check .`
-- **Засегнати файлове**: `app/modules/accounts/*`, `migrations/.../09ee8360d8c2_*.py`, `tests/accounts/*`.
+  - `cd services/commerce && uv run --locked alembic upgrade head`
+  - `cd services/commerce && uv run --locked pytest -q`
+- **Засегнати файлове**: `app/modules/accounts/*`, `app/modules/catalog/*`, `app/modules/cart/*`, `app/modules/orders/*`, `migrations/.../f3c8a91b4d2e_*.py`, `tests/*`.
 - **Следваща стъпка**: Потребителски преглед и ръчен commit / push.
