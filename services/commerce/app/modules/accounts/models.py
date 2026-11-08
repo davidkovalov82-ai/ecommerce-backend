@@ -1,4 +1,4 @@
-from sqlalchemy import Integer, String, UniqueConstraint
+from sqlalchemy import Integer, String, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -16,4 +16,7 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(32), nullable=False, default="customer")
     display_name: Mapped[str | None] = mapped_column(
         String(80), nullable=True, default=None
+    )
+    token_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
     )

@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException, Query, status
 from app.config import settings
 from app.modules.accounts.dependencies import AccountServiceDep, CurrentUserDep
 from app.modules.accounts.schemas import (
+    ChangePasswordRequest,
     TokenResponse,
     UserLoginRequest,
     UserRegisterRequest,
@@ -12,6 +13,8 @@ from app.modules.accounts.schemas import (
 from app.modules.accounts.service import (
     EmailAlreadyExists,
     InvalidCredentials,
+    InvalidCurrentPassword,
+    SamePasswordError,
     UserNotFound,
 )
 from app.modules.accounts.tokens import create_access_token
@@ -48,6 +51,7 @@ def login(
         secret=settings.jwt_secret,
         algorithm=settings.jwt_algorithm,
         expire_minutes=settings.jwt_access_token_expire_minutes,
+        token_version=user.token_version,
     )
     return TokenResponse(access_token=access_token, token_type="bearer")
 
@@ -101,6 +105,40 @@ def update_me(
             detail={
                 "code": "USER_NOT_FOUND",
                 "message": "User not found",
+            },
+        )
+
+
+@router.post(
+    "/me/change-password",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def change_password(
+    request: ChangePasswordRequest,
+    current_user: CurrentUserDep,
+    account_service: AccountServiceDep,
+) -> None:
+    """HTTP обработчик за сигурна смяна на парола на текущия потребител."""
+    try:
+        account_service.change_password(
+            user_id=current_user.id,
+            current_password=request.current_password,
+            new_password=request.new_password,
+        )
+    except InvalidCurrentPassword:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "INVALID_CURRENT_PASSWORD",
+                "message": "Current password is incorrect",
+            },
+        )
+    except SamePasswordError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "code": "SAME_PASSWORD",
+                "message": "New password must be different from current password",
             },
         )
 

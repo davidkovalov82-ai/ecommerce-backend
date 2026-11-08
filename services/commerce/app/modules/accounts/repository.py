@@ -20,8 +20,13 @@ class UserRepository:
         return self._session.get(User, user_id)
 
     def lock_by_id(self, user_id: int) -> User | None:
-        """Заключва реда на потребителя с FOR NO KEY UPDATE за синхронизация."""
-        stmt = select(User).where(User.id == user_id).with_for_update(key_share=True)
+        """Заключва реда на потребителя с FOR UPDATE и опреснява данните му от БД."""
+        stmt = (
+            select(User)
+            .where(User.id == user_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         return self._session.scalars(stmt).first()
 
     def create(self, user: User) -> User:

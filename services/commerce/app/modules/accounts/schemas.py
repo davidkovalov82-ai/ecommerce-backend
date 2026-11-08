@@ -1,4 +1,11 @@
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 
 class UserRegisterRequest(BaseModel):
@@ -68,10 +75,29 @@ class UserUpdateRequest(BaseModel):
 
         Явен null връща None (изчистване на името).
         За низове премахва външните интервали и изисква дължина между 1 и 80 знака.
+        Отхвърля нулеви символи (\0) с 422.
         """
         if v is None:
             return None
+        if "\0" in v or "\x00" in v:
+            raise ValueError("display_name cannot contain null characters")
         cleaned = v.strip()
         if not (1 <= len(cleaned) <= 80):
             raise ValueError("display_name must be between 1 and 80 characters")
         return cleaned
+
+
+class ChangePasswordRequest(BaseModel):
+    """Схема за заявка за смяна на парола на текущия потребител."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    current_password: str
+    new_password: str = Field(min_length=15, max_length=128)
+
+    @model_validator(mode="after")
+    def verify_passwords_differ(self) -> "ChangePasswordRequest":
+        """Проверява дали новата парола се различава от текущата."""
+        if self.current_password == self.new_password:
+            raise ValueError("New password must be different from current password")
+        return self

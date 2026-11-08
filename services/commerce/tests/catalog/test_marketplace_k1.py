@@ -323,6 +323,8 @@ def test_migration_on_database_with_existing_product() -> None:
 
         # 5. Опит за вход като legacy-catalog@internal.ecommerce.com през временната БД трябва да върне 401
         # (входът е напълно невъзможен)
+        previous_override = app.dependency_overrides.get(get_db_session)
+
         def override_db_session():
             with Session(temp_engine) as session:
                 yield session
@@ -339,7 +341,10 @@ def test_migration_on_database_with_existing_product() -> None:
             assert login_res.status_code == 401
             assert login_res.json()["detail"]["code"] == "INVALID_CREDENTIALS"
         finally:
-            app.dependency_overrides.pop(get_db_session, None)
+            if previous_override is not None:
+                app.dependency_overrides[get_db_session] = previous_override
+            else:
+                app.dependency_overrides.pop(get_db_session, None)
 
         # 6. Проверяваме downgrade: seller_id се премахва, но потребителят не се изтрива
         command.downgrade(alembic_cfg, "bd4c339e0dfa")

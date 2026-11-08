@@ -61,7 +61,7 @@ def get_current_user(
         )
 
     try:
-        user_id = decode_access_token(
+        token_data = decode_access_token(
             credentials.credentials,
             secret=settings.jwt_secret,
             algorithm=settings.jwt_algorithm,
@@ -76,13 +76,23 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    user = user_repository.get_by_id(user_id)
+    user = user_repository.get_by_id(token_data.user_id)
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={
                 "code": "USER_NOT_FOUND",
                 "message": "User not found",
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if user.token_version != token_data.token_version:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "INVALID_TOKEN",
+                "message": "Invalid or expired token",
             },
             headers={"WWW-Authenticate": "Bearer"},
         )
