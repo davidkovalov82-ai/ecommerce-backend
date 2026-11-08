@@ -1,6 +1,8 @@
 import datetime
 import hashlib
+import logging
 import secrets
+import smtplib
 import time
 
 from pwdlib import PasswordHash
@@ -12,6 +14,8 @@ from app.config import settings
 from app.modules.accounts.mailer import AccountMailer
 from app.modules.accounts.models import AccountModerationLog, PasswordResetToken, User
 from app.modules.accounts.repository import UserRepository
+
+logger = logging.getLogger(__name__)
 
 _TECHNICAL_ACCOUNT_EMAIL = "legacy-catalog@internal.ecommerce.com"
 
@@ -239,6 +243,7 @@ class AccountService:
 
         user.password_hash = self._password_hasher.hash(new_password)
         user.token_version += 1
+        self._user_repository.invalidate_user_reset_tokens(user.id)
 
         try:
             self._session.commit()
@@ -246,14 +251,14 @@ class AccountService:
             self._session.rollback()
             raise
 
-    def request_password_reset(
-        self, email: str, client_ip: str | None = None
-    ) -> None:
+    def request_password_reset(self, email: str, client_ip: str | None = None) -> None:
         """Сценарий: заявка за възстановяване на забравена парола по имейл.
 
         Ограничава честотата на заявките по IP и имейл без разкриване на съществуването на акаунта.
+        Йерархия на блокировките: заключва първо реда на потребителя (users), преди запис на токен.
         При несъществуващ, блокиран, закрит или служебен технически акаунт не изпраща писмо,
         но завършва без грешка (за идентичен отговор 202).
+        Не извежда токена в логовете и осигурява устойчивост при недостъпен SMTP/Mailpit.
         """
         if client_ip and not self._rate_limiter.check_and_record(f"ip:{client_ip}"):
             raise RateLimitExceeded(
@@ -268,13 +273,15 @@ class AccountService:
         if user is None:
             return
 
-        if (
-            user.email == _TECHNICAL_ACCOUNT_EMAIL
-            or user.password_hash.startswith("!")
-        ):
+        if user.email == _TECHNICAL_ACCOUNT_EMAIL or user.password_hash.startswith("!"):
             return
 
         if user.status != "active":
+            return
+
+        # Захващаме реда на потребителя първи според йерархията на блокировките
+        locked_user = self._user_repository.lock_by_id(user.id)
+        if locked_user is None or locked_user.status != "active":
             return
 
         plain_token = secrets.token_urlsafe(32)
@@ -284,7 +291,7 @@ class AccountService:
         )
 
         token_record = PasswordResetToken(
-            user_id=user.id,
+            user_id=locked_user.id,
             token_hash=token_hash,
             expires_at=expires_at,
         )
@@ -296,40 +303,65 @@ class AccountService:
             raise
 
         reset_url = f"{settings.password_reset_base_url}?token={plain_token}"
-        self._mailer.send_password_reset_email(
-            to_email=user.email,
-            token=plain_token,
-            reset_url=reset_url,
-        )
+        try:
+            self._mailer.send_password_reset_email(
+                to_email=locked_user.email,
+                token=plain_token,
+                reset_url=reset_url,
+            )
+        except (OSError, smtplib.SMTPException) as exc:
+            # Не извеждаме тайната на токена в лога и не разкриваме грешка навън
+            logger.warning(
+                "Failed to deliver password reset email to %s: %s",
+                locked_user.email,
+                type(exc).__name__,
+            )
+            return
 
     def confirm_password_reset(self, token: str, new_password: str) -> None:
         """Сценарий: потвърждаване на възстановяване на парола с еднократен токен.
 
-        Атомарно в една транзакция:
-        1. Заключва записа на токена с FOR UPDATE (само един конкурентен опит успява).
-        2. Верифицира валидността (неизползван и неизтекъл).
-        3. Заключва потребителя и проверява дали е активен.
-        4. Задава новата парола, инкрементира token_version и маркира токена като използван.
-        5. Инвалидира всички останали неизползвани токени на потребителя.
+        Йерархия на блокировките (lock order: users -> password_reset_tokens):
+        1. Намиране на user_id по хеша на токена без заключване (read-only).
+        2. Захващане на реда на потребителя с FOR UPDATE (lock_by_id).
+        3. Препрочитане на токена под блокировка FOR UPDATE (get_password_reset_token_for_update).
+        4. Повторна проверка на used_at, expires_at и статуса на потребителя.
+        5. Задаване на новата парола, token_version += 1 и погасяване на токените в същата транзакция.
         """
         token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-        token_record = self._user_repository.get_password_reset_token_for_update(
+
+        # 1. Намиране на user_id по хеша без блокировка
+        initial_token = self._user_repository.get_password_reset_token_by_hash(
             token_hash
         )
         now = datetime.datetime.now(datetime.UTC)
-
         if (
-            token_record is None
-            or token_record.used_at is not None
-            or token_record.expires_at < now
+            initial_token is None
+            or initial_token.used_at is not None
+            or initial_token.expires_at < now
         ):
             raise InvalidResetToken("Invalid or expired password reset token")
 
-        user = self._user_repository.lock_by_id(token_record.user_id)
+        # 2. Захващане на реда на потребителя с FOR UPDATE
+        user = self._user_repository.lock_by_id(initial_token.user_id)
         if user is None or user.status != "active":
             raise InvalidResetToken("Invalid or expired password reset token")
 
-        token_record.used_at = now
+        # 3. Препрочитане на токена под блокировка FOR UPDATE
+        token_record = self._user_repository.get_password_reset_token_for_update(
+            token_hash
+        )
+        now_fresh = datetime.datetime.now(datetime.UTC)
+        if (
+            token_record is None
+            or token_record.used_at is not None
+            or token_record.expires_at < now_fresh
+            or token_record.user_id != user.id
+        ):
+            raise InvalidResetToken("Invalid or expired password reset token")
+
+        # 4. Обновяване в същата транзакция
+        token_record.used_at = now_fresh
         self._user_repository.invalidate_user_reset_tokens(user.id)
         user.password_hash = self._password_hasher.hash(new_password)
         user.token_version += 1
@@ -359,9 +391,7 @@ class AccountService:
             target_user.email == _TECHNICAL_ACCOUNT_EMAIL
             or target_user.password_hash.startswith("!")
         ):
-            raise TechnicalAccountProtected(
-                "Cannot moderate technical system account"
-            )
+            raise TechnicalAccountProtected("Cannot moderate technical system account")
 
         if target_user.status == "closed":
             raise InvalidAccountState("Cannot block an already closed account")
@@ -401,9 +431,7 @@ class AccountService:
             target_user.email == _TECHNICAL_ACCOUNT_EMAIL
             or target_user.password_hash.startswith("!")
         ):
-            raise TechnicalAccountProtected(
-                "Cannot moderate technical system account"
-            )
+            raise TechnicalAccountProtected("Cannot moderate technical system account")
 
         if target_user.status == "closed":
             raise InvalidAccountState("Closed accounts cannot be unblocked")
@@ -449,9 +477,7 @@ class AccountService:
             target_user.email == _TECHNICAL_ACCOUNT_EMAIL
             or target_user.password_hash.startswith("!")
         ):
-            raise TechnicalAccountProtected(
-                "Cannot moderate technical system account"
-            )
+            raise TechnicalAccountProtected("Cannot moderate technical system account")
 
         if target_user.status == "closed":
             raise InvalidAccountState("Account is already closed")

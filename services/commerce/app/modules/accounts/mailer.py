@@ -46,4 +46,3 @@ class AccountMailer:
 
         with smtplib.SMTP(self.host, self.port, timeout=self.timeout) as client:
             client.send_message(msg)
-

@@ -30,7 +30,7 @@ def test_seller_blocked_and_unblocked_catalog_and_checkout_flow(
     - Опитът за checkout от Борис се отхвърля без списан stock и без изчистване на количката.
     - Админ отблокира Анна: стоката отново е видима, в количката е available=True, checkout успява.
     """
-    admin, admin_token = _create_admin(db_session)
+    _, admin_token = _create_admin(db_session)
 
     # 1. Регистрация на Анна (продавач) и Борис (купувач)
     anna_email = "anna_seller_test@example.com"
@@ -83,9 +83,7 @@ def test_seller_blocked_and_unblocked_catalog_and_checkout_flow(
     assert add_cart_res.status_code == 200
 
     # Проверка на количката на Борис: позицията е налична (available=True)
-    cart_pre = client.get(
-        "/cart", headers={"Authorization": f"Bearer {boris_token}"}
-    )
+    cart_pre = client.get("/cart", headers={"Authorization": f"Bearer {boris_token}"})
     assert cart_pre.status_code == 200
     cart_item_pre = next(
         i for i in cart_pre.json()["items"] if i["product_id"] == prod_id
@@ -103,9 +101,7 @@ def test_seller_blocked_and_unblocked_catalog_and_checkout_flow(
     # 6. Продуктът на Анна изчезва от публичния каталог и дава 404 на детайли
     catalog_post_block = client.get("/products")
     assert catalog_post_block.status_code == 200
-    assert not any(
-        p["id"] == prod_id for p in catalog_post_block.json()["items"]
-    )
+    assert not any(p["id"] == prod_id for p in catalog_post_block.json()["items"])
 
     detail_post_block = client.get(f"/products/{prod_id}")
     assert detail_post_block.status_code == 404
@@ -263,9 +259,7 @@ def test_paid_order_preservation_after_seller_closed(
 ) -> None:
     """3. Закриването на продавача запазва напълно историята на вече платена поръчка."""
     _, admin_token = _create_admin(db_session)
-    clara, clara_token = _create_user_and_token(
-        db_session, email="clara_seller@example.com"
-    )
+    clara, _ = _create_user_and_token(db_session, email="clara_seller@example.com")
     buyer, buyer_token = _create_user_and_token(
         db_session, email="buyer_order_history@example.com"
     )
@@ -325,3 +319,74 @@ def test_paid_order_preservation_after_seller_closed(
     assert order_data["total_minor"] == 15000
     assert len(order_data["items"]) == 1
     assert order_data["items"][0]["product_title"] == "Clara Antique Clock"
+
+
+def test_put_cart_item_blocked_seller_returns_404_and_preserves_cart(
+    db_session: Session,
+) -> None:
+    """4. Ново добавяне на стока на блокиран продавач дава 404 и не променя количката.
+
+    Позиция, добавена преди блока, остава видима като недостъпна и може да бъде изтрита.
+    """
+    _, admin_token = _create_admin(db_session)
+    seller, seller_token = _create_user_and_token(
+        db_session, email="cart_seller_test@example.com"
+    )
+    _, buyer_token = _create_user_and_token(
+        db_session, email="cart_buyer_test@example.com"
+    )
+
+    # 1. Продавачът публикува стока
+    prod_res = client.post(
+        "/products",
+        headers={"Authorization": f"Bearer {seller_token}"},
+        json={
+            "title": "Available Item",
+            "price_minor": 3000,
+            "currency": "EUR",
+            "stock": 10,
+        },
+    )
+    prod_id = prod_res.json()["id"]
+
+    # 2. Купувачът добавя стоката преди блока
+    r_add = client.put(
+        f"/cart/items/{prod_id}",
+        headers={"Authorization": f"Bearer {buyer_token}"},
+        json={"quantity": 1},
+    )
+    assert r_add.status_code == 200
+
+    # 3. Администраторът блокира продавача
+    client.post(
+        f"/users/{seller.id}/block",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+
+    # 4. Ново добавяне / промяна на количество за стока на блокирания продавач връща 404
+    r_blocked_put = client.put(
+        f"/cart/items/{prod_id}",
+        headers={"Authorization": f"Bearer {buyer_token}"},
+        json={"quantity": 2},
+    )
+    assert r_blocked_put.status_code == 404
+
+    # Количката не е променена (количеството е все още 1)
+    cart_res = client.get("/cart", headers={"Authorization": f"Bearer {buyer_token}"})
+    assert len(cart_res.json()["items"]) == 1
+    assert cart_res.json()["items"][0]["quantity"] == 1
+    # Позицията е видима, но недостъпна (available=False)
+    assert cart_res.json()["items"][0]["available"] is False
+
+    # 5. Позицията може да бъде изтрита от количката (204)
+    r_del = client.delete(
+        f"/cart/items/{prod_id}",
+        headers={"Authorization": f"Bearer {buyer_token}"},
+    )
+    assert r_del.status_code == 204
+
+    # Количката вече е празна
+    cart_after_del = client.get(
+        "/cart", headers={"Authorization": f"Bearer {buyer_token}"}
+    )
+    assert len(cart_after_del.json()["items"]) == 0

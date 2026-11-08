@@ -101,4 +101,3 @@ def downgrade() -> None:
     op.drop_table("account_moderation_logs")
     op.drop_table("password_reset_tokens")
     op.drop_column("users", "status")
-

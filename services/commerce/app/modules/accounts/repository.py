@@ -56,6 +56,15 @@ class UserRepository:
         self._session.flush()
         return token_record
 
+    def get_password_reset_token_by_hash(
+        self, token_hash: str
+    ) -> PasswordResetToken | None:
+        """Извлича запис на токен за възстановяване по неговия хеш без заключване."""
+        stmt = select(PasswordResetToken).where(
+            PasswordResetToken.token_hash == token_hash
+        )
+        return self._session.scalars(stmt).first()
+
     def get_password_reset_token_for_update(
         self, token_hash: str
     ) -> PasswordResetToken | None:

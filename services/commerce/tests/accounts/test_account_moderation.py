@@ -9,7 +9,9 @@ from tests.orders.helpers import _create_user_and_token
 client = TestClient(app)
 
 
-def _create_admin(db_session: Session, email: str = "admin@example.com") -> tuple[User, str]:
+def _create_admin(
+    db_session: Session, email: str = "admin@example.com"
+) -> tuple[User, str]:
     """Създава потребител с администраторска роля (admin) и валиден токен."""
     return _create_user_and_token(db_session, email=email, role="admin")
 
@@ -29,7 +31,6 @@ def test_admin_block_and_unblock_cycle_and_token_invalidation(
     login_res = client.post(
         "/auth/login", json={"email": user_email, "password": user_pass}
     )
-    user_id = login_res.json()
     user_old_token = login_res.json()["access_token"]
 
     # Преди блока потребителят има нормален достъп
@@ -107,10 +108,8 @@ def test_admin_close_account_is_irreversible_and_preserves_row(
     db_session: Session,
 ) -> None:
     """2. Закриването на акаунт е окончателно, редът се запазва физически и не може да се отблокира."""
-    admin, admin_token = _create_admin(db_session)
-    user, _ = _create_user_and_token(
-        db_session, email="close_test_user@example.com"
-    )
+    _, admin_token = _create_admin(db_session)
+    user, _ = _create_user_and_token(db_session, email="close_test_user@example.com")
 
     # 1. Закриване на акаунта
     close_res = client.post(
@@ -146,9 +145,7 @@ def test_admin_close_account_is_irreversible_and_preserves_row(
 
 def test_self_moderation_forbidden(db_session: Session) -> None:
     """3. Администраторът не може да блокира или закрива собствения си акаунт (400)."""
-    admin, admin_token = _create_admin(
-        db_session, email="self_mod_admin@example.com"
-    )
+    admin, admin_token = _create_admin(db_session, email="self_mod_admin@example.com")
 
     # Самоблокиране
     r1 = client.post(

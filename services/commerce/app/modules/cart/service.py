@@ -95,8 +95,8 @@ class CartService:
         try:
             self._user_repository.lock_by_id(user_id)
 
-            product = self._product_repository.get_by_id(product_id)
-            if product is None or not product.active:
+            product = self._product_repository.get_active_by_id(product_id)
+            if product is None:
                 raise ProductNotFound(f"Product with id {product_id} not found")
 
             if quantity > product.stock:

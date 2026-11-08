@@ -105,9 +105,7 @@ def request_password_reset(
     """
     client_ip = request.client.host if request.client else None
     try:
-        account_service.request_password_reset(
-            email=body.email, client_ip=client_ip
-        )
+        account_service.request_password_reset(email=body.email, client_ip=client_ip)
     except RateLimitExceeded:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
