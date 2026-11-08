@@ -1,7 +1,31 @@
-from sqlalchemy import Boolean, CheckConstraint, ForeignKey, Integer, String
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
+
+
+class Category(Base):
+    """SQLAlchemy ORM модел за продуктови категории."""
+
+    __tablename__ = "categories"
+    __table_args__ = (
+        Index(
+            "uq_categories_name_lower",
+            text("lower(trim(name))"),
+            unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
 
 
 class Product(Base):
@@ -23,6 +47,13 @@ class Product(Base):
         nullable=False,
         index=True,
         default=1,
+    )
+    category_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("categories.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+        default=None,
     )
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     price_minor: Mapped[int] = mapped_column(Integer, nullable=False)
