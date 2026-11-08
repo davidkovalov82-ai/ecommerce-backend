@@ -18,12 +18,12 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
+LEGACY_SELLER_EMAIL = "legacy-catalog@internal.ecommerce.com"
+DISABLED_PASSWORD_HASH = "!disabled"
+
+
 def upgrade() -> None:
     """Добавя seller_id към products със съхраняване на съществуващите продукти."""
-    # 1. Добавяме колона seller_id като nullable=True
-    op.add_column("products", sa.Column("seller_id", sa.Integer(), nullable=True))
-
-    # 2. Намираме или създаваме технически акаунт за историческите продукти
     users_table = sa.table(
         "users",
         sa.column("id", sa.Integer),
@@ -32,22 +32,35 @@ def upgrade() -> None:
         sa.column("role", sa.String),
     )
     conn = op.get_bind()
-    tech_user_id = conn.execute(
-        sa.select(users_table.c.id).where(
-            users_table.c.email == "legacy-catalog@internal.ecommerce.com"
-        )
-    ).scalar()
 
-    if tech_user_id is None:
+    # 1. Проверяваме състоянието на служебния потребител преди промени по схемата.
+    # Ако адресът е зает от обикновен потребителски акаунт, операцията спира с грешка.
+    existing_user = conn.execute(
+        sa.select(users_table.c.id, users_table.c.password_hash).where(
+            users_table.c.email == LEGACY_SELLER_EMAIL
+        )
+    ).first()
+
+    if existing_user is not None:
+        if existing_user.password_hash != DISABLED_PASSWORD_HASH:
+            raise RuntimeError(
+                f"Technical account email '{LEGACY_SELLER_EMAIL}' is already occupied "
+                f"by a regular user account. Aborting migration to protect user data."
+            )
+        tech_user_id = existing_user.id
+    else:
         tech_user_id = conn.execute(
             sa.insert(users_table)
             .values(
-                email="legacy-catalog@internal.ecommerce.com",
-                password_hash="!disabled",
+                email=LEGACY_SELLER_EMAIL,
+                password_hash=DISABLED_PASSWORD_HASH,
                 role="customer",
             )
             .returning(users_table.c.id)
         ).scalar()
+
+    # 2. Добавяме колона seller_id като nullable=True
+    op.add_column("products", sa.Column("seller_id", sa.Integer(), nullable=True))
 
     # 3. Запълваме seller_id за всички съществуващи продукти, които нямат такъв
     products_table = sa.table(
@@ -77,19 +90,11 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Връща миграцията назад."""
+    """Връща миграцията назад.
+
+    Не изтрива потребителски записи по съвпадение на имейл, за да не се
+    засегнат непредвидено потребителски данни. Техническият запис се запазва.
+    """
     op.drop_index("ix_products_seller_id", table_name="products")
     op.drop_constraint("fk_products_seller_id_users", "products", type_="foreignkey")
     op.drop_column("products", "seller_id")
-
-    users_table = sa.table(
-        "users",
-        sa.column("id", sa.Integer),
-        sa.column("email", sa.String),
-    )
-    conn = op.get_bind()
-    conn.execute(
-        users_table.delete().where(
-            users_table.c.email == "legacy-catalog@internal.ecommerce.com"
-        )
-    )

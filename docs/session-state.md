@@ -1,18 +1,18 @@
 # Session State
 
-- **Текуща задача**: Преход към маркетплейс — Етап К1 (публикуване от потребителски профил).
+- **Текуща задача**: Защита на техническия собственик в миграция 9e7a669efa79 и seed_products (К1).
 - **Реализирано**:
-  - `products.seller_id` с FK към `users.id` (ON DELETE RESTRICT) и Alembic миграция `9e7a669efa79`.
-  - Прехвърляне на заварени продукти към деактивиран технически акаунт `legacy-catalog@internal.ecommerce.com`.
-  - `POST /products`: всеки автентикиран потребител публикува стока; `seller_id` се задава от сървъра (в тялото -> 422).
-  - `PATCH /products/{id}`: само собственик редактира (цена, наличност, активност); чужд/липсващ -> 404; admin няма служебен достъп.
-  - `GET /users/me/products`: пагиниран личен списък на собствените активни и неактивни стоки.
+  - В миграцията и seed: ако служебният email е зает от обикновен потребител, операцията спира с грешка.
+  - Потребителят не се модифицира и не му се начисляват стоки; при грешка в миграцията транзакцията се оттегля.
+  - При downgrade потребителят не се изтрива (запазва се техническият запис).
+  - Добавени тестове в `test_marketplace_k1.py` за откат на миграция, downgrade и защита на seed скрипта.
 - **Проверено / Резултати**:
-  - `uv run --locked pytest`: 232 passed (100% успех, включително сценарии за Анна и Борис, пагинация, 422 и миграция).
+  - `uv run --locked pytest`: 234 passed (100% успех, включително 7 теста в `test_marketplace_k1.py`).
   - `uv run --locked ruff check .` и `uv run --locked ruff format --check .`: 0 грешки.
-- **Непроверено**: Интеграция с UI фронтенд клиент (тествано изцяло през API и БД).
+- **Непроверено**: Интеграция с UI фронтенд.
 - **Работещи команди**:
+  - `cd services/commerce && uv run --locked pytest tests/catalog/test_marketplace_k1.py`
   - `cd services/commerce && uv run --locked pytest`
   - `cd services/commerce && uv run --locked ruff check . && uv run --locked ruff format --check .`
-- **Засегнати файлове**: `app/modules/catalog/*`, `app/modules/accounts/*`, `migrations/*`, `tests/*`, `.agents/rules/learning.md`.
-- **Следваща стъпка**: Потребителски преглед на локалните разлики и ръчен git commit / push.
+- **Засегнати файлове**: `migrations/.../9e7a669efa79_*.py`, `scripts/seed_products.py`, `tests/.../test_marketplace_k1.py`.
+- **Следваща стъпка**: Потребителски преглед и ръчен commit / push.

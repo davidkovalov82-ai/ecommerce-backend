@@ -1,9 +1,10 @@
 from pathlib import Path
 
+import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -11,6 +12,7 @@ from app.main import app
 from app.modules.accounts.models import User
 from app.modules.accounts.tokens import create_access_token
 from app.modules.catalog.models import Product
+from scripts.seed_products import seed
 
 client = TestClient(app)
 COMMERCE_DIR = Path(__file__).resolve().parents[2]
@@ -330,8 +332,185 @@ def test_migration_on_database_with_existing_product() -> None:
         assert login_res.status_code == 401
         assert login_res.json()["detail"]["code"] == "INVALID_CREDENTIALS"
 
+        # 6. Проверяваме downgrade: seller_id се премахва, но потребителят не се изтрива
+        command.downgrade(alembic_cfg, "bd4c339e0dfa")
+        with temp_engine.connect() as conn:
+            has_seller_id = conn.execute(
+                text(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name = 'products' AND column_name = 'seller_id'"
+                )
+            ).scalar()
+            assert has_seller_id is None
+
+            # Техническият потребител остава в базата данни
+            tech_user_exists = conn.execute(
+                text(
+                    "SELECT 1 FROM users WHERE email = 'legacy-catalog@internal.ecommerce.com'"
+                )
+            ).scalar()
+            assert tech_user_exists == 1
+
     finally:
         temp_engine.dispose()
         with admin_engine.connect() as conn:
             conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
         admin_engine.dispose()
+
+
+def test_migration_fails_and_rolls_back_when_technical_email_occupied_by_regular_user() -> (
+    None
+):
+    """Ако служебният email е зает от обикновен потребител, миграцията спира контролирано и се оттегля."""
+    temp_db_name = "commerce_temp_k1_occupied_test"
+    admin_engine = create_engine(settings.database_url, isolation_level="AUTOCOMMIT")
+
+    with admin_engine.connect() as conn:
+        conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
+        conn.execute(text(f"CREATE DATABASE {temp_db_name}"))
+
+    temp_db_url = (
+        f"postgresql+psycopg://{settings.db_user}:{settings.db_password}"
+        f"@{settings.db_host}:{settings.db_port}/{temp_db_name}"
+    )
+    temp_engine = create_engine(temp_db_url)
+
+    try:
+        alembic_cfg = Config(ALEMBIC_INI_PATH)
+        alembic_cfg.set_main_option("script_location", ALEMBIC_SCRIPT_LOCATION)
+        alembic_cfg.set_main_option("sqlalchemy.url", temp_db_url)
+
+        # 1. Прилагаме миграциите до bd4c339e0dfa
+        command.upgrade(alembic_cfg, "bd4c339e0dfa")
+
+        # 2. Вмъкваме продукт и обикновен потребител със служебния email
+        with temp_engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO users (id, email, password_hash, role) "
+                    "VALUES (10, 'legacy-catalog@internal.ecommerce.com', '$argon2id$v=19$user_hash', 'customer')"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO products (id, title, price_minor, currency, stock, active) "
+                    "VALUES (42, 'Pre-migration Classic Laptop', 89900, 'EUR', 7, true)"
+                )
+            )
+
+        # 3. Опитът за миграция трябва да се провали с контролирана грешка
+        with pytest.raises(Exception) as exc_info:
+            command.upgrade(alembic_cfg, "head")
+
+        assert "already occupied by a regular user account" in str(exc_info.value)
+
+        # 4. Проверяваме, че транзакцията е върната назад и данните са запазени непокътнати
+        with temp_engine.connect() as conn:
+            # Потребителят не е променен (парола и роля са същите)
+            user_row = (
+                conn.execute(
+                    text(
+                        "SELECT id, email, password_hash, role FROM users WHERE id = 10"
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            assert user_row["email"] == "legacy-catalog@internal.ecommerce.com"
+            assert user_row["password_hash"] == "$argon2id$v=19$user_hash"
+            assert user_row["role"] == "customer"
+
+            # Продуктът не е променен
+            prod_row = (
+                conn.execute(
+                    text(
+                        "SELECT id, title, price_minor, stock, active FROM products WHERE id = 42"
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            assert prod_row["title"] == "Pre-migration Classic Laptop"
+            assert prod_row["price_minor"] == 89900
+            assert prod_row["stock"] == 7
+            assert prod_row["active"] is True
+
+            # Колоната seller_id не съществува в таблицата products (DDL е върнат назад)
+            has_seller_id = conn.execute(
+                text(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name = 'products' AND column_name = 'seller_id'"
+                )
+            ).scalar()
+            assert has_seller_id is None
+
+            # Версията на миграцията е останала bd4c339e0dfa
+            current_version = conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar()
+            assert current_version == "bd4c339e0dfa"
+
+    finally:
+        temp_engine.dispose()
+        with admin_engine.connect() as conn:
+            conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
+        admin_engine.dispose()
+
+
+def test_seed_products_fails_when_technical_email_occupied_by_regular_user(
+    db_session: Session,
+) -> None:
+    """Скриптът за seed не пренаписва потребителя и не му начислява стоки, ако email-ът е зает."""
+    # Подменяме паролата на служебния потребител на валиден потребителски хеш
+    db_session.execute(
+        text(
+            "UPDATE users SET password_hash = '$argon2id$v=19$regular_user_hash', role = 'customer' "
+            "WHERE email = 'legacy-catalog@internal.ecommerce.com'"
+        )
+    )
+    db_session.commit()
+
+    user_before = db_session.scalars(
+        select(User).where(User.email == "legacy-catalog@internal.ecommerce.com")
+    ).one()
+    user_id = user_before.id
+    count_before = (
+        db_session.scalar(
+            select(text("count(*)"))
+            .select_from(Product)
+            .where(Product.seller_id == user_id)
+        )
+        or 0
+    )
+
+    try:
+        with pytest.raises(
+            RuntimeError, match="already occupied by a regular user account"
+        ):
+            seed(db_session)
+
+        # Потребителят е непокътнат
+        db_session.expire_all()
+        user_after = db_session.get(User, user_id)
+        assert user_after is not None
+        assert user_after.password_hash == "$argon2id$v=19$regular_user_hash"
+        assert user_after.role == "customer"
+
+        # Не са добавени нови стоки за този потребител
+        count_after = (
+            db_session.scalar(
+                select(text("count(*)"))
+                .select_from(Product)
+                .where(Product.seller_id == user_id)
+            )
+            or 0
+        )
+        assert count_after == count_before
+    finally:
+        db_session.execute(
+            text(
+                "UPDATE users SET password_hash = '!disabled', role = 'customer' "
+                "WHERE email = 'legacy-catalog@internal.ecommerce.com'"
+            )
+        )
+        db_session.commit()

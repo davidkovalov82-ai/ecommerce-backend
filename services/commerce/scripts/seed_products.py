@@ -110,7 +110,13 @@ def seed(session: Session) -> int:
     tech_user = session.scalar(
         select(User).where(User.email == "legacy-catalog@internal.ecommerce.com")
     )
-    if not tech_user:
+    if tech_user is not None:
+        if tech_user.password_hash != "!disabled":
+            raise RuntimeError(
+                "Technical account email 'legacy-catalog@internal.ecommerce.com' is already occupied "
+                "by a regular user account. Cannot proceed with seeding."
+            )
+    else:
         tech_user = User(
             email="legacy-catalog@internal.ecommerce.com",
             password_hash="!disabled",
