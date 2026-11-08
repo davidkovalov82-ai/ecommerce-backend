@@ -8,7 +8,7 @@ from app.modules.catalog.repository import ProductRepository
 
 
 class ProductNotFound(Exception):
-    """Сигнализира, че търсеният продукт не съществува в каталога."""
+    """Сигнализира, че търсеният продукт не съществува в каталога или не принадлежи на потребителя."""
 
 
 class CatalogService:
@@ -20,17 +20,19 @@ class CatalogService:
 
     def create_product(
         self,
+        seller_id: int,
         title: str,
         price_minor: int,
         currency: str,
         stock: int,
         active: bool = True,
     ) -> Product:
-        """Сценарий: създаване на нов продукт в каталога.
+        """Сценарий: създаване на нов продукт в каталога от текущия потребител.
 
         Управлява транзакционната граница (commit/rollback).
         """
         product = Product(
+            seller_id=seller_id,
             title=title,
             price_minor=price_minor,
             currency=currency,
@@ -48,20 +50,22 @@ class CatalogService:
     def update_product(
         self,
         product_id: int,
+        seller_id: int,
         update_data: dict[str, Any],
     ) -> Product:
-        """Сценарий: администратор редактира, деактивира или активира продукт по ID.
+        """Сценарий: потребител редактира, деактивира или активира собствен продукт по ID.
 
-        Редактира както активни, така и неактивни продукти.
-        Хвърля ProductNotFound, ако продуктът липсва в базата данни.
+        За чужд или несъществуващ продукт хвърля ProductNotFound (връща 404).
         Управлява транзакционната граница (commit/rollback).
         """
         product = self._product_repository.get_by_id(product_id)
-        if product is None:
+        if product is None or product.seller_id != seller_id:
             raise ProductNotFound(f"Product with id {product_id} not found")
 
         try:
             for field, value in update_data.items():
+                if field == "seller_id":
+                    continue
                 setattr(product, field, value)
             self._session.commit()
             return product
@@ -70,7 +74,7 @@ class CatalogService:
             raise
 
     def get_product_by_id(self, product_id: int) -> Product:
-        """Сценарий: намиране на активен продукт по ID.
+        """Сценарий: намиране на активен продукт по ID за публичния каталог.
 
         Хвърля ProductNotFound, ако продуктът липсва в базата данни или не е активен.
         """
@@ -82,3 +86,11 @@ class CatalogService:
     def list_active_products(self, limit: int, offset: int) -> Sequence[Product]:
         """Сценарий: извличане на публичен списък с активни продукти с пагинация."""
         return self._product_repository.list_active(limit=limit, offset=offset)
+
+    def list_products_by_seller(
+        self, seller_id: int, limit: int, offset: int
+    ) -> Sequence[Product]:
+        """Сценарий: извличане на продукти на конкретен продавач (вкл. неактивни) с пагинация."""
+        return self._product_repository.list_by_seller(
+            seller_id=seller_id, limit=limit, offset=offset
+        )

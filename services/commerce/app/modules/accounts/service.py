@@ -1,4 +1,5 @@
 from pwdlib import PasswordHash
+from pwdlib.exceptions import UnknownHashError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -58,7 +59,12 @@ class AccountService:
             self._password_hasher.verify(password, _DUMMY_HASH)
             raise InvalidCredentials("Invalid email or password")
 
-        if not self._password_hasher.verify(password, user.password_hash):
+        try:
+            valid = self._password_hasher.verify(password, user.password_hash)
+        except (UnknownHashError, ValueError):
+            valid = False
+
+        if not valid:
             raise InvalidCredentials("Invalid email or password")
 
         return user

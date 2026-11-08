@@ -1,20 +1,18 @@
 # Session State
 
-- **Текуща задача**: Завършване на проверката на известия (Mailpit в CI, уникален получател, deadline).
+- **Текуща задача**: Преход към маркетплейс — Етап К1 (публикуване от потребителски профил).
 - **Реализирано**:
-  - Mailpit добавен като service контейнер в `.github/workflows/ci.yml` с healthcheck.
-  - Липсата на Mailpit проваля проверката (без pytest.skip) и в CI, и при `make test-notifications-retry`.
-  - Премахнато глобално изтриване; уникален получател за всеки тест, изчакване с deadline (5s).
-  - Проверени номер на поръчка, форматирана сума и валута в полученото писмо.
-  - Сценарий: webhook -> отказан SMTP -> поръчката остава paid -> успешен retry -> точно 1 писмо и след 3-то пускане.
+  - `products.seller_id` с FK към `users.id` (ON DELETE RESTRICT) и Alembic миграция `9e7a669efa79`.
+  - Прехвърляне на заварени продукти към деактивиран технически акаунт `legacy-catalog@internal.ecommerce.com`.
+  - `POST /products`: всеки автентикиран потребител публикува стока; `seller_id` се задава от сървъра (в тялото -> 422).
+  - `PATCH /products/{id}`: само собственик редактира (цена, наличност, активност); чужд/липсващ -> 404; admin няма служебен достъп.
+  - `GET /users/me/products`: пагиниран личен списък на собствените активни и неактивни стоки.
 - **Проверено / Резултати**:
-  - Локално: `make test-notifications-retry` и `pytest -q`: 225/225 passed (100%).
-  - Тест при спрян Mailpit: проваля се с AssertionError (без skip).
-  - Ruff check & format: 100% чисти, 0 грешки.
-  - CI: конфигуриран service container за автоматичен пуск в GitHub Actions.
+  - `uv run --locked pytest`: 232 passed (100% успех, включително сценарии за Анна и Борис, пагинация, 422 и миграция).
+  - `uv run --locked ruff check .` и `uv run --locked ruff format --check .`: 0 грешки.
+- **Непроверено**: Интеграция с UI фронтенд клиент (тествано изцяло през API и БД).
 - **Работещи команди**:
-  - `make test-notifications-retry`
-  - `cd services/commerce && uv run --locked pytest -q`
+  - `cd services/commerce && uv run --locked pytest`
   - `cd services/commerce && uv run --locked ruff check . && uv run --locked ruff format --check .`
-- **Засегнати файлове**: `.github/workflows/ci.yml`, `test_order_notifications.py`, `docs/session-state.md`.
-- **Следваща стъпка**: Потребителски преглед, git commit и push от потребителя.
+- **Засегнати файлове**: `app/modules/catalog/*`, `app/modules/accounts/*`, `migrations/*`, `tests/*`, `.agents/rules/learning.md`.
+- **Следваща стъпка**: Потребителски преглед на локалните разлики и ръчен git commit / push.

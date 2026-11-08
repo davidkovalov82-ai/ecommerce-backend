@@ -12,7 +12,7 @@ from pydantic import (
 
 
 class ProductCreateRequest(BaseModel):
-    """Схема за входните данни при създаване на продукт от администратор."""
+    """Схема за входните данни при създаване на продукт от автентикиран потребител."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -32,7 +32,7 @@ class ProductCreateRequest(BaseModel):
 
 
 class ProductUpdateRequest(BaseModel):
-    """Схема за частично обновяване на продукт от администратор (PATCH)."""
+    """Схема за частично обновяване на продукт от собственика му (PATCH)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -68,6 +68,7 @@ class ProductResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    seller_id: int
     title: str
     price_minor: int
     currency: str
