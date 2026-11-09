@@ -12,21 +12,31 @@ from app.modules.orders.schemas import (
     OrderDetailResponse,
     OrderListResponse,
     OrderSummaryResponse,
+    SellerShipmentDetailResponse,
+    SellerShipmentListResponse,
+    SellerShipmentSummaryResponse,
     StripeCheckoutSessionResponse,
 )
 from app.modules.orders.service import (
     CartEmpty,
     CartProductUnavailable,
+    IdempotencyPayloadConflict,
     InsufficientStock,
     InvalidOrderAmount,
+    MissingShippingData,
     OrderAlreadyPaid,
     OrderNotFound,
+    OrderNotPaid,
     OrderStateConflict,
+    ShipmentNotFound,
     StripeNotConfigured,
     StripeServiceError,
 )
 
 router = APIRouter(prefix="/orders", tags=["orders"])
+seller_shipments_router = APIRouter(
+    prefix="/seller/shipments", tags=["seller-shipments"]
+)
 webhook_router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
 
@@ -46,8 +56,17 @@ def create_order(
         order = order_service.create_order(
             user_id=current_user.id,
             idempotency_key=str(idempotency_key),
+            shipping_address=payload.shipping_address,
         )
         return OrderDetailResponse.model_validate(order)
+    except IdempotencyPayloadConflict as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "IDEMPOTENCY_KEY_PAYLOAD_MISMATCH",
+                "message": str(e),
+            },
+        )
     except CartEmpty:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -241,4 +260,156 @@ async def stripe_webhook(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"code": "STRIPE_NOT_CONFIGURED", "message": str(e)},
+        )
+
+
+@seller_shipments_router.get("", response_model=SellerShipmentListResponse)
+def list_seller_shipments(
+    current_user: CurrentUserDep,
+    order_service: OrderServiceDep,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> SellerShipmentListResponse:
+    """HTTP обработчик за пагиниран списък със собствените пратки на продавача."""
+    shipments, total = order_service.list_seller_shipments(
+        seller_id=current_user.id,
+        limit=limit,
+        offset=offset,
+    )
+    return SellerShipmentListResponse(
+        items=[SellerShipmentSummaryResponse.model_validate(sh) for sh in shipments],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@seller_shipments_router.get(
+    "/{shipment_id}", response_model=SellerShipmentDetailResponse
+)
+def get_seller_shipment(
+    shipment_id: int,
+    current_user: CurrentUserDep,
+    order_service: OrderServiceDep,
+) -> SellerShipmentDetailResponse:
+    """HTTP обработчик за детайли на собствена пратка на продавача (позиции + адрес)."""
+    try:
+        shipment = order_service.get_seller_shipment(
+            shipment_id=shipment_id,
+            seller_id=current_user.id,
+        )
+        return SellerShipmentDetailResponse.model_validate(shipment)
+    except ShipmentNotFound:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "SHIPMENT_NOT_FOUND", "message": "Shipment not found"},
+        )
+
+
+@seller_shipments_router.post(
+    "/{shipment_id}/ship", response_model=SellerShipmentDetailResponse
+)
+def ship_seller_shipment(
+    shipment_id: int,
+    current_user: CurrentUserDep,
+    order_service: OrderServiceDep,
+) -> SellerShipmentDetailResponse:
+    """HTTP обработчик за отбелязване на собствена пратка като изпратена от продавача."""
+    try:
+        shipment = order_service.ship_seller_shipment(
+            shipment_id=shipment_id,
+            seller_id=current_user.id,
+        )
+        return SellerShipmentDetailResponse.model_validate(shipment)
+    except ShipmentNotFound:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "SHIPMENT_NOT_FOUND", "message": "Shipment not found"},
+        )
+    except OrderNotPaid as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "ORDER_NOT_PAID", "message": str(e)},
+        )
+    except MissingShippingData as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "MISSING_SHIPPING_DATA", "message": str(e)},
+        )
+
+
+@seller_shipments_router.get("", response_model=SellerShipmentListResponse)
+def list_seller_shipments(
+    current_user: CurrentUserDep,
+    order_service: OrderServiceDep,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> SellerShipmentListResponse:
+    """HTTP обработчик за пагиниран списък със собствените пратки на продавача."""
+    shipments, total = order_service.list_seller_shipments(
+        seller_id=current_user.id,
+        limit=limit,
+        offset=offset,
+    )
+    return SellerShipmentListResponse(
+        items=[
+            SellerShipmentSummaryResponse.model_validate(sh) for sh in shipments
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@seller_shipments_router.get(
+    "/{shipment_id}", response_model=SellerShipmentDetailResponse
+)
+def get_seller_shipment(
+    shipment_id: int,
+    current_user: CurrentUserDep,
+    order_service: OrderServiceDep,
+) -> SellerShipmentDetailResponse:
+    """HTTP обработчик за детайли на собствена пратка на продавача (позиции + адрес)."""
+    try:
+        shipment = order_service.get_seller_shipment(
+            shipment_id=shipment_id,
+            seller_id=current_user.id,
+        )
+        return SellerShipmentDetailResponse.model_validate(shipment)
+    except ShipmentNotFound:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "SHIPMENT_NOT_FOUND", "message": "Shipment not found"},
+        )
+
+
+@seller_shipments_router.post(
+    "/{shipment_id}/ship", response_model=SellerShipmentDetailResponse
+)
+def ship_seller_shipment(
+    shipment_id: int,
+    current_user: CurrentUserDep,
+    order_service: OrderServiceDep,
+) -> SellerShipmentDetailResponse:
+    """HTTP обработчик за отбелязване на собствена пратка като изпратена от продавача."""
+    try:
+        shipment = order_service.ship_seller_shipment(
+            shipment_id=shipment_id,
+            seller_id=current_user.id,
+        )
+        return SellerShipmentDetailResponse.model_validate(shipment)
+    except ShipmentNotFound:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "SHIPMENT_NOT_FOUND", "message": "Shipment not found"},
+        )
+    except OrderNotPaid as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "ORDER_NOT_PAID", "message": str(e)},
+        )
+    except MissingShippingData as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "MISSING_SHIPPING_DATA", "message": str(e)},
         )

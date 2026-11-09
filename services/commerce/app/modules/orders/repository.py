@@ -8,6 +8,7 @@ from app.modules.orders.models import (
     OrderItem,
     OrderOutboxEvent,
     PaymentAttempt,
+    Shipment,
     StripeCheckoutSession,
     StripeProcessedEvent,
 )
@@ -34,14 +35,14 @@ class OrderRepository:
         user_id: int,
         idempotency_key: str,
     ) -> Order | None:
-        """Търси поръчка по user_id и idempotency_key с предварително заредени позиции."""
+        """Търси поръчка по user_id и idempotency_key с предварително заредени позиции и пратки."""
         stmt = (
             select(Order)
             .where(
                 Order.user_id == user_id,
                 Order.idempotency_key == idempotency_key,
             )
-            .options(selectinload(Order.items))
+            .options(selectinload(Order.items), selectinload(Order.shipments))
         )
         return self._session.scalars(stmt).first()
 
@@ -50,14 +51,14 @@ class OrderRepository:
         order_id: int,
         user_id: int,
     ) -> Order | None:
-        """Извлича поръчка по id и user_id с предварително заредени позиции."""
+        """Извлича поръчка по id и user_id с предварително заредени позиции и пратки."""
         stmt = (
             select(Order)
             .where(
                 Order.id == order_id,
                 Order.user_id == user_id,
             )
-            .options(selectinload(Order.items))
+            .options(selectinload(Order.items), selectinload(Order.shipments))
         )
         return self._session.scalars(stmt).first()
 
@@ -73,7 +74,7 @@ class OrderRepository:
                 Order.id == order_id,
                 Order.user_id == user_id,
             )
-            .options(selectinload(Order.items))
+            .options(selectinload(Order.items), selectinload(Order.shipments))
             .with_for_update()
             .execution_options(populate_existing=True)
         )
@@ -84,7 +85,7 @@ class OrderRepository:
         stmt = (
             select(Order)
             .where(Order.id == order_id)
-            .options(selectinload(Order.items))
+            .options(selectinload(Order.items), selectinload(Order.shipments))
             .with_for_update()
             .execution_options(populate_existing=True)
         )
@@ -260,5 +261,92 @@ class OrderRepository:
             select(OrderOutboxEvent)
             .where(OrderOutboxEvent.id == event_id)
             .with_for_update()
+        )
+        return self._session.scalars(stmt).first()
+
+    def add_shipment(self, shipment: Shipment) -> Shipment:
+        """Добавя пратка в сесията без commit."""
+        self._session.add(shipment)
+        return shipment
+
+    def get_shipment_by_id(self, shipment_id: int) -> Shipment | None:
+        """Извлича пратка по нейното ID с заредена свързана поръчка и нейните позиции."""
+        stmt = (
+            select(Shipment)
+            .where(Shipment.id == shipment_id)
+            .options(selectinload(Shipment.order).selectinload(Order.items))
+        )
+        return self._session.scalars(stmt).first()
+
+    def get_shipment_by_id_for_update(self, shipment_id: int) -> Shipment | None:
+        """Извлича и заключва пратка по нейното ID с FOR UPDATE."""
+        stmt = (
+            select(Shipment)
+            .where(Shipment.id == shipment_id)
+            .options(selectinload(Shipment.order).selectinload(Order.items))
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return self._session.scalars(stmt).first()
+
+    def list_shipments_by_order_id(self, order_id: int) -> Sequence[Shipment]:
+        """Извлича всички пратки към поръчка, сортирани по ID възходящо."""
+        stmt = (
+            select(Shipment)
+            .where(Shipment.order_id == order_id)
+            .order_by(Shipment.id.asc())
+        )
+        return self._session.scalars(stmt).all()
+
+    def list_shipments_by_seller(
+        self,
+        seller_id: int,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[Sequence[Shipment], int]:
+        """Извлича пагиниран списък с пратки за конкретен продавач и общия им брой."""
+        count_stmt = (
+            select(func.count())
+            .select_from(Shipment)
+            .where(Shipment.seller_id == seller_id)
+        )
+        total = self._session.scalar(count_stmt) or 0
+
+        stmt = (
+            select(Shipment)
+            .where(Shipment.seller_id == seller_id)
+            .options(selectinload(Shipment.order).selectinload(Order.items))
+            .order_by(Shipment.created_at.desc(), Shipment.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        shipments = self._session.scalars(stmt).all()
+        return shipments, total
+
+    def list_order_items_by_order_and_seller(
+        self,
+        order_id: int,
+        seller_id: int,
+    ) -> Sequence[OrderItem]:
+        """Извлича позициите от дадена поръчка, които принадлежат на конкретен продавач."""
+        stmt = (
+            select(OrderItem)
+            .where(
+                OrderItem.order_id == order_id,
+                OrderItem.seller_id == seller_id,
+            )
+            .order_by(OrderItem.product_id.asc())
+        )
+        return self._session.scalars(stmt).all()
+
+    def get_outbox_event_by_shipment_id(
+        self,
+        shipment_id: int,
+        event_type: str = "shipment.shipped",
+    ) -> OrderOutboxEvent | None:
+        """Извлича outbox събитие по shipment_id и event_type."""
+        stmt = select(OrderOutboxEvent).where(
+            OrderOutboxEvent.shipment_id == shipment_id,
+            OrderOutboxEvent.event_type == event_type,
         )
         return self._session.scalars(stmt).first()

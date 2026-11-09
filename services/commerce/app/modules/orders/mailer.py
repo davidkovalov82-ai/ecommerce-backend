@@ -49,3 +49,40 @@ class EmailSender:
 
         with smtplib.SMTP(self.host, self.port, timeout=self.timeout) as client:
             client.send_message(msg)
+
+    def send_shipment_shipped_email(
+        self,
+        to_email: str,
+        order_id: int,
+        shipment_id: int,
+        items: list[dict[str, object]],
+    ) -> None:
+        """Изпраща потвърждение за изпратена пратка със списък на включените позиции."""
+        items_lines = []
+        for it in items:
+            title = it.get("product_title", "")
+            qty = it.get("quantity", 1)
+            items_lines.append(f"- {title} ({qty} бр.)")
+        items_text = "\n".join(items_lines)
+
+        msg = EmailMessage()
+        msg["Subject"] = (
+            f"Вашата пратка #{shipment_id} от поръчка #{order_id} е изпратена"
+        )
+        msg["From"] = self.from_email
+        msg["To"] = to_email
+
+        body = (
+            f"Здравейте,\n\n"
+            f"Част от вашата поръчка беше успешно изпратена!\n\n"
+            f"Детайли за пратката:\n"
+            f"- Номер на поръчка: #{order_id}\n"
+            f"- Номер на пратка: #{shipment_id}\n\n"
+            f"Изпратени стоки:\n"
+            f"{items_text}\n\n"
+            f"Благодарим ви, че пазарувахте при нас!\n"
+        )
+        msg.set_content(body)
+
+        with smtplib.SMTP(self.host, self.port, timeout=self.timeout) as client:
+            client.send_message(msg)

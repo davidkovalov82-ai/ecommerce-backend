@@ -93,6 +93,16 @@ def _sync_categories_sequence(conn: Any) -> None:
     )
 
 
+def _sync_shipments_sequence(conn: Any) -> None:
+    """Синхронизира PostgreSQL sequence-а на shipments с текущото максимално ID."""
+    conn.execute(
+        text(
+            "SELECT setval(pg_get_serial_sequence('shipments', 'id'), "
+            "coalesce(max(id), 1), max(id) IS NOT NULL) FROM shipments;"
+        )
+    )
+
+
 @pytest.fixture
 def db_session() -> Generator[Session]:
     """Изолирана сесия за тестове с автоматично почистване на новите записи."""
@@ -102,11 +112,14 @@ def db_session() -> Generator[Session]:
     finally:
         session.rollback()
         # Премахваме всички добавени от тестовете редове
+        session.execute(text("DELETE FROM order_outbox_events"))
         session.execute(text("DELETE FROM stripe_checkout_sessions"))
         session.execute(text("DELETE FROM stripe_processed_events"))
         session.execute(text("DELETE FROM payment_attempts"))
         session.execute(text("DELETE FROM cart_items"))
         session.execute(text("DELETE FROM order_items"))
+        session.execute(text("DELETE FROM shipments"))
+        _sync_shipments_sequence(session)
         session.execute(text("DELETE FROM orders"))
         session.execute(text("DELETE FROM products WHERE id != 1"))
         session.execute(
@@ -131,11 +144,14 @@ def db_session() -> Generator[Session]:
 def clean_users_table() -> Generator[None]:
     """Гарантира почистване на таблиците преди и след всеки тест."""
     with TestingSessionLocal() as session:
+        session.execute(text("DELETE FROM order_outbox_events"))
         session.execute(text("DELETE FROM stripe_checkout_sessions"))
         session.execute(text("DELETE FROM stripe_processed_events"))
         session.execute(text("DELETE FROM payment_attempts"))
         session.execute(text("DELETE FROM cart_items"))
         session.execute(text("DELETE FROM order_items"))
+        session.execute(text("DELETE FROM shipments"))
+        _sync_shipments_sequence(session)
         session.execute(text("DELETE FROM orders"))
         session.execute(text("DELETE FROM products WHERE id != 1"))
         session.execute(
@@ -155,11 +171,14 @@ def clean_users_table() -> Generator[None]:
         session.commit()
     yield
     with TestingSessionLocal() as session:
+        session.execute(text("DELETE FROM order_outbox_events"))
         session.execute(text("DELETE FROM stripe_checkout_sessions"))
         session.execute(text("DELETE FROM stripe_processed_events"))
         session.execute(text("DELETE FROM payment_attempts"))
         session.execute(text("DELETE FROM cart_items"))
         session.execute(text("DELETE FROM order_items"))
+        session.execute(text("DELETE FROM shipments"))
+        _sync_shipments_sequence(session)
         session.execute(text("DELETE FROM orders"))
         session.execute(text("DELETE FROM products WHERE id != 1"))
         session.execute(

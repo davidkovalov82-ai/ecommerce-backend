@@ -14,10 +14,12 @@ from app.modules.orders.models import (
     Order,
     OrderItem,
     OrderOutboxEvent,
+    Shipment,
     StripeCheckoutSession,
     StripeProcessedEvent,
 )
 from app.modules.orders.repository import OrderRepository
+from app.modules.orders.schemas import ShippingAddress
 from app.modules.orders.stripe_client import StripeClient, StripeNotConfigured
 
 
@@ -63,6 +65,22 @@ class IdempotencyConflict(Exception):
     """Сигнализира за повторно използване на същия idempotency key с различен метод."""
 
 
+class IdempotencyPayloadConflict(Exception):
+    """Сигнализира за повторно използване на същия idempotency key с различен адрес или данни."""
+
+
+class ShipmentNotFound(Exception):
+    """Сигнализира, че пратката не съществува или принадлежи на друг продавач."""
+
+
+class OrderNotPaid(Exception):
+    """Сигнализира за опит за изпращане на неплатена поръчка."""
+
+
+class MissingShippingData(Exception):
+    """Сигнализира за опит за изпращане на поръчка без валиден адрес за доставка."""
+
+
 class InvalidOrderAmount(Exception):
     """Сигнализира за сума на поръчката извън допустимите граници за Stripe."""
 
@@ -90,31 +108,57 @@ class OrderService:
         self._session = session
         self._stripe_client = stripe_client or StripeClient()
 
-    def create_order(self, user_id: int, idempotency_key: str) -> Order:
-        """Сценарий: оформяне на цялата текуща количка в нова поръчка.
+    def create_order(
+        self,
+        user_id: int,
+        idempotency_key: str,
+        shipping_address: ShippingAddress,
+    ) -> Order:
+        """Сценарий: оформяне на цялата текуща количка в нова поръчка с адрес и пратки.
 
         Транзакционен протокол:
         1. Заключване на потребителя с FOR NO KEY UPDATE за пълна сериализация.
         2. Проверка за съществуваща поръчка със същия ключ (идемпотентност).
+           - При различен адрес -> хвърля IdempotencyPayloadConflict (409).
+           - При съвпадащ адрес -> връща съществуващата поръчка без странични ефекти.
         3. Проверка за непразна количка.
         4. Заключване на засегнатите продукти във възходящ ред по ID с FOR UPDATE.
-        5. Проверка на актуална активност и наличност.
-        6. Създаване на Order и исторически OrderItem позиции.
-        7. Намаляване на складовите наличности.
-        8. Изчистване на потребителската количка.
-        9. Commit на транзакцията.
+        5. Проверка на актуална активност и наличност, както и статус на продавача.
+        6. Създаване на Order с копие на адреса и начален fulfillment_status='unshipped'.
+        7. Създаване на Shipment за всеки уникален продавач (order_id, seller_id).
+        8. Създаване на исторически OrderItem позиции с фиксиран seller_id.
+        9. Намаляване на складовите наличности.
+        10. Изчистване на потребителската количка.
+        11. Commit на транзакцията.
         """
         try:
             # 1. Обща DB блокировка за текущия потребител
             self._user_repository.lock_by_id(user_id)
 
-            # 2. Проверка за съществуваща поръчка със същия ключ (идемпотентност преди количката)
+            # 2. Проверка за съществуваща поръчка със същия ключ (идемпотентност)
             existing_order = self._order_repository.get_by_user_and_idempotency_key(
                 user_id=user_id,
                 idempotency_key=idempotency_key,
             )
             if existing_order is not None:
-                # Връща съществуващата поръчка без да променя склад или количка
+                # Проверка дали адресът съвпада
+                if (
+                    existing_order.shipping_recipient_name
+                    != shipping_address.recipient_name
+                    or existing_order.shipping_phone != shipping_address.phone
+                    or existing_order.shipping_country_code
+                    != shipping_address.country_code
+                    or existing_order.shipping_city != shipping_address.city
+                    or existing_order.shipping_postal_code
+                    != shipping_address.postal_code
+                    or existing_order.shipping_address_line1
+                    != shipping_address.address_line1
+                    or existing_order.shipping_address_line2
+                    != shipping_address.address_line2
+                ):
+                    raise IdempotencyPayloadConflict(
+                        "Idempotency key was already used with a different shipping address"
+                    )
                 return existing_order
 
             # 3. Прочитане на текущата количка
@@ -122,19 +166,19 @@ class OrderService:
             if not cart_items:
                 raise CartEmpty("Shopping cart is empty")
 
-            # 4. Заключване на продуктите във възходящ ред по id с гаранция за свежи стойности
+            # 4. Заключване на продуктите във възходящ ред по id
             product_ids = [item.product_id for item in cart_items]
             locked_products = self._product_repository.get_by_ids_for_update(
                 product_ids
             )
             products_by_id = {p.id: p for p in locked_products}
 
-            # 5. Проверка на актуалните active, stock и price_minor, както и статуса на продавача
+            # 5. Проверка на активност, наличност и статус на продавачите
             seller_ids = [p.seller_id for p in locked_products]
             sellers = self._user_repository.get_by_ids(seller_ids)
             sellers_by_id = {u.id: u for u in sellers}
 
-            order_items_data: list[tuple[int, str, int, int, int]] = []
+            order_items_data: list[tuple[int, str, int, int, int, int]] = []
             total_minor = 0
 
             for item in cart_items:
@@ -159,10 +203,11 @@ class OrderService:
                         item.quantity,
                         unit_price,
                         subtotal,
+                        product.seller_id,
                     )
                 )
 
-            # 6. Създаване на поръчката и запазените позиции
+            # 6. Създаване на поръчката с адрес за доставка
             now = datetime.datetime.now(datetime.UTC)
             expires_at = now + datetime.timedelta(
                 minutes=settings.order_reserve_timeout_minutes
@@ -170,24 +215,45 @@ class OrderService:
             order = Order(
                 user_id=user_id,
                 status="pending_payment",
+                fulfillment_status="unshipped",
                 currency="EUR",
                 total_minor=total_minor,
                 idempotency_key=idempotency_key,
+                shipping_recipient_name=shipping_address.recipient_name,
+                shipping_phone=shipping_address.phone,
+                shipping_country_code=shipping_address.country_code,
+                shipping_city=shipping_address.city,
+                shipping_postal_code=shipping_address.postal_code,
+                shipping_address_line1=shipping_address.address_line1,
+                shipping_address_line2=shipping_address.address_line2,
                 expires_at=expires_at,
             )
             self._order_repository.add(order)
             self._session.flush()
 
+            # 7. Създаване на отделна пратка (Shipment) за всеки уникален продавач
+            unique_seller_ids = sorted({p.seller_id for p in locked_products})
+            for s_id in unique_seller_ids:
+                shipment = Shipment(
+                    order_id=order.id,
+                    seller_id=s_id,
+                    status="unshipped",
+                )
+                self._order_repository.add_shipment(shipment)
+
+            # 8. Създаване на OrderItem позиции с фиксиран seller_id
             for (
                 p_id,
                 p_title,
                 qty,
                 u_price,
                 subtot,
+                s_id,
             ) in order_items_data:
                 order_item = OrderItem(
                     order_id=order.id,
                     product_id=p_id,
+                    seller_id=s_id,
                     product_title=p_title,
                     quantity=qty,
                     unit_price_minor=u_price,
@@ -195,20 +261,19 @@ class OrderService:
                 )
                 self._order_repository.add_item(order_item)
 
-                # 7. Намаляване на наличността с поръчаното количество
+                # 9. Намаляване на наличността
                 product = products_by_id[p_id]
                 product.stock -= qty
 
-            # 8. Изчистване на поръчаната количка
+            # 10. Изчистване на поръчаната количка
             self._cart_repository.clear_by_user_id(user_id)
 
-            # Гарантираме с flush, че всички промени са изпратени към БД преди commit
+            # 11. Записване на транзакцията
             self._session.flush()
-
-            # 9. Commit
             self._session.commit()
             self._session.refresh(order)
             _ = order.items
+            _ = order.shipments
             return order
         except Exception:
             self._session.rollback()
@@ -236,6 +301,252 @@ class OrderService:
             limit=limit,
             offset=offset,
         )
+
+    def list_seller_shipments(
+        self,
+        seller_id: int,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[Sequence[Shipment], int]:
+        """Сценарий: пагиниран списък със собствени пратки на текущия продавач."""
+        return self._order_repository.list_shipments_by_seller(
+            seller_id=seller_id,
+            limit=limit,
+            offset=offset,
+        )
+
+    def get_seller_shipment(
+        self,
+        shipment_id: int,
+        seller_id: int,
+    ) -> Shipment:
+        """Сценарий: извличане на детайли за конкретна собствена пратка на продавача."""
+        shipment = self._order_repository.get_shipment_by_id(shipment_id)
+        if shipment is None or shipment.seller_id != seller_id:
+            raise ShipmentNotFound(f"Shipment {shipment_id} not found")
+        return shipment
+
+    def ship_seller_shipment(
+        self,
+        shipment_id: int,
+        seller_id: int,
+    ) -> Shipment:
+        """Сценарий: продавач отбелязва пратката си като изпратена.
+
+        Транзакционен протокол:
+        1. Заключване на пратката с FOR UPDATE.
+        2. Проверка за права (чужда или липсваща пратка дава 404).
+        3. Заключване на поръчката с FOR UPDATE.
+        4. Проверка на потвърдения статус на поръчката (status == 'paid', иначе 409).
+        5. Проверка за наличен адрес (иначе 409).
+        6. Ако пратката вече е 'shipped': връща текущото състояние без нов outbox запис (идемпотентност).
+        7. Ако пратката е 'unshipped':
+           - Обновяване на пратката (status = 'shipped', shipped_at = now).
+           - Преизчисляване на fulfillment_status на поръчката ('shipped' или 'partially_shipped').
+           - Запис на outbox събитие shipment.shipped в същата транзакция.
+        8. Commit.
+        """
+        try:
+            shipment = self._order_repository.get_shipment_by_id_for_update(shipment_id)
+            if shipment is None or shipment.seller_id != seller_id:
+                raise ShipmentNotFound(f"Shipment {shipment_id} not found")
+
+            order = self._order_repository.get_by_id_for_update(shipment.order_id)
+            if order is None:
+                raise ShipmentNotFound(f"Order for shipment {shipment_id} not found")
+
+            # Проверка дали поръчката е платена
+            if order.status != "paid":
+                raise OrderNotPaid(
+                    f"Cannot ship order with payment status '{order.status}'"
+                )
+
+            # Проверка за наличен адрес за доставка (стари поръчки)
+            if not order.shipping_recipient_name or not order.shipping_address_line1:
+                raise MissingShippingData("Cannot ship order without shipping address")
+
+            # 6. Повтор на вече изпратена пратка -> идемпотентно връща състоянието
+            if shipment.status == "shipped":
+                return shipment
+
+            # 7. Изпращане на пратката
+            now = datetime.datetime.now(datetime.UTC)
+            shipment.status = "shipped"
+            shipment.shipped_at = now
+
+            # Преизчисляване на fulfillment_status на поръчката
+            all_shipments = self._order_repository.list_shipments_by_order_id(order.id)
+            shipped_count = sum(
+                1 for s in all_shipments if s.id == shipment.id or s.status == "shipped"
+            )
+            if shipped_count >= len(all_shipments):
+                order.fulfillment_status = "shipped"
+            else:
+                order.fulfillment_status = "partially_shipped"
+
+            # Намиране на имейла на купувача за известието
+            customer = self._user_repository.get_by_id(order.user_id)
+            customer_email = customer.email if customer else ""
+
+            # Позиции само за този продавач
+            seller_items = [
+                {
+                    "product_id": it.product_id,
+                    "product_title": it.product_title,
+                    "quantity": it.quantity,
+                }
+                for it in shipment.items
+            ]
+
+            # Запис на Outbox събитие в същата транзакция
+            outbox_event = OrderOutboxEvent(
+                order_id=order.id,
+                shipment_id=shipment.id,
+                event_type="shipment.shipped",
+                payload={
+                    "customer_email": customer_email,
+                    "order_id": order.id,
+                    "shipment_id": shipment.id,
+                    "seller_id": seller_id,
+                    "items": seller_items,
+                },
+                status="pending",
+            )
+            self._order_repository.record_outbox_event(outbox_event)
+            self._session.flush()
+            self._session.commit()
+            self._session.refresh(shipment)
+            return shipment
+        except (ShipmentNotFound, OrderNotPaid, MissingShippingData):
+            self._session.rollback()
+            raise
+        except Exception:
+            self._session.rollback()
+            raise
+
+    def list_seller_shipments(
+        self,
+        seller_id: int,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[Sequence[Shipment], int]:
+        """Сценарий: пагиниран списък със собствени пратки на текущия продавач."""
+        return self._order_repository.list_shipments_by_seller(
+            seller_id=seller_id,
+            limit=limit,
+            offset=offset,
+        )
+
+    def get_seller_shipment(
+        self,
+        shipment_id: int,
+        seller_id: int,
+    ) -> Shipment:
+        """Сценарий: извличане на детайли за конкретна собствена пратка на продавача."""
+        shipment = self._order_repository.get_shipment_by_id(shipment_id)
+        if shipment is None or shipment.seller_id != seller_id:
+            raise ShipmentNotFound(f"Shipment {shipment_id} not found")
+        return shipment
+
+    def ship_seller_shipment(
+        self,
+        shipment_id: int,
+        seller_id: int,
+    ) -> Shipment:
+        """Сценарий: продавач отбелязва пратката си като изпратена.
+
+        Транзакционен протокол:
+        1. Заключване на пратката с FOR UPDATE.
+        2. Проверка за права (чужда или липсваща пратка дава 404).
+        3. Заключване на поръчката с FOR UPDATE.
+        4. Проверка на потвърдения статус на поръчката (status == 'paid', иначе 409).
+        5. Проверка за наличен адрес (иначе 409).
+        6. Ако пратката вече е 'shipped': връща текущото състояние без нов outbox запис (идемпотентност).
+        7. Ако пратката е 'unshipped':
+           - Обновяване на пратката (status = 'shipped', shipped_at = now).
+           - Преизчисляване на fulfillment_status на поръчката ('shipped' или 'partially_shipped').
+           - Запис на outbox събитие shipment.shipped в същата транзакция.
+        8. Commit.
+        """
+        try:
+            shipment = self._order_repository.get_shipment_by_id_for_update(shipment_id)
+            if shipment is None or shipment.seller_id != seller_id:
+                raise ShipmentNotFound(f"Shipment {shipment_id} not found")
+
+            order = self._order_repository.get_by_id_for_update(shipment.order_id)
+            if order is None:
+                raise ShipmentNotFound(f"Order for shipment {shipment_id} not found")
+
+            # Проверка дали поръчката е платена
+            if order.status != "paid":
+                raise OrderNotPaid(
+                    f"Cannot ship order with payment status '{order.status}'"
+                )
+
+            # Проверка за наличен адрес за доставка (стари поръчки)
+            if not order.shipping_recipient_name or not order.shipping_address_line1:
+                raise MissingShippingData(
+                    "Cannot ship order without shipping address"
+                )
+
+            # 6. Повтор на вече изпратена пратка -> идемпотентно връща състоянието
+            if shipment.status == "shipped":
+                return shipment
+
+            # 7. Изпращане на пратката
+            now = datetime.datetime.now(datetime.UTC)
+            shipment.status = "shipped"
+            shipment.shipped_at = now
+
+            # Преизчисляване на fulfillment_status на поръчката
+            all_shipments = self._order_repository.list_shipments_by_order_id(order.id)
+            shipped_count = sum(
+                1 for s in all_shipments if s.id == shipment.id or s.status == "shipped"
+            )
+            if shipped_count >= len(all_shipments):
+                order.fulfillment_status = "shipped"
+            else:
+                order.fulfillment_status = "partially_shipped"
+
+            # Намиране на имейла на купувача за известието
+            customer = self._user_repository.get_by_id(order.user_id)
+            customer_email = customer.email if customer else ""
+
+            # Позиции само за този продавач
+            seller_items = [
+                {
+                    "product_id": it.product_id,
+                    "product_title": it.product_title,
+                    "quantity": it.quantity,
+                }
+                for it in shipment.items
+            ]
+
+            # Запис на Outbox събитие в същата транзакция
+            outbox_event = OrderOutboxEvent(
+                order_id=order.id,
+                shipment_id=shipment.id,
+                event_type="shipment.shipped",
+                payload={
+                    "customer_email": customer_email,
+                    "order_id": order.id,
+                    "shipment_id": shipment.id,
+                    "seller_id": seller_id,
+                    "items": seller_items,
+                },
+                status="pending",
+            )
+            self._order_repository.record_outbox_event(outbox_event)
+            self._session.flush()
+            self._session.commit()
+            self._session.refresh(shipment)
+            return shipment
+        except (ShipmentNotFound, OrderNotPaid, MissingShippingData):
+            self._session.rollback()
+            raise
+        except Exception:
+            self._session.rollback()
+            raise
 
     def _restore_order_stock(self, order: Order) -> None:
         """Възстановява запазените количества от позициите на поръчката в склада."""

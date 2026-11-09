@@ -7,7 +7,7 @@ from app.main import app
 from app.modules.accounts.models import User
 from app.modules.catalog.models import Product
 from app.modules.orders.models import Order, OrderItem
-from tests.orders.helpers import _create_user_and_token
+from tests.orders.helpers import ORDER_PAYLOAD, _create_user_and_token
 
 client = TestClient(app)
 
@@ -124,7 +124,7 @@ def test_seller_blocked_and_unblocked_catalog_and_checkout_flow(
             "Authorization": f"Bearer {boris_token}",
             "Idempotency-Key": idempotency_key,
         },
-        json={},
+        json=ORDER_PAYLOAD,
     )
     assert checkout_blocked_res.status_code == 409
 
@@ -168,7 +168,7 @@ def test_seller_blocked_and_unblocked_catalog_and_checkout_flow(
             "Authorization": f"Bearer {boris_token}",
             "Idempotency-Key": new_idempotency_key,
         },
-        json={},
+        json=ORDER_PAYLOAD,
     )
     assert checkout_success_res.status_code == 201
 

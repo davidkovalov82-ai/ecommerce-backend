@@ -9,6 +9,18 @@ from app.modules.cart.models import CartItem
 from app.modules.catalog.models import Product
 from app.modules.orders.models import Order, OrderItem
 
+DEFAULT_SHIPPING_ADDRESS = {
+    "recipient_name": "Иван Иванов",
+    "phone": "+359888123456",
+    "country_code": "BG",
+    "city": "София",
+    "postal_code": "1000",
+    "address_line1": "бул. Витоша 1",
+    "address_line2": "ет. 2, ап. 5",
+}
+
+ORDER_PAYLOAD = {"shipping_address": DEFAULT_SHIPPING_ADDRESS}
+
 
 def _create_user_and_token(
     db_session: Session,
