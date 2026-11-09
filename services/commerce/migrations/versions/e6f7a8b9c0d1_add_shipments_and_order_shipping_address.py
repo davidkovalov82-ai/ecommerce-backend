@@ -4,6 +4,13 @@ Revision ID: e6f7a8b9c0d1
 Revises: d5e6f7a8b9c0
 Create Date: 2026-11-09 20:00:00.000000
 
+Downgrade policy:
+Downgrade is explicitly prohibited if there are any shipment events
+(`shipment_id IS NOT NULL` or `event_type = 'shipment.shipped'`) in `order_outbox_events`.
+The legacy unique constraint `(order_id, event_type)` cannot support multiple
+shipment events per order. A descriptive `RuntimeError` is raised before making
+any schema changes, preserving existing data and state. If no shipment events exist,
+downgrade safely proceeds.
 """
 
 from collections.abc import Sequence
@@ -175,6 +182,21 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # 0. Проверка за съществуващи shipment събития преди всякакви промени по схемата
+    bind = op.get_bind()
+    count = bind.execute(
+        sa.text(
+            "SELECT COUNT(*) FROM order_outbox_events "
+            "WHERE shipment_id IS NOT NULL OR event_type = 'shipment.shipped'"
+        )
+    ).scalar()
+    if count and count > 0:
+        raise RuntimeError(
+            f"Cannot downgrade migration {revision}: found {count} shipment events in order_outbox_events. "
+            "The legacy unique constraint (order_id, event_type) is incompatible with multi-shipment events. "
+            "Downgrade is blocked to protect event data and integrity."
+        )
+
     # 4. Връщане на order_outbox_events
     op.drop_index("uq_order_outbox_shipment_event", table_name="order_outbox_events")
     op.drop_index("uq_order_outbox_order_event", table_name="order_outbox_events")
@@ -205,4 +227,3 @@ def downgrade() -> None:
     op.drop_column("orders", "shipping_recipient_name")
     op.drop_constraint("ck_orders_fulfillment_status_valid", "orders", type_="check")
     op.drop_column("orders", "fulfillment_status")
-

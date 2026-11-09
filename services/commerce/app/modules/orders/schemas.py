@@ -1,4 +1,5 @@
 import datetime
+import re
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -55,9 +56,9 @@ class ShippingAddress(BaseModel):
     @field_validator("country_code")
     @classmethod
     def validate_country_code(cls, v: str) -> str:
-        """Проверява дали кодът на държавата се състои от точно 2 букви."""
-        if not (len(v) == 2 and v.isalpha()):
-            raise ValueError("country_code must be a 2-letter alpha code")
+        """Проверява дали кодът на държавата се състои от точно 2 ASCII букви и нормализира към главни букви."""
+        if not re.fullmatch(r"[A-Za-z]{2}", v):
+            raise ValueError("country_code must be exactly 2 ASCII letters (e.g. 'BG')")
         return v.upper()
 
 

@@ -202,6 +202,67 @@ def test_shipping_address_validation_and_restrictions(
     assert res5.status_code == 422
 
 
+def test_country_code_normalization_and_strict_ascii_validation(
+    db_session: Session,
+) -> None:
+    """Критерий: country_code приема точно две ASCII-букви с нормализация в горен регистър (bg -> BG).
+
+    Отклонява с 422 преди запис на поръчка: ßa, БГ, цифри (12, B1), невалидна дължина (B, BGR).
+    """
+    user, token = _create_user_and_token(db_session)
+    product = Product(
+        seller_id=user.id,
+        title="Test item country",
+        price_minor=1000,
+        currency="EUR",
+        stock=10,
+        active=True,
+    )
+    db_session.add(product)
+    db_session.commit()
+    _add_to_cart(db_session, user.id, product.id, quantity=1)
+
+    # 1. Отхвърляне с 422 за невалидни кодове: ßa, БГ, цифри, дължина
+    invalid_codes = ["ßa", "БГ", "12", "B1", "B", "BGR", "DEU", ""]
+    for code in invalid_codes:
+        addr = dict(DEFAULT_SHIPPING_ADDRESS)
+        addr["country_code"] = code
+        res = client.post(
+            "/orders",
+            json={"shipping_address": addr},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Idempotency-Key": str(uuid.uuid4()),
+            },
+        )
+        assert res.status_code == 422, (
+            f"Expected 422 for country_code='{code}', got {res.status_code}"
+        )
+
+    # Уверяваме се, че никаква поръчка не е записана в базата
+    assert db_session.query(Order).count() == 0
+
+    # 2. Малки букви 'bg' се нормализират към 'BG'
+    valid_addr = dict(DEFAULT_SHIPPING_ADDRESS)
+    valid_addr["country_code"] = "bg"
+    res_ok = client.post(
+        "/orders",
+        json={"shipping_address": valid_addr},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Idempotency-Key": str(uuid.uuid4()),
+        },
+    )
+    assert res_ok.status_code == 201
+    created_data = res_ok.json()
+    assert created_data["shipping_address"]["country_code"] == "BG"
+
+    # Проверка и директно в колоната на Order в базата данни
+    db_order = db_session.get(Order, created_data["id"])
+    assert db_order is not None
+    assert db_order.shipping_country_code == "BG"
+
+
 def test_idempotency_same_address_and_different_address(
     db_session: Session,
 ) -> None:

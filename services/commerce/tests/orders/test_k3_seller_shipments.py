@@ -1,4 +1,5 @@
 import concurrent.futures
+import threading
 import uuid
 
 from fastapi.testclient import TestClient
@@ -386,3 +387,68 @@ def test_concurrent_ship_calls(db_session: Session) -> None:
         .all()
     )
     assert len(events) == 1
+
+
+def test_concurrent_ship_calls_for_different_shipments_same_order(
+    db_session: Session,
+) -> None:
+    """Конкурентни заявки за ship към две различни пратки на една и съща поръчка:
+
+    - И двете заявки успяват (200).
+    - Крайният статус на поръчката е 'shipped'.
+    - Записани са точно две Outbox събития — по едно за всяка пратка.
+    """
+    anna_data, boris_data, _, order, anna_s, boris_s = _setup_multi_seller_order(
+        db_session
+    )
+
+    barrier = threading.Barrier(2)
+
+    def _ship_shipment(shipment_id: int, token: str) -> int:
+        barrier.wait()
+        c = TestClient(app)
+        res = c.post(
+            f"/seller/shipments/{shipment_id}/ship",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        return res.status_code
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(_ship_shipment, anna_s.id, anna_data["token"])
+        f2 = executor.submit(_ship_shipment, boris_s.id, boris_data["token"])
+        r1 = f1.result()
+        r2 = f2.result()
+
+    assert r1 == 200
+    assert r2 == 200
+
+    # Проверка на състоянието на поръчката: трябва да е напълно 'shipped'
+    db_session.expire_all()
+    db_order = db_session.get(Order, order.id)
+    assert db_order is not None
+    assert db_order.fulfillment_status == "shipped"
+    assert db_order.status == "paid"
+
+    # Проверка на пратките
+    db_anna_s = db_session.get(Shipment, anna_s.id)
+    db_boris_s = db_session.get(Shipment, boris_s.id)
+    assert db_anna_s is not None and db_anna_s.status == "shipped"
+    assert db_boris_s is not None and db_boris_s.status == "shipped"
+
+    # Проверка на Outbox събитията: точно 2 събития за тази поръчка
+    events = (
+        db_session.execute(
+            select(OrderOutboxEvent).where(
+                OrderOutboxEvent.order_id == order.id,
+                OrderOutboxEvent.event_type == "shipment.shipped",
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(events) == 2
+    assert {ev.shipment_id for ev in events} == {anna_s.id, boris_s.id}
+    assert {ev.payload["seller_id"] for ev in events} == {
+        anna_data["user"].id,
+        boris_data["user"].id,
+    }

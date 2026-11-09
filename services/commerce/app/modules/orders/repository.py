@@ -295,6 +295,7 @@ class OrderRepository:
             select(Shipment)
             .where(Shipment.order_id == order_id)
             .order_by(Shipment.id.asc())
+            .execution_options(populate_existing=True)
         )
         return self._session.scalars(stmt).all()
 

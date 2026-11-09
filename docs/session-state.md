@@ -1,20 +1,20 @@
 # Session State
 
-- **Текуща задача**: Етап К3: поръчка от няколко продавача, пратки, адрес за доставка и известия.
+- **Текуща задача**: Етап К3: корекции след ревью на коммит 4261404 (OpenAPI, country_code, миграционен downgrade, конкурентен ship).
 - **Реализирано**:
-  - Модел/БД: миграция `e6f7a8b9c0d1`, таблица `shipments` (UNIQUE `order_id, seller_id`), `orders.fulfillment_status`, `order_items.seller_id`, адрес за доставка и частични outbox индекси.
-  - Чекаут: задължителен валидиран `shipping_address` в `POST /orders`, създаване на пратка за всеки продавач, съхраняване на `seller_id` в позициите, защита от конфликт при еднакъв ключ и различен адрес (409).
-  - Продавач: `GET /seller/shipments`, `GET /seller/shipments/{id}`, `POST /seller/shipments/{id}/ship` (изолация на артикули, 404 за чужди, 409 при неплатена/без адрес, идемпотентност).
-  - Статуси: `fulfillment_status` преминава `unshipped -> partially_shipped -> shipped`, докато `order.status` остава `paid`.
-  - Уведомяване: атомен outbox запис на `shipment.shipped` в транзакцията на изпращане; Mailpit известия с артикулите само на съответния продавач; устойчивост на SMTP срив.
+  - Изчистени дублирани методи в `api.py` и `service.py`; OpenAPI генерира схемата с 0 warnings и без дублирани Operation IDs.
+  - Строга ASCII проверка на `country_code` (`[A-Za-z]{2}`) с нормализация `bg -> BG` и 422 при невалидни стойности преди запис.
+  - Миграция `e6f7a8b9c0d1`: защитен downgrade при налични `shipment` събития с ясно съобщение и запазване на данните; чист downgrade без събития.
+  - Конкурентност: `flush()` преди преизчисляване на `fulfillment_status`; потвърдено финално `shipped` и 2 outbox събития при паралелен ship.
 - **Проверено / Резултати**:
-  - `uv run --locked pytest -q`: 288 passed (100% успех, включително 17 нови теста за К3).
-  - `uv run --locked ruff check .` и `uv run --locked ruff format --check .`: 0 грешки.
-  - `alembic downgrade -1 && alembic upgrade head`: обратимост на миграцията потвърдена.
-- **Непроверено**: At-least-once SMTP повторение при аварийно спиране на процеса между SMTP приемане и DB commit (документирано ограничение).
+  - `uv run --locked pytest -q`: 291 passed (100% успех на пълния suite).
+  - `uv run --locked ruff check .` и `uv run --locked ruff format --check .`: 0 грешки (108 файла форматирани).
+  - Изолирани тестове на миграции в PostgreSQL: отказ при събития + успех без събития + head upgrade.
+- **Непроверено**: At-least-once SMTP повторение при аварийно спиране между SMTP приемане и DB commit (документирано ограничение).
 - **Работещи команди**:
   - `cd services/commerce && uv run --locked ruff check . && uv run --locked ruff format --check .`
+  - `cd services/commerce && uv run --locked pytest tests/infrastructure/migrations/test_orders_migrations.py -v`
   - `cd services/commerce && uv run --locked pytest tests/orders/test_k3*.py -v`
   - `cd services/commerce && uv run --locked pytest -q`
-- **Засегнати файлове**: `app/modules/orders/*`, `app/main.py`, `migrations/.../e6f7a8b9c0d1_*.py`, `tests/orders/*`, `tests/conftest.py`.
-- **Следваща стъпка**: Потребителски преглед и ръчен commit / push на завършения етап К3.
+- **Засегнати файлове**: `app/modules/orders/*`, `migrations/.../e6f7a8b9c0d1_*.py`, `tests/orders/*`, `tests/infrastructure/migrations/*`.
+- **Следваща стъпка**: Потребителски преглед и ръчен commit / push на отстранените забележки.
