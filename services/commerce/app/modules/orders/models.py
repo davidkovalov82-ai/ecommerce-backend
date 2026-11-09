@@ -33,6 +33,10 @@ class Order(Base):
             "status IN ('pending_payment', 'payment_processing', 'paid', 'cancelled', 'expired')",
             name="ck_orders_status_valid",
         ),
+        CheckConstraint(
+            "fulfillment_status IN ('unshipped', 'partially_shipped', 'shipped')",
+            name="ck_orders_fulfillment_status_valid",
+        ),
         CheckConstraint("currency = 'EUR'", name="ck_orders_currency_eur"),
         CheckConstraint(
             "total_minor >= 0",
@@ -56,6 +60,12 @@ class Order(Base):
         nullable=False,
         default="pending_payment",
     )
+    fulfillment_status: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="unshipped",
+        server_default="unshipped",
+    )
     currency: Mapped[str] = mapped_column(
         String(3),
         nullable=False,
@@ -63,6 +73,34 @@ class Order(Base):
     )
     total_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)
     idempotency_key: Mapped[str] = mapped_column(String(36), nullable=False)
+    shipping_recipient_name: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    shipping_phone: Mapped[str | None] = mapped_column(
+        String(50),
+        nullable=True,
+    )
+    shipping_country_code: Mapped[str | None] = mapped_column(
+        String(2),
+        nullable=True,
+    )
+    shipping_city: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+    )
+    shipping_postal_code: Mapped[str | None] = mapped_column(
+        String(20),
+        nullable=True,
+    )
+    shipping_address_line1: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+    shipping_address_line2: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -80,6 +118,12 @@ class Order(Base):
         cascade="all, delete-orphan",
         order_by="OrderItem.product_id.asc()",
     )
+    shipments: Mapped[list["Shipment"]] = relationship(
+        "Shipment",
+        back_populates="order",
+        cascade="all, delete-orphan",
+        order_by="Shipment.id.asc()",
+    )
     payment_attempts: Mapped[list["PaymentAttempt"]] = relationship(
         "PaymentAttempt",
         back_populates="order",
@@ -92,6 +136,21 @@ class Order(Base):
         cascade="all, delete-orphan",
         order_by="StripeCheckoutSession.id.asc()",
     )
+
+    @property
+    def shipping_address(self) -> dict[str, Any] | None:
+        """Връща адреса за доставка като речник за сериализация или None за стари поръчки."""
+        if self.shipping_recipient_name is not None:
+            return {
+                "recipient_name": self.shipping_recipient_name,
+                "phone": self.shipping_phone or "",
+                "country_code": self.shipping_country_code or "",
+                "city": self.shipping_city or "",
+                "postal_code": self.shipping_postal_code or "",
+                "address_line1": self.shipping_address_line1 or "",
+                "address_line2": self.shipping_address_line2,
+            }
+        return None
 
 
 class OrderItem(Base):
@@ -134,12 +193,90 @@ class OrderItem(Base):
         ForeignKey("products.id", ondelete="RESTRICT"),
         nullable=False,
     )
+    seller_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     product_title: Mapped[str] = mapped_column(String(255), nullable=False)
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     unit_price_minor: Mapped[int] = mapped_column(Integer, nullable=False)
     subtotal_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
     order: Mapped["Order"] = relationship("Order", back_populates="items")
+
+
+class Shipment(Base):
+    """SQLAlchemy ORM модел за пратка към поръчка от конкретен продавач."""
+
+    __tablename__ = "shipments"
+    __table_args__ = (
+        UniqueConstraint(
+            "order_id",
+            "seller_id",
+            name="uq_shipments_order_id_seller_id",
+        ),
+        CheckConstraint(
+            "status IN ('unshipped', 'shipped')",
+            name="ck_shipments_status_valid",
+        ),
+        Index("ix_shipments_seller_id_created", "seller_id", "created_at"),
+        Index("ix_shipments_order_id", "order_id"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True,
+    )
+    order_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("orders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    seller_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="unshipped",
+        server_default="unshipped",
+    )
+    shipped_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.datetime.now(datetime.UTC),
+        server_default=func.now(),
+    )
+
+    order: Mapped["Order"] = relationship("Order", back_populates="shipments")
+
+    @property
+    def items(self) -> list["OrderItem"]:
+        """Връща позициите от поръчката, принадлежащи на продавача на тази пратка."""
+        if self.order and self.order.items:
+            return [it for it in self.order.items if it.seller_id == self.seller_id]
+        return []
+
+    @property
+    def items_count(self) -> int:
+        """Връща броя позиции в пратката на продавача."""
+        return len(self.items)
+
+    @property
+    def shipping_address(self) -> dict[str, Any] | None:
+        """Връща адреса за доставка от поръчката."""
+        if self.order:
+            return self.order.shipping_address
+        return None
 
 
 class PaymentAttempt(Base):
@@ -336,10 +473,19 @@ class OrderOutboxEvent(Base):
 
     __tablename__ = "order_outbox_events"
     __table_args__ = (
-        UniqueConstraint(
+        Index(
+            "uq_order_outbox_order_event",
             "order_id",
             "event_type",
-            name="uq_order_outbox_order_id_event_type",
+            unique=True,
+            postgresql_where=text("shipment_id IS NULL"),
+        ),
+        Index(
+            "uq_order_outbox_shipment_event",
+            "shipment_id",
+            "event_type",
+            unique=True,
+            postgresql_where=text("shipment_id IS NOT NULL"),
         ),
         CheckConstraint(
             "status IN ('pending', 'sent', 'failed')",
@@ -347,6 +493,7 @@ class OrderOutboxEvent(Base):
         ),
         Index("ix_order_outbox_status_created", "status", "created_at"),
         Index("ix_order_outbox_order_id", "order_id"),
+        Index("ix_order_outbox_shipment_id", "shipment_id"),
     )
 
     id: Mapped[int] = mapped_column(
@@ -358,6 +505,11 @@ class OrderOutboxEvent(Base):
         BigInteger,
         ForeignKey("orders.id", ondelete="CASCADE"),
         nullable=False,
+    )
+    shipment_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("shipments.id", ondelete="CASCADE"),
+        nullable=True,
     )
     event_type: Mapped[str] = mapped_column(
         String(50),

@@ -14,7 +14,13 @@ logger = logging.getLogger(__name__)
 
 
 class OutboxProcessor:
-    """Обработва чакащите outbox събития без задържане на DB заключване по време на SMTP."""
+    """Обработва чакащите outbox събития без задържане на DB заключване по време на SMTP.
+
+    Гарантира доставка от тип at-least-once:
+    Ако процесът падне след приемането на писмото от SMTP сървъра, но преди обновяването
+    на статуса на събитието в базата данни на 'sent', при последваща обработка е възможно
+    повторно изпращане на писмото (exactly-once доставка не се гарантира).
+    """
 
     def __init__(
         self,
@@ -52,8 +58,54 @@ class OutboxProcessor:
                     stats["sent"] += 1
                 else:
                     stats["failed"] += 1
+            elif event_type == "shipment.shipped":
+                success = self._process_shipment_shipped_event(
+                    event_id, order_id, payload
+                )
+                if success:
+                    stats["sent"] += 1
+                else:
+                    stats["failed"] += 1
 
         return stats
+
+    def _process_shipment_shipped_event(
+        self, event_id: int, order_id: int, payload: dict[str, Any]
+    ) -> bool:
+        to_email = payload.get("customer_email") or ""
+        shipment_id = payload.get("shipment_id") or 0
+        items = payload.get("items") or []
+
+        try:
+            self._email_sender.send_shipment_shipped_email(
+                to_email=to_email,
+                order_id=order_id,
+                shipment_id=shipment_id,
+                items=items,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to send shipment email for shipment #%s via SMTP: %s",
+                shipment_id,
+                exc,
+            )
+            with self._session_factory() as session:
+                repo = OrderRepository(session)
+                event = repo.get_outbox_event_by_id_for_update(event_id)
+                if event and event.status == "pending":
+                    event.retry_count += 1
+                    event.last_error = str(exc)[:1000]
+                    session.commit()
+            return False
+
+        with self._session_factory() as session:
+            repo = OrderRepository(session)
+            event = repo.get_outbox_event_by_id_for_update(event_id)
+            if event and event.status == "pending":
+                event.status = "sent"
+                event.processed_at = datetime.datetime.now(datetime.UTC)
+                session.commit()
+        return True
 
     def _process_order_paid_event(
         self, event_id: int, order_id: int, payload: dict[str, Any]

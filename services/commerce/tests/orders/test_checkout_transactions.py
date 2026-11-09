@@ -9,6 +9,7 @@ from app.modules.cart.models import CartItem
 from app.modules.catalog.models import Product
 from app.modules.orders.models import Order, OrderItem
 from tests.orders.helpers import (
+    ORDER_PAYLOAD,
     _add_to_cart,
     _create_product,
     _create_user_and_token,
@@ -48,7 +49,7 @@ def test_late_rollback_on_simulated_error_before_commit(
     monkeypatch.setattr(Session, "commit", _failing_commit)
 
     with pytest.raises(RuntimeError, match="Simulated failure right before commit"):
-        client.post("/orders", json={}, headers=headers)
+        client.post("/orders", json=ORDER_PAYLOAD, headers=headers)
 
     # Проверка през НАПЪЛНО ОТДЕЛНА сесия след rollback
     with session_factory() as verification_session:
@@ -78,7 +79,7 @@ def test_late_rollback_on_simulated_error_before_commit(
     monkeypatch.setattr(Session, "commit", original_commit)
 
     # Повтаряме със СЪЩИЯ Idempotency-Key
-    r_retry = client.post("/orders", json={}, headers=headers)
+    r_retry = client.post("/orders", json=ORDER_PAYLOAD, headers=headers)
     assert r_retry.status_code == 201
     order_data = r_retry.json()
     assert order_data["status"] == "pending_payment"
@@ -102,6 +103,6 @@ def test_late_rollback_on_simulated_error_before_commit(
         )
 
     # Трето повторение със същия ключ -> връща същата поръчка (идемпотентност)
-    r_idempotent = client.post("/orders", json={}, headers=headers)
+    r_idempotent = client.post("/orders", json=ORDER_PAYLOAD, headers=headers)
     assert r_idempotent.status_code == 201
     assert r_idempotent.json()["id"] == order_data["id"]

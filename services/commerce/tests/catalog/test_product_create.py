@@ -2,7 +2,6 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -45,9 +44,11 @@ def test_create_product_without_token_returns_401() -> None:
     assert response.json()["detail"]["code"] == "AUTHENTICATION_REQUIRED"
 
 
-def test_create_product_as_customer_returns_403(db_session: Session) -> None:
-    """POST /products от потребител с роля customer връща 403 FORBIDDEN и не добавя запис."""
-    _, customer_token = _create_user_with_role(
+def test_create_product_as_customer_returns_201_with_seller_id(
+    db_session: Session,
+) -> None:
+    """POST /products от потребител с роля customer връща 201 и записва seller_id."""
+    customer, customer_token = _create_user_with_role(
         db_session, "customer_tester@example.com", "customer"
     )
 
@@ -63,19 +64,15 @@ def test_create_product_as_customer_returns_403(db_session: Session) -> None:
         json=payload,
         headers={"Authorization": f"Bearer {customer_token}"},
     )
-    assert response.status_code == 403
-    assert response.json() == {
-        "detail": {
-            "code": "FORBIDDEN",
-            "message": "Admin privileges required",
-        }
-    }
+    assert response.status_code == 201
+    data = response.json()
+    assert data["seller_id"] == customer.id
+    assert data["title"] == "Customer Attempt Product"
 
-    # Проверка, че продуктът не е записан в базата
-    existing = db_session.execute(
-        text("SELECT id FROM products WHERE title = 'Customer Attempt Product'")
-    ).scalar()
-    assert existing is None
+    # Проверка, че продуктът е записан в базата с точния seller_id
+    product_in_db = db_session.get(Product, data["id"])
+    assert product_in_db is not None
+    assert product_in_db.seller_id == customer.id
 
 
 def test_create_product_as_admin_returns_201_and_persists(
@@ -349,78 +346,46 @@ def test_registration_with_role_admin_forbidden() -> None:
     assert res.status_code == 422
 
 
-def test_role_change_in_db_recognized_with_existing_token(
+def test_client_cannot_pass_seller_id_in_create_returns_422(
     db_session: Session,
 ) -> None:
-    """Промяна на роля от customer на admin в базата данни се отчита моментално със съществуващ токен."""
-    user, token = _create_user_with_role(
-        db_session, "promoted_later@example.com", "customer"
+    """Ако клиентът опита да подаде seller_id в тялото на POST /products, сървърът връща 422."""
+    _, token = _create_user_with_role(
+        db_session, "seller_injection@example.com", "customer"
     )
 
-    # Като customer заявката се отхвърля
-    res_before = client.post(
+    res = client.post(
         "/products",
         json={
-            "title": "Test Prod",
-            "price_minor": 100,
+            "title": "Injected Seller Product",
+            "price_minor": 1000,
             "currency": "EUR",
-            "stock": 1,
+            "stock": 5,
             "active": True,
+            "seller_id": 999,
         },
         headers={"Authorization": f"Bearer {token}"},
     )
-    assert res_before.status_code == 403
-
-    # Променяме ролята в базата
-    user.role = "admin"
-    db_session.commit()
-
-    # Със СЪЩИЯ токен вече има достъп (тъй като get_current_user зарежда ролята от базата)
-    res_after = client.post(
-        "/products",
-        json={
-            "title": "Test Prod",
-            "price_minor": 100,
-            "currency": "EUR",
-            "stock": 1,
-            "active": True,
-        },
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    assert res_after.status_code == 201
+    assert res.status_code == 422
 
 
-def test_role_revocation_in_db_recognized_with_existing_token(
+def test_user_deletion_in_db_returns_401_for_create(
     db_session: Session,
 ) -> None:
-    """Отнемане на права (admin -> customer в БД): същият токен получава 403 при POST /products и не се създава продукт."""
+    """Изтрит от базата потребител не може да създава продукти със стар токен (връща 401)."""
     user, token = _create_user_with_role(
-        db_session, "demoted_later@example.com", "admin"
+        db_session, "deleted_creator@example.com", "customer"
     )
 
-    # 1. Докато е admin, заявката е успешна
-    res_before = client.post(
-        "/products",
-        json={
-            "title": "Admin Initial Product",
-            "price_minor": 100,
-            "currency": "EUR",
-            "stock": 1,
-            "active": True,
-        },
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    assert res_before.status_code == 201
-
-    # 2. Отнемаме правата директно в базата данни (admin -> customer)
-    user.role = "customer"
+    # 1. Изтриваме потребителя директно в БД
+    db_session.delete(user)
     db_session.commit()
 
-    # 3. Със СЪЩИЯ токен вече получава 403 FORBIDDEN
-    res_after = client.post(
+    # 2. Със същия токен опитва да създаде продукт
+    res = client.post(
         "/products",
         json={
-            "title": "Blocked Customer Product",
+            "title": "Ghost Product",
             "price_minor": 100,
             "currency": "EUR",
             "stock": 1,
@@ -428,11 +393,5 @@ def test_role_revocation_in_db_recognized_with_existing_token(
         },
         headers={"Authorization": f"Bearer {token}"},
     )
-    assert res_after.status_code == 403
-    assert res_after.json()["detail"]["code"] == "FORBIDDEN"
-
-    # 4. Проверяваме, че продуктът не е създаден в БД
-    blocked_product = db_session.execute(
-        text("SELECT id FROM products WHERE title = 'Blocked Customer Product'")
-    ).scalar()
-    assert blocked_product is None
+    assert res.status_code == 401
+    assert res.json()["detail"]["code"] == "USER_NOT_FOUND"

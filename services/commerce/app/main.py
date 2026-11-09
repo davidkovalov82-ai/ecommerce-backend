@@ -10,9 +10,10 @@ from app.db import db
 from app.modules.accounts.api import auth_router
 from app.modules.accounts.api import router as accounts_router
 from app.modules.cart.api import router as cart_router
+from app.modules.catalog.api import categories_router
 from app.modules.catalog.api import router as catalog_router
 from app.modules.orders.api import router as orders_router
-from app.modules.orders.api import webhook_router
+from app.modules.orders.api import seller_shipments_router, webhook_router
 
 
 def _sanitize_error_input(value: Any, is_sensitive_path: bool) -> Any:
@@ -95,11 +96,13 @@ def create_app() -> FastAPI:
             sanitized_errors.append(err_dict)
         return JSONResponse(status_code=422, content={"detail": sanitized_errors})
 
+    app.include_router(categories_router)
     app.include_router(catalog_router)
     app.include_router(accounts_router)
     app.include_router(auth_router)
     app.include_router(cart_router)
     app.include_router(orders_router)
+    app.include_router(seller_shipments_router)
     app.include_router(webhook_router)
     return app
 

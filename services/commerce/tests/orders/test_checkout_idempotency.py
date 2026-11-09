@@ -7,6 +7,7 @@ from app.main import app
 from app.modules.cart.models import CartItem
 from app.modules.catalog.models import Product
 from tests.orders.helpers import (
+    ORDER_PAYLOAD,
     _add_to_cart,
     _create_product,
     _create_user_and_token,
@@ -25,7 +26,7 @@ def test_create_order_idempotency_same_user(db_session: Session) -> None:
     headers = {"Authorization": f"Bearer {token}", "Idempotency-Key": key}
 
     # 1. Първо създаване
-    r1 = client.post("/orders", json={}, headers=headers)
+    r1 = client.post("/orders", json=ORDER_PAYLOAD, headers=headers)
     assert r1.status_code == 201
     order1_id = r1.json()["id"]
 
@@ -34,7 +35,7 @@ def test_create_order_idempotency_same_user(db_session: Session) -> None:
     _add_to_cart(db_session, user.id, prod_new.id, quantity=1)
 
     # 2. Повторно извикване със същия ключ
-    r2 = client.post("/orders", json={}, headers=headers)
+    r2 = client.post("/orders", json=ORDER_PAYLOAD, headers=headers)
     assert r2.status_code == 201
     assert r2.json()["id"] == order1_id
 
@@ -61,7 +62,7 @@ def test_create_order_idempotency_retry_after_failed_transaction(
     headers = {"Authorization": f"Bearer {token}", "Idempotency-Key": key}
 
     # 1. Първи опит: недостатъчен склад -> 409
-    r1 = client.post("/orders", json={}, headers=headers)
+    r1 = client.post("/orders", json=ORDER_PAYLOAD, headers=headers)
     assert r1.status_code == 409
 
     # Администраторът увеличава наличността
@@ -69,7 +70,7 @@ def test_create_order_idempotency_retry_after_failed_transaction(
     db_session.commit()
 
     # 2. Повторен опит със СЪЩИЯ ключ -> сега трябва да успее с 201
-    r2 = client.post("/orders", json={}, headers=headers)
+    r2 = client.post("/orders", json=ORDER_PAYLOAD, headers=headers)
     assert r2.status_code == 201
     assert r2.json()["status"] == "pending_payment"
 
@@ -91,7 +92,7 @@ def test_same_idempotency_key_different_users(db_session: Session) -> None:
 
     r_a = client.post(
         "/orders",
-        json={},
+        json=ORDER_PAYLOAD,
         headers={
             "Authorization": f"Bearer {token_a}",
             "Idempotency-Key": shared_key,
@@ -101,7 +102,7 @@ def test_same_idempotency_key_different_users(db_session: Session) -> None:
 
     r_b = client.post(
         "/orders",
-        json={},
+        json=ORDER_PAYLOAD,
         headers={
             "Authorization": f"Bearer {token_b}",
             "Idempotency-Key": shared_key,
@@ -126,7 +127,7 @@ def test_order_total_minor_exceeds_32bit_integer(db_session: Session) -> None:
         "Authorization": f"Bearer {token}",
         "Idempotency-Key": str(uuid.uuid4()),
     }
-    r = client.post("/orders", json={}, headers=headers)
+    r = client.post("/orders", json=ORDER_PAYLOAD, headers=headers)
     assert r.status_code == 201
     data = r.json()
 

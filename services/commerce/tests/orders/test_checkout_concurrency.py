@@ -16,6 +16,7 @@ from app.modules.cart.models import CartItem
 from app.modules.catalog.models import Product
 from app.modules.orders.models import Order
 from tests.orders.helpers import (
+    ORDER_PAYLOAD,
     _add_to_cart,
     _create_product,
     _create_user_and_token,
@@ -50,7 +51,7 @@ def test_concurrent_same_key_creates_single_order(
 
     def _send_post() -> tuple[int, int]:
         barrier.wait(timeout=5.0)
-        r = client.post("/orders", json={}, headers=headers)
+        r = client.post("/orders", json=ORDER_PAYLOAD, headers=headers)
         return r.status_code, r.json().get("id", 0)
 
     try:
@@ -102,7 +103,7 @@ def test_two_users_compete_for_last_stock(
         barrier.wait(timeout=5.0)
         r = client.post(
             "/orders",
-            json={},
+            json=ORDER_PAYLOAD,
             headers={
                 "Authorization": f"Bearer {tok}",
                 "Idempotency-Key": str(uuid.uuid4()),
@@ -158,7 +159,7 @@ def test_concurrent_checkouts_same_cart_different_keys(
         barrier.wait(timeout=5.0)
         r = client.post(
             "/orders",
-            json={},
+            json=ORDER_PAYLOAD,
             headers={
                 "Authorization": f"Bearer {token}",
                 "Idempotency-Key": str(uuid.uuid4()),
@@ -275,7 +276,7 @@ def test_parallel_checkout_and_cart_modification(
     def _do_checkout() -> int:
         r = client.post(
             "/orders",
-            json={},
+            json=ORDER_PAYLOAD,
             headers={
                 "Authorization": f"Bearer {token}",
                 "Idempotency-Key": idempotency_key,

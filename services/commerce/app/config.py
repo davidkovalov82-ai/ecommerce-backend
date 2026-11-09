@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     smtp_from: str = "noreply@example.com"
     mailpit_web_url: str = "http://localhost:8025"
 
+    password_reset_base_url: str = "http://localhost:8000/auth/password-reset/confirm"
+    password_reset_expire_minutes: int = 15
+
     @field_validator("jwt_secret")
     @classmethod
     def validate_jwt_secret(cls, v: str) -> str:

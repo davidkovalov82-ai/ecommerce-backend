@@ -8,6 +8,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
+from app.modules.accounts.models import User
 from app.modules.catalog.models import Product
 
 PRODUCT_TEMPLATES = [
@@ -106,11 +107,29 @@ def seed(session: Session) -> int:
         f"Намерени вече съществуващи демопродукти: {len(existing_demo_titles)} от {len(products)}"
     )
 
+    tech_user = session.scalar(
+        select(User).where(User.email == "legacy-catalog@internal.ecommerce.com")
+    )
+    if tech_user is not None:
+        if tech_user.password_hash != "!disabled":
+            raise RuntimeError(
+                "Technical account email 'legacy-catalog@internal.ecommerce.com' is already occupied "
+                "by a regular user account. Cannot proceed with seeding."
+            )
+    else:
+        tech_user = User(
+            email="legacy-catalog@internal.ecommerce.com",
+            password_hash="!disabled",
+            role="customer",
+        )
+        session.add(tech_user)
+        session.flush()
+
     added = 0
     for data in products:
         if str(data["title"]) in existing_demo_titles:
             continue
-        p = Product(**data)
+        p = Product(**data, seller_id=tech_user.id)
         session.add(p)
         added += 1
 

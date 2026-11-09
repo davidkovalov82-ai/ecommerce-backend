@@ -83,6 +83,26 @@ def _sync_users_sequence(conn: Any) -> None:
     )
 
 
+def _sync_categories_sequence(conn: Any) -> None:
+    """Синхронизира PostgreSQL sequence-а на categories с текущото максимално ID."""
+    conn.execute(
+        text(
+            "SELECT setval(pg_get_serial_sequence('categories', 'id'), "
+            "coalesce(max(id), 1), max(id) IS NOT NULL) FROM categories;"
+        )
+    )
+
+
+def _sync_shipments_sequence(conn: Any) -> None:
+    """Синхронизира PostgreSQL sequence-а на shipments с текущото максимално ID."""
+    conn.execute(
+        text(
+            "SELECT setval(pg_get_serial_sequence('shipments', 'id'), "
+            "coalesce(max(id), 1), max(id) IS NOT NULL) FROM shipments;"
+        )
+    )
+
+
 @pytest.fixture
 def db_session() -> Generator[Session]:
     """Изолирана сесия за тестове с автоматично почистване на новите записи."""
@@ -92,17 +112,30 @@ def db_session() -> Generator[Session]:
     finally:
         session.rollback()
         # Премахваме всички добавени от тестовете редове
+        session.execute(text("DELETE FROM order_outbox_events"))
         session.execute(text("DELETE FROM stripe_checkout_sessions"))
         session.execute(text("DELETE FROM stripe_processed_events"))
         session.execute(text("DELETE FROM payment_attempts"))
         session.execute(text("DELETE FROM cart_items"))
         session.execute(text("DELETE FROM order_items"))
+        session.execute(text("DELETE FROM shipments"))
+        _sync_shipments_sequence(session)
         session.execute(text("DELETE FROM orders"))
-        session.execute(text("DELETE FROM users"))
-        _sync_users_sequence(session)
         session.execute(text("DELETE FROM products WHERE id != 1"))
-        session.execute(text("UPDATE products SET active = true WHERE id = 1"))
+        session.execute(
+            text("UPDATE products SET active = true, category_id = NULL WHERE id = 1")
+        )
         _sync_products_sequence(session)
+        session.execute(text("DELETE FROM categories"))
+        _sync_categories_sequence(session)
+        session.execute(text("DELETE FROM password_reset_tokens"))
+        session.execute(text("DELETE FROM account_moderation_logs"))
+        session.execute(
+            text(
+                "DELETE FROM users WHERE email != 'legacy-catalog@internal.ecommerce.com'"
+            )
+        )
+        _sync_users_sequence(session)
         session.commit()
         session.close()
 
@@ -111,24 +144,56 @@ def db_session() -> Generator[Session]:
 def clean_users_table() -> Generator[None]:
     """Гарантира почистване на таблиците преди и след всеки тест."""
     with TestingSessionLocal() as session:
+        session.execute(text("DELETE FROM order_outbox_events"))
         session.execute(text("DELETE FROM stripe_checkout_sessions"))
         session.execute(text("DELETE FROM stripe_processed_events"))
         session.execute(text("DELETE FROM payment_attempts"))
         session.execute(text("DELETE FROM cart_items"))
         session.execute(text("DELETE FROM order_items"))
+        session.execute(text("DELETE FROM shipments"))
+        _sync_shipments_sequence(session)
         session.execute(text("DELETE FROM orders"))
-        session.execute(text("DELETE FROM users"))
+        session.execute(text("DELETE FROM products WHERE id != 1"))
+        session.execute(
+            text("UPDATE products SET active = true, category_id = NULL WHERE id = 1")
+        )
+        _sync_products_sequence(session)
+        session.execute(text("DELETE FROM categories"))
+        _sync_categories_sequence(session)
+        session.execute(text("DELETE FROM password_reset_tokens"))
+        session.execute(text("DELETE FROM account_moderation_logs"))
+        session.execute(
+            text(
+                "DELETE FROM users WHERE email != 'legacy-catalog@internal.ecommerce.com'"
+            )
+        )
         _sync_users_sequence(session)
         session.commit()
     yield
     with TestingSessionLocal() as session:
+        session.execute(text("DELETE FROM order_outbox_events"))
         session.execute(text("DELETE FROM stripe_checkout_sessions"))
         session.execute(text("DELETE FROM stripe_processed_events"))
         session.execute(text("DELETE FROM payment_attempts"))
         session.execute(text("DELETE FROM cart_items"))
         session.execute(text("DELETE FROM order_items"))
+        session.execute(text("DELETE FROM shipments"))
+        _sync_shipments_sequence(session)
         session.execute(text("DELETE FROM orders"))
-        session.execute(text("DELETE FROM users"))
+        session.execute(text("DELETE FROM products WHERE id != 1"))
+        session.execute(
+            text("UPDATE products SET active = true, category_id = NULL WHERE id = 1")
+        )
+        _sync_products_sequence(session)
+        session.execute(text("DELETE FROM categories"))
+        _sync_categories_sequence(session)
+        session.execute(text("DELETE FROM password_reset_tokens"))
+        session.execute(text("DELETE FROM account_moderation_logs"))
+        session.execute(
+            text(
+                "DELETE FROM users WHERE email != 'legacy-catalog@internal.ecommerce.com'"
+            )
+        )
         _sync_users_sequence(session)
         session.commit()
 

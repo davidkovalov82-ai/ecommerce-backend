@@ -8,6 +8,8 @@ from app.modules.cart.models import CartItem
 from app.modules.catalog.models import Product
 from app.modules.orders.models import Order
 from tests.orders.helpers import (
+    DEFAULT_SHIPPING_ADDRESS,
+    ORDER_PAYLOAD,
     _add_to_cart,
     _create_product,
     _create_user_and_token,
@@ -22,13 +24,13 @@ def test_create_order_validation(db_session: Session) -> None:
     headers = {"Authorization": f"Bearer {token}"}
 
     # 1. Липсващ Idempotency-Key
-    r1 = client.post("/orders", json={}, headers=headers)
+    r1 = client.post("/orders", json=ORDER_PAYLOAD, headers=headers)
     assert r1.status_code == 422
 
     # 2. Невалиден UUID в Idempotency-Key
     r2 = client.post(
         "/orders",
-        json={},
+        json=ORDER_PAYLOAD,
         headers={**headers, "Idempotency-Key": "not-a-valid-uuid"},
     )
     assert r2.status_code == 422
@@ -36,13 +38,21 @@ def test_create_order_validation(db_session: Session) -> None:
     # 3. Невалидно тяло (съдържа допълнителни полета)
     r3 = client.post(
         "/orders",
-        json={"notes": "please rush"},
+        json={"shipping_address": DEFAULT_SHIPPING_ADDRESS, "notes": "please rush"},
         headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
     )
     assert r3.status_code == 422
 
-    # 4. Невалидно тяло (не е JSON обект)
+    # 4. Невалидно тяло (липсва shipping_address / празен обект)
     r4 = client.post(
+        "/orders",
+        json={},
+        headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert r4.status_code == 422
+
+    # 5. Невалидно тяло (не е JSON обект)
+    r5 = client.post(
         "/orders",
         content="[1, 2, 3]",
         headers={
@@ -51,7 +61,7 @@ def test_create_order_validation(db_session: Session) -> None:
             "Content-Type": "application/json",
         },
     )
-    assert r4.status_code == 422
+    assert r5.status_code == 422
 
 
 def test_create_order_empty_cart(db_session: Session) -> None:
@@ -62,7 +72,7 @@ def test_create_order_empty_cart(db_session: Session) -> None:
         "Idempotency-Key": str(uuid.uuid4()),
     }
 
-    r = client.post("/orders", json={}, headers=headers)
+    r = client.post("/orders", json=ORDER_PAYLOAD, headers=headers)
     assert r.status_code == 409
     body = r.json()
     assert body["detail"]["code"] == "CART_EMPTY"
@@ -78,7 +88,7 @@ def test_create_order_inactive_product(db_session: Session) -> None:
         "Authorization": f"Bearer {token}",
         "Idempotency-Key": str(uuid.uuid4()),
     }
-    r = client.post("/orders", json={}, headers=headers)
+    r = client.post("/orders", json=ORDER_PAYLOAD, headers=headers)
     assert r.status_code == 409
     body = r.json()
     assert body["detail"]["code"] == "CART_PRODUCT_UNAVAILABLE"
@@ -100,7 +110,7 @@ def test_create_order_insufficient_stock(db_session: Session) -> None:
         "Authorization": f"Bearer {token}",
         "Idempotency-Key": str(uuid.uuid4()),
     }
-    r = client.post("/orders", json={}, headers=headers)
+    r = client.post("/orders", json=ORDER_PAYLOAD, headers=headers)
     assert r.status_code == 409
     body = r.json()
     assert body["detail"]["code"] == "INSUFFICIENT_STOCK"
@@ -129,7 +139,7 @@ def test_create_order_success(db_session: Session) -> None:
         "Idempotency-Key": key,
     }
 
-    r = client.post("/orders", json={}, headers=headers)
+    r = client.post("/orders", json=ORDER_PAYLOAD, headers=headers)
     assert r.status_code == 201
     data = r.json()
 
@@ -178,7 +188,7 @@ def test_order_snapshot_preserved_after_catalog_changes(
 
     key = str(uuid.uuid4())
     headers = {"Authorization": f"Bearer {token}", "Idempotency-Key": key}
-    r = client.post("/orders", json={}, headers=headers)
+    r = client.post("/orders", json=ORDER_PAYLOAD, headers=headers)
     assert r.status_code == 201
     order_id = r.json()["id"]
 

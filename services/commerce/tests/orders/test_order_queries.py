@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.main import app
 from tests.orders.helpers import (
+    ORDER_PAYLOAD,
     _add_to_cart,
     _create_product,
     _create_user_and_token,
@@ -18,7 +19,7 @@ def test_orders_auth_required() -> None:
     # POST /orders
     r_post = client.post(
         "/orders",
-        json={},
+        json=ORDER_PAYLOAD,
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert r_post.status_code == 401
@@ -43,7 +44,7 @@ def test_get_orders_pagination_and_sorting(db_session: Session) -> None:
         _add_to_cart(db_session, user.id, prod.id, quantity=1)
         r = client.post(
             "/orders",
-            json={},
+            json=ORDER_PAYLOAD,
             headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
         )
         assert r.status_code == 201
@@ -88,7 +89,7 @@ def test_get_order_by_id_isolation(db_session: Session) -> None:
     _add_to_cart(db_session, user_a.id, prod.id, quantity=1)
     r_create = client.post(
         "/orders",
-        json={},
+        json=ORDER_PAYLOAD,
         headers={
             "Authorization": f"Bearer {token_a}",
             "Idempotency-Key": str(uuid.uuid4()),
