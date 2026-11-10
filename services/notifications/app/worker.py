@@ -38,7 +38,13 @@ def _sanitize_error_message(exc: Exception, payload: dict[str, Any]) -> str:
 
 
 class DeliveryWorker:
-    """Обработва задачите за Email и SMS независимо една от друга с лезинг и повторни опити."""
+    """Обработва задачите за Email и SMS независимо с последователен захват преди изпращане.
+
+    Всяко следващо задание се заключва непосредствено преди изпращането му (limit=1),
+    така че времето за бавни предходни доставки не изяжда срока на захвата (lease) на
+    следващите задачи в партидата. Ако SMTP приеме писмото миг преди падане на процеса
+    преди commit на статуса 'sent', остава валидно документираното at-least-once повторение.
+    """
 
     def __init__(
         self,
@@ -49,10 +55,19 @@ class DeliveryWorker:
         email_retry_delay_seconds: int | None = None,
         sms_retry_delay_seconds: int | None = None,
         delivery_lease_seconds: int | None = None,
+        provider_timeout_seconds: float | None = None,
+        clock: Callable[[], datetime.datetime] | None = None,
     ) -> None:
+        if provider_timeout_seconds is not None and provider_timeout_seconds <= 0:
+            raise ValueError("provider_timeout_seconds must be positive")
+
         self._session_factory = session_factory
-        self._email_sender = email_sender or EmailSender()
-        self._sms_sender = sms_sender or TwilioSmsProvider()
+        self._email_sender = email_sender or EmailSender(
+            timeout=provider_timeout_seconds
+        )
+        self._sms_sender = sms_sender or TwilioSmsProvider(
+            timeout=provider_timeout_seconds
+        )
         self._email_retry_delay_seconds = (
             email_retry_delay_seconds
             if email_retry_delay_seconds is not None
@@ -68,6 +83,32 @@ class DeliveryWorker:
             if delivery_lease_seconds is not None
             else settings.delivery_lease_seconds
         )
+        self._clock = clock or (lambda: datetime.datetime.now(datetime.UTC))
+
+        self._validate_provider_timeouts_against_lease(provider_timeout_seconds)
+
+    def _validate_provider_timeouts_against_lease(
+        self, explicit_timeout: float | None
+    ) -> None:
+        timeouts: list[float] = []
+        if explicit_timeout is not None:
+            timeouts.append(float(explicit_timeout))
+        for sender in (self._email_sender, self._sms_sender):
+            raw_timeout = getattr(sender, "timeout", None)
+            if isinstance(raw_timeout, (int, float)) and not isinstance(
+                raw_timeout, bool
+            ):
+                if raw_timeout <= 0:
+                    raise ValueError("Provider timeout must be positive")
+                timeouts.append(float(raw_timeout))
+
+        if timeouts:
+            max_timeout = max(timeouts)
+            if self._delivery_lease_seconds < max_timeout * 3:
+                raise ValueError(
+                    "delivery_lease_seconds must be at least 3x provider timeout "
+                    f"({self._delivery_lease_seconds}s < {max_timeout * 3:.1f}s)"
+                )
 
     def _deliver_email(self, claimed: ClaimedDelivery) -> str | None:
         to_email = str(claimed.payload.get("customer_email") or "")
@@ -128,26 +169,35 @@ class DeliveryWorker:
         limit: int = 20,
         now: datetime.datetime | None = None,
     ) -> dict[str, int]:
-        """Заключва партида готови задачи, доставя ги извън БД транзакцията и записва статуса."""
-        claim_time = now or datetime.datetime.now(datetime.UTC)
-        with self._session_factory() as session:
-            repo = NotificationRepository(session)
-            claimed_tasks = repo.claim_due_deliveries(
-                limit=limit,
-                lease_seconds=self._delivery_lease_seconds,
-                now=claim_time,
-            )
-            session.commit()
-
+        """Последователно заключва по 1 задача непосредствено преди изпращане и я финализира."""
         stats = {
-            "claimed": len(claimed_tasks),
+            "claimed": 0,
             "sent": 0,
             "retried": 0,
             "failed": 0,
             "stale": 0,
         }
+        attempted_ids: set[int] = set()
 
-        for task in claimed_tasks:
+        while len(attempted_ids) < limit:
+            claim_time = now if now is not None else self._clock()
+            with self._session_factory() as session:
+                repo = NotificationRepository(session)
+                claimed_batch = repo.claim_due_deliveries(
+                    limit=1,
+                    lease_seconds=self._delivery_lease_seconds,
+                    now=claim_time,
+                    exclude_delivery_ids=attempted_ids,
+                )
+                session.commit()
+
+            if not claimed_batch:
+                break
+
+            task = claimed_batch[0]
+            attempted_ids.add(task.delivery_id)
+            stats["claimed"] += 1
+
             try:
                 if task.channel == "email":
                     provider_id = self._deliver_email(task)
@@ -162,7 +212,7 @@ class DeliveryWorker:
                     if task.channel == "email"
                     else self._sms_retry_delay_seconds
                 )
-                finalize_time = now or datetime.datetime.now(datetime.UTC)
+                finalize_time = now if now is not None else self._clock()
                 with self._session_factory() as session:
                     repo = NotificationRepository(session)
                     outcome = repo.finalize_delivery_failure(
@@ -193,7 +243,7 @@ class DeliveryWorker:
                     stats["stale"] += 1
                 continue
 
-            finalize_time = now or datetime.datetime.now(datetime.UTC)
+            finalize_time = now if now is not None else self._clock()
             with self._session_factory() as session:
                 repo = NotificationRepository(session)
                 finalized = repo.finalize_delivery_success(

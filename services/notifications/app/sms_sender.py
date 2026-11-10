@@ -81,6 +81,8 @@ class TwilioSmsProvider:
         self.auth_token = auth_token or settings.sms_auth_token
         self.from_number = from_number or settings.sms_from_number
         self.timeout = timeout if timeout is not None else settings.sms_timeout_seconds
+        if self.timeout <= 0:
+            raise ValueError("SMS timeout must be positive")
         self._transport = transport
 
     def send_sms(
@@ -104,7 +106,7 @@ class TwilioSmsProvider:
 
         base_url = self.api_base_url or "https://api.twilio.com"
         endpoint = f"{base_url}/2010-04-01/Accounts/{self.account_sid}/Messages.json"
-        client_kwargs: dict[str, object] = {"timeout": self.timeout}
+        client_kwargs: dict[str, object] = {"timeout": httpx.Timeout(self.timeout)}
         if self._transport is not None:
             client_kwargs["transport"] = self._transport
 

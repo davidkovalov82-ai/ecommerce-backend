@@ -9,6 +9,7 @@ from typing import Any
 
 import pika
 import pika.exceptions
+from sqlalchemy.exc import DataError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -136,14 +137,13 @@ class RabbitMQEventConsumer:
     ) -> None:
         """Обработва единично AMQP съобщение: валидира -> DB commit -> basic_ack."""
         # 1. Стриктна валидация на контракта и версията; невалидните -> DLQ без повторение
+        # Важно: не извеждаме в лога сурови event_id, event_type или event_version от невалидно съобщение
         try:
             event = parse_and_validate_event(body)
         except EventContractError as exc:
             logger.warning(
-                "Dead-lettering invalid event event_id=%s event_type=%s event_version=%s reason=%s",
-                exc.event_id,
-                exc.event_type,
-                exc.event_version,
+                "Dead-lettering invalid event delivery_tag=%s reason=%s",
+                getattr(method, "delivery_tag", None),
                 exc.reason,
             )
             channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
@@ -159,9 +159,20 @@ class RabbitMQEventConsumer:
                     sms_max_attempts=self.sms_max_attempts,
                 )
                 session.commit()
+        except DataError as exc:
+            logger.warning(
+                "Dead-lettering DB DataError event_id=%s event_type=%s order_id=%s shipment_id=%s error=%s",
+                event.event_id,
+                event.event_type,
+                event.order_id,
+                event.shipment_id,
+                _sanitize_error(exc),
+            )
+            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            return
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "DB failure while ingesting event_id=%s event_type=%s order_id=%s shipment_id=%s error=%s",
+                "Temporary DB failure while ingesting event_id=%s event_type=%s order_id=%s shipment_id=%s error=%s",
                 event.event_id,
                 event.event_type,
                 event.order_id,

@@ -29,8 +29,8 @@ if str(NOTIFICATIONS_DIR) not in sys.path:
 
 os.environ["DB_HOST"] = "127.0.0.1"
 os.environ["DB_PORT"] = "55432"
-os.environ["DB_USER"] = "notifications"
-os.environ["DB_PASSWORD"] = "notifications"
+os.environ["DB_USER"] = "notifications_app"
+os.environ["DB_PASSWORD"] = "notifications_app"
 os.environ["DB_NAME"] = "notifications"
 os.environ["RABBITMQ_HOST"] = "127.0.0.1"
 os.environ["RABBITMQ_PORT"] = "55672"
@@ -47,13 +47,11 @@ MAILPIT_API_URL = "http://127.0.0.1:58025"
 SMS_MOCK_URL = "http://127.0.0.1:58080"
 STRIPE_WEBHOOK_SECRET = "whsec_k4_e2e_secret_stripe_commerce_32_bytes_ok"
 
-COMMERCE_DSN = "postgresql://commerce:commerce@127.0.0.1:55432/commerce"
+COMMERCE_DSN = "postgresql://commerce_app:commerce_app@127.0.0.1:55432/commerce"
 NOTIFICATIONS_DSN = (
-    "postgresql://notifications:notifications@127.0.0.1:55432/notifications"
+    "postgresql://notifications_app:notifications_app@127.0.0.1:55432/notifications"
 )
-NOTIFICATIONS_SQLALCHEMY_URL = (
-    "postgresql+psycopg://notifications:notifications@127.0.0.1:55432/notifications"
-)
+NOTIFICATIONS_SQLALCHEMY_URL = "postgresql+psycopg://notifications_app:notifications_app@127.0.0.1:55432/notifications"
 
 DEFAULT_ADDRESS = {
     "recipient_name": "Иван Петров",
@@ -287,17 +285,52 @@ def get_rabbitmq_queue_count(queue_name: str) -> int:
         conn.close()
 
 
+def _assert_db_access_denied(dsn: str) -> None:
+    """Проверява изричен PostgreSQL отказ в достъпа (42501 / permission denied), не срив на мрежата."""
+    try:
+        with psycopg.connect(dsn, connect_timeout=3):
+            raise AssertionError(
+                f"Expected permission denied for {dsn}, connection succeeded!"
+            )
+    except psycopg.OperationalError as exc:
+        msg = str(exc).lower()
+        sqlstate = getattr(exc, "sqlstate", None)
+        assert sqlstate == "42501" or "permission denied for database" in msg, (
+            f"Expected PostgreSQL permission denied (42501), got connection error: {exc!r}"
+        )
+
+
 def verify_db_isolation() -> None:
     print(
-        "-> [Isolation] Checking role 'notifications' cannot connect to 'commerce' DB..."
+        "-> [Isolation] Checking non-superuser roles commerce_app and notifications_app cannot read each other's DB..."
     )
-    bad_dsn = "postgresql://notifications:notifications@127.0.0.1:55432/commerce"
+    with psycopg.connect(COMMERCE_DSN, connect_timeout=3) as conn, conn.cursor() as cur:
+        cur.execute("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+        assert cur.fetchone()[0] is False
+        cur.execute("SELECT COUNT(*) FROM order_outbox_events")
+        assert cur.fetchone() is not None
+
+    with (
+        psycopg.connect(NOTIFICATIONS_DSN, connect_timeout=3) as conn,
+        conn.cursor() as cur,
+    ):
+        cur.execute("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+        assert cur.fetchone()[0] is False
+        cur.execute("SELECT COUNT(*) FROM inbox_events")
+        assert cur.fetchone() is not None
+
+    _assert_db_access_denied(
+        "postgresql://notifications_app:notifications_app@127.0.0.1:55432/commerce"
+    )
+    _assert_db_access_denied(
+        "postgresql://commerce_app:commerce_app@127.0.0.1:55432/notifications"
+    )
     try:
-        with psycopg.connect(bad_dsn, connect_timeout=3):
-            raise AssertionError(
-                "notifications role MUST NOT access commerce database!"
-            )
-    except psycopg.OperationalError:
+        _assert_db_access_denied(
+            "postgresql://notifications_app:notifications_app@127.0.0.1:59999/commerce"
+        )
+        raise AssertionError("Closed port should not pass access-denied check")
+    except AssertionError:
         pass
 
 
@@ -760,6 +793,52 @@ def verify_dlq_and_legacy_no_phone() -> None:
             mandatory=True,
         )
 
+        # order_id = 2**63 (над PostgreSQL BIGINT) -> DLQ
+        bigint_overflow_msg = json.dumps(
+            {
+                "event_id": str(uuid.uuid4()),
+                "event_type": "order.paid",
+                "event_version": 1,
+                "occurred_at": datetime.datetime.now(datetime.UTC).isoformat(),
+                "producer": "commerce",
+                "data": {
+                    "order_id": 2**63,
+                    "customer_email": "bad@example.com",
+                    "total_minor": 100,
+                    "currency": "EUR",
+                },
+            }
+        ).encode("utf-8")
+        ch.basic_publish(
+            exchange="commerce.events",
+            routing_key="order.paid",
+            body=bigint_overflow_msg,
+            properties=pika.BasicProperties(
+                delivery_mode=2, content_type="application/json"
+            ),
+            mandatory=True,
+        )
+
+        # Обект с тестова контактна метка вместо event_version -> DLQ и без теч в логовете
+        marker_contact = "e2e-poison-marker@example.com"
+        poison_obj_msg = json.dumps(
+            {
+                "event_id": f"raw-{marker_contact}",
+                "event_type": f"raw-type-{marker_contact}",
+                "event_version": {"contact": marker_contact},
+                "data": {"order_id": 1},
+            }
+        ).encode("utf-8")
+        ch.basic_publish(
+            exchange="commerce.events",
+            routing_key="order.paid",
+            body=poison_obj_msg,
+            properties=pika.BasicProperties(
+                delivery_mode=2, content_type="application/json"
+            ),
+            mandatory=True,
+        )
+
         # Старо събитие без полето customer_phone
         legacy_msg = json.dumps(
             {
@@ -789,11 +868,30 @@ def verify_dlq_and_legacy_no_phone() -> None:
         conn.close()
 
     wait_until(
-        "Unknown event_version dead-lettered into notifications.events.dlq",
+        "Invalid / overflow / unknown-version events dead-lettered into notifications.events.dlq",
         lambda: (
-            True if get_rabbitmq_queue_count("notifications.events.dlq") >= 1 else None
+            True if get_rabbitmq_queue_count("notifications.events.dlq") >= 3 else None
         ),
     )
+    logs_res = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-p",
+            COMPOSE_PROJECT,
+            "-f",
+            COMPOSE_FILE,
+            "logs",
+            "--no-color",
+            "notifications-e2e",
+        ],
+        cwd=ROOT_DIR,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "e2e-poison-marker@example.com" not in logs_res.stdout
+    assert "raw-" not in logs_res.stdout
     wait_until(
         "Legacy event email delivered",
         lambda: m if len(m := get_mailpit_messages(legacy_email)) == 1 else None,

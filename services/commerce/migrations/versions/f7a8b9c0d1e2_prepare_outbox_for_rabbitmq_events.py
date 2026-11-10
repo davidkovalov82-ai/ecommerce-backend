@@ -4,14 +4,18 @@ Revision ID: f7a8b9c0d1e2
 Revises: e6f7a8b9c0d1
 Create Date: 2026-11-10 08:30:00.000000
 
-Migration policy:
-- Preserves historical outbox semantics: rows already delivered via the legacy
-  Commerce SMTP outbox worker (`status = 'sent'`) are converted to `'legacy_sent'`
-  so they are NEVER republished or emailed again after cutover.
-- Unsent rows (`status = 'pending'`) stay `'pending'` so the RabbitMQ outbox
-  publisher delivers them to the Notifications service.
-- Assigns stable `event_id` (UUID), `event_version = 1`, `occurred_at = created_at`,
-  and adds `published_at`.
+Migration & Downgrade policy:
+- Upgrade preserves historical outbox semantics: rows already delivered via the
+  legacy Commerce SMTP outbox worker (`status = 'sent'`) are converted to
+  `'legacy_sent'` so they are NEVER republished or emailed again after cutover.
+  Unsent rows (`status = 'pending'`) stay `'pending'` for the RabbitMQ publisher.
+- Downgrade is explicitly blocked before any schema change if any row currently
+  has `status = 'published'`: Commerce cannot prove from its own database
+  whether those RabbitMQ-published events have already been delivered by the
+  independent Notifications service. Converting `'published'` silently to `'sent'`
+  or `'pending'` would either hide undelivered notifications or risk duplicates.
+  If no `'published'` rows exist, downgrade safely converts `'legacy_sent'` back
+  to `'sent'` (preserving original `processed_at`) and removes the K4 columns.
 """
 
 from collections.abc import Sequence
@@ -105,7 +109,19 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Връща схемата на order_outbox_events, запазвайки изпратените и публикувани събития като 'sent'."""
+    """Връща схемата безопасно, като отказва откат при наличие на 'published' събития."""
+    bind = op.get_bind()
+    published_count = bind.execute(
+        sa.text("SELECT COUNT(*) FROM order_outbox_events WHERE status = 'published'")
+    ).scalar()
+    if published_count and published_count > 0:
+        raise RuntimeError(
+            f"Cannot downgrade migration {revision}: found {published_count} 'published' "
+            "events in order_outbox_events whose delivery by the independent Notifications "
+            "service cannot be proven from the Commerce database. "
+            "Downgrade is blocked before schema changes to protect delivery guarantees."
+        )
+
     op.drop_constraint(
         "uq_order_outbox_event_id",
         "order_outbox_events",
@@ -119,9 +135,8 @@ def downgrade() -> None:
     op.execute(
         sa.text(
             "UPDATE order_outbox_events "
-            "SET status = 'sent', "
-            "    processed_at = COALESCE(processed_at, published_at, now()) "
-            "WHERE status IN ('legacy_sent', 'published')"
+            "SET status = 'sent' "
+            "WHERE status = 'legacy_sent'"
         )
     )
     op.create_check_constraint(

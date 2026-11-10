@@ -62,6 +62,18 @@ class Settings(BaseSettings):
     worker_poll_interval_seconds: float = 0.5
 
     @model_validator(mode="after")
+    def validate_timeouts_and_lease(self) -> "Settings":
+        """Съгласува таймаутите към провайдърите със срока на захвата (lease)."""
+        if self.smtp_timeout_seconds <= 0 or self.sms_timeout_seconds <= 0:
+            raise ValueError("Provider timeouts must be positive")
+        max_provider_timeout = max(self.smtp_timeout_seconds, self.sms_timeout_seconds)
+        if self.delivery_lease_seconds < max_provider_timeout * 3:
+            raise ValueError(
+                "DELIVERY_LEASE_SECONDS must be at least 3x the maximum provider timeout"
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_sms_configuration(self) -> "Settings":
         """Гарантира сигурна конфигурация на SMS провайдъра в live и test режим."""
         if self.sms_mode == "live":

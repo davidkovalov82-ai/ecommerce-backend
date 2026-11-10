@@ -43,6 +43,8 @@ class EmailSender:
         self.port = port or settings.smtp_port
         self.from_email = from_email or settings.smtp_from
         self.timeout = timeout if timeout is not None else settings.smtp_timeout_seconds
+        if self.timeout <= 0:
+            raise ValueError("SMTP timeout must be positive")
 
     def send_order_paid_email(
         self,

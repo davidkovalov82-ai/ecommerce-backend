@@ -18,28 +18,24 @@ from pydantic import (
 )
 
 SUPPORTED_EVENT_VERSION = 1
+PG_INT_MAX = 2**31 - 1
+PG_BIGINT_MAX = 2**63 - 1
 
 
 class EventContractError(Exception):
-    """Базова грешка при невалидно или неподдържано събитие (подлежи на DLQ)."""
+    """Базова грешка при невалидно или неподдържано събитие (подлежи на DLQ).
 
-    def __init__(
-        self,
-        reason: str,
-        *,
-        event_id: str | None = None,
-        event_type: str | None = None,
-        event_version: Any = None,
-    ) -> None:
+    Не съхранява сурови стойности на event_id, event_type или event_version от
+    недоверени невалидни съобщения, за да не изтичат контакти или произволни низове в логовете.
+    """
+
+    def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
-        self.event_id = event_id
-        self.event_type = event_type
-        self.event_version = event_version
 
 
 class InvalidEventContract(EventContractError):
-    """Съобщението не е валиден JSON или нарушава схемата на версията."""
+    """Съобщението не е валиден JSON или нарушава схемата и границите за БД."""
 
 
 class UnsupportedEventVersion(EventContractError):
@@ -57,13 +53,22 @@ def _normalize_optional_contact(value: Any) -> Any:
     return value
 
 
+def _safe_error_field(exc: ValidationError) -> str:
+    errors = exc.errors()
+    if not errors:
+        return "unknown"
+    loc = errors[0].get("loc") or ()
+    parts = [str(part) for part in loc if isinstance(part, (str, int))]
+    return ".".join(parts)[:64] or "unknown"
+
+
 class OrderPaidData(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    order_id: Annotated[int, StrictInt()] = Field(gt=0)
+    order_id: Annotated[int, StrictInt()] = Field(gt=0, le=PG_BIGINT_MAX)
     customer_email: EmailStr | None = None
     customer_phone: StrictStr | None = None
-    total_minor: Annotated[int, StrictInt()] = Field(ge=0)
+    total_minor: Annotated[int, StrictInt()] = Field(ge=0, le=PG_BIGINT_MAX)
     currency: StrictStr = Field(min_length=3, max_length=3)
     created_at: str | None = None
 
@@ -81,17 +86,19 @@ class OrderPaidData(BaseModel):
 class ShipmentItemData(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    product_id: Annotated[int, StrictInt()] = Field(gt=0)
+    product_id: Annotated[int, StrictInt()] = Field(gt=0, le=PG_INT_MAX)
     product_title: StrictStr = Field(min_length=1, max_length=255)
-    quantity: Annotated[int, StrictInt()] = Field(gt=0)
+    quantity: Annotated[int, StrictInt()] = Field(gt=0, le=PG_INT_MAX)
 
 
 class ShipmentShippedData(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    order_id: Annotated[int, StrictInt()] = Field(gt=0)
-    shipment_id: Annotated[int, StrictInt()] = Field(gt=0)
-    seller_id: Annotated[int, StrictInt()] | None = Field(default=None, gt=0)
+    order_id: Annotated[int, StrictInt()] = Field(gt=0, le=PG_BIGINT_MAX)
+    shipment_id: Annotated[int, StrictInt()] = Field(gt=0, le=PG_BIGINT_MAX)
+    seller_id: Annotated[int, StrictInt()] | None = Field(
+        default=None, gt=0, le=PG_INT_MAX
+    )
     customer_email: EmailStr | None = None
     customer_phone: StrictStr | None = None
     items: list[ShipmentItemData] = Field(min_length=1)
@@ -142,8 +149,8 @@ class ValidatedEvent:
 def parse_and_validate_event(raw_body: bytes) -> ValidatedEvent:
     """Разчита суровите байтове на AMQP съобщението и валидира контракта строго.
 
-    При невалиден JSON, липсващи полета, непозната версия или тип хвърля
-    EventContractError без изтичане на лични контакти в съобщението.
+    При невалиден JSON, препълване извън БД типовете, непозната версия или тип
+    хвърля EventContractError без изтичане на сурови входни стойности или контакти.
     """
     try:
         raw_obj = json.loads(raw_body.decode("utf-8"))
@@ -153,36 +160,19 @@ def parse_and_validate_event(raw_body: bytes) -> ValidatedEvent:
     if not isinstance(raw_obj, dict):
         raise InvalidEventContract("envelope_must_be_object")
 
-    raw_event_id = raw_obj.get("event_id")
-    safe_event_id = raw_event_id if isinstance(raw_event_id, str) else None
-    raw_event_type = raw_obj.get("event_type")
-    safe_event_type = raw_event_type if isinstance(raw_event_type, str) else None
     raw_event_version = raw_obj.get("event_version")
 
-    # Проверка на версията преди останалата валидация на payload
+    # Проверка на версията преди останалата валидация на payload (без логване на сурови стойности)
     if isinstance(raw_event_version, bool) or not isinstance(raw_event_version, int):
-        raise InvalidEventContract(
-            "invalid_event_version_type",
-            event_id=safe_event_id,
-            event_type=safe_event_type,
-            event_version=raw_event_version,
-        )
+        raise InvalidEventContract("invalid_event_version_type")
     if raw_event_version != SUPPORTED_EVENT_VERSION:
-        raise UnsupportedEventVersion(
-            f"unsupported_event_version:{raw_event_version}",
-            event_id=safe_event_id,
-            event_type=safe_event_type,
-            event_version=raw_event_version,
-        )
+        raise UnsupportedEventVersion("unsupported_event_version")
 
     try:
         envelope = EventEnvelope.model_validate(raw_obj)
     except ValidationError as exc:
         raise InvalidEventContract(
-            f"invalid_envelope:{exc.errors()[0].get('loc')}",
-            event_id=safe_event_id,
-            event_type=safe_event_type,
-            event_version=raw_event_version,
+            f"invalid_envelope:{_safe_error_field(exc)}"
         ) from exc
 
     if envelope.event_type == "order.paid":
@@ -190,10 +180,7 @@ def parse_and_validate_event(raw_body: bytes) -> ValidatedEvent:
             paid_data = OrderPaidData.model_validate(envelope.data)
         except ValidationError as exc:
             raise InvalidEventContract(
-                f"invalid_order_paid_payload:{exc.errors()[0].get('loc')}",
-                event_id=envelope.event_id,
-                event_type=envelope.event_type,
-                event_version=envelope.event_version,
+                f"invalid_order_paid_payload:{_safe_error_field(exc)}"
             ) from exc
 
         normalized_payload = {
@@ -223,10 +210,7 @@ def parse_and_validate_event(raw_body: bytes) -> ValidatedEvent:
             shipped_data = ShipmentShippedData.model_validate(envelope.data)
         except ValidationError as exc:
             raise InvalidEventContract(
-                f"invalid_shipment_shipped_payload:{exc.errors()[0].get('loc')}",
-                event_id=envelope.event_id,
-                event_type=envelope.event_type,
-                event_version=envelope.event_version,
+                f"invalid_shipment_shipped_payload:{_safe_error_field(exc)}"
             ) from exc
 
         normalized_payload = {
@@ -258,9 +242,4 @@ def parse_and_validate_event(raw_body: bytes) -> ValidatedEvent:
             customer_phone=shipped_data.customer_phone,
         )
 
-    raise UnsupportedEventType(
-        f"unsupported_event_type:{envelope.event_type}",
-        event_id=envelope.event_id,
-        event_type=envelope.event_type,
-        event_version=envelope.event_version,
-    )
+    raise UnsupportedEventType("unsupported_event_type")

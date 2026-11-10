@@ -331,14 +331,22 @@ def test_k4_outbox_migration_preserves_legacy_sent_and_pending_events() -> None:
     from app.modules.orders.publisher import EventPublisher
 
     temp_db_name = "commerce_temp_k4_outbox_mig_test"
-    admin_engine = create_engine(settings.database_url, isolation_level="AUTOCOMMIT")
+    admin_engine = create_engine(
+        settings.admin_database_url, isolation_level="AUTOCOMMIT"
+    )
 
     with admin_engine.connect() as conn:
         conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
         conn.execute(text(f"CREATE DATABASE {temp_db_name}"))
 
+    admin_user = settings.db_admin_user or settings.db_user
+    admin_password = (
+        settings.db_admin_password
+        if settings.db_admin_password is not None
+        else settings.db_password
+    )
     temp_db_url = (
-        f"postgresql+psycopg://{settings.db_user}:{settings.db_password}"
+        f"postgresql+psycopg://{admin_user}:{admin_password}"
         f"@{settings.db_host}:{settings.db_port}/{temp_db_name}"
     )
 
@@ -441,20 +449,132 @@ def test_k4_outbox_migration_preserves_legacy_sent_and_pending_events() -> None:
         ]
         assert published_order_ids == [9502, 9502]
 
-        # 4. Безопасен downgrade до e6f7a8b9c0d1 връща статуса на 'sent' без загуба
-        command.downgrade(alembic_cfg, "e6f7a8b9c0d1")
+        # 4. Наличие на 'published' (103, 104) трябва да БЛОКИРА downgrade преди промяна на схемата!
+        with pytest.raises(
+            Exception,
+            match="Cannot downgrade migration f7a8b9c0d1e2: found 2 'published' events",
+        ):
+            command.downgrade(alembic_cfg, "e6f7a8b9c0d1")
+
+        # Данните и схемата остават напълно непокътнати след отказания откат
         with Session(temp_engine) as session:
+            col_exists = session.execute(
+                text(
+                    "SELECT EXISTS ("
+                    "  SELECT 1 FROM information_schema.columns "
+                    "  WHERE table_name = 'order_outbox_events' AND column_name = 'published_at'"
+                    ")"
+                )
+            ).scalar()
+            assert col_exists is True
+
             statuses = dict(
                 session.execute(
                     text("SELECT id, status FROM order_outbox_events ORDER BY id")
                 ).all()
             )
             assert statuses == {
-                101: "sent",
-                102: "sent",
-                103: "sent",
-                104: "sent",
+                101: "legacy_sent",
+                102: "legacy_sent",
+                103: "published",
+                104: "published",
             }
+    finally:
+        temp_engine.dispose()
+        with admin_engine.connect() as conn:
+            conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
+        admin_engine.dispose()
+
+
+def test_k4_outbox_migration_allows_safe_downgrade_without_published_events() -> None:
+    """Когато няма 'published' събития, downgrade връща 'legacy_sent' -> 'sent' и пази 'pending'."""
+    temp_db_name = "commerce_temp_k4_outbox_downgrade_ok_test"
+    admin_engine = create_engine(
+        settings.admin_database_url, isolation_level="AUTOCOMMIT"
+    )
+
+    with admin_engine.connect() as conn:
+        conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
+        conn.execute(text(f"CREATE DATABASE {temp_db_name}"))
+
+    admin_user = settings.db_admin_user or settings.db_user
+    admin_password = (
+        settings.db_admin_password
+        if settings.db_admin_password is not None
+        else settings.db_password
+    )
+    temp_db_url = (
+        f"postgresql+psycopg://{admin_user}:{admin_password}"
+        f"@{settings.db_host}:{settings.db_port}/{temp_db_name}"
+    )
+
+    temp_engine = create_engine(temp_db_url)
+    try:
+        alembic_cfg = Config(ALEMBIC_INI_PATH)
+        alembic_cfg.set_main_option("sqlalchemy.url", temp_db_url)
+
+        # 1. Наливане на данни в К4 схема без 'published' записи (само 'legacy_sent' и 'pending')
+        command.upgrade(alembic_cfg, "head")
+        with Session(temp_engine) as session:
+            session.execute(
+                text(
+                    "INSERT INTO users (id, email, password_hash, role) "
+                    "VALUES (961, 'safe_dg@example.com', 'h1', 'customer')"
+                )
+            )
+            session.execute(
+                text(
+                    "INSERT INTO orders (id, user_id, status, currency, total_minor, idempotency_key) VALUES "
+                    "(9601, 961, 'paid', 'EUR', 1500, 'idemp-dg-1'), "
+                    "(9602, 961, 'paid', 'EUR', 3000, 'idemp-dg-2')"
+                )
+            )
+            session.execute(
+                text(
+                    "INSERT INTO order_outbox_events "
+                    "(id, event_id, event_version, order_id, event_type, payload, status, processed_at) VALUES "
+                    "(201, '11111111-1111-4111-8111-111111111111', 1, 9601, 'order.paid', "
+                    "'{\"order_id\": 9601}', 'legacy_sent', '2026-11-08 10:00:00+00'), "
+                    "(202, '22222222-2222-4222-8222-222222222222', 1, 9602, 'order.paid', "
+                    "'{\"order_id\": 9602}', 'pending', NULL)"
+                )
+            )
+            session.commit()
+
+        # 2. Разрешен downgrade до e6f7a8b9c0d1
+        command.downgrade(alembic_cfg, "e6f7a8b9c0d1")
+
+        with Session(temp_engine) as session:
+            rows = session.execute(
+                text(
+                    "SELECT id, status, processed_at FROM order_outbox_events ORDER BY id"
+                )
+            ).all()
+            by_id = {r.id: r for r in rows}
+            assert by_id[201].status == "sent"
+            assert by_id[201].processed_at is not None
+            assert by_id[202].status == "pending"
+            assert by_id[202].processed_at is None
+
+            col_exists = session.execute(
+                text(
+                    "SELECT EXISTS ("
+                    "  SELECT 1 FROM information_schema.columns "
+                    "  WHERE table_name = 'order_outbox_events' AND column_name = 'event_id'"
+                    ")"
+                )
+            ).scalar()
+            assert col_exists is False
+
+        # 3. Обратен upgrade до head отново превръща 'sent' -> 'legacy_sent' и пази 'pending'
+        command.upgrade(alembic_cfg, "head")
+        with Session(temp_engine) as session:
+            statuses = dict(
+                session.execute(
+                    text("SELECT id, status FROM order_outbox_events ORDER BY id")
+                ).all()
+            )
+            assert statuses == {201: "legacy_sent", 202: "pending"}
     finally:
         temp_engine.dispose()
         with admin_engine.connect() as conn:

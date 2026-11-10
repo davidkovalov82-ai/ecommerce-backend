@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     db_user: str = "commerce"
     db_password: str = "commerce"
     db_name: str = "commerce"
+    db_admin_user: str | None = None
+    db_admin_password: str | None = None
+    db_admin_name: str | None = None
 
     jwt_secret: str
     jwt_algorithm: str = "HS256"
@@ -91,6 +94,21 @@ class Settings(BaseSettings):
         return (
             f"postgresql+psycopg://{self.db_user}:{self.db_password}"
             f"@{self.db_host}:{self.db_port}/{self.db_name}"
+        )
+
+    @property
+    def admin_database_url(self) -> str:
+        """Административен URL само за управление на изолирани тестови БД/роли."""
+        admin_user = self.db_admin_user or self.db_user
+        admin_password = (
+            self.db_admin_password
+            if self.db_admin_password is not None
+            else self.db_password
+        )
+        admin_name = self.db_admin_name or self.db_name
+        return (
+            f"postgresql+psycopg://{admin_user}:{admin_password}"
+            f"@{self.db_host}:{self.db_port}/{admin_name}"
         )
 
 

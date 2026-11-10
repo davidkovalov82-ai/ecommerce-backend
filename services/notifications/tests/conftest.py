@@ -1,4 +1,4 @@
-"""Pytest фикстури за изолираната база данни на Notifications."""
+"""Pytest фикстури за изолираната тестова база и тестова роля на Notifications."""
 
 import os
 from collections.abc import Generator
@@ -19,8 +19,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config import settings
 
 TEST_DB_NAME = "notifications_test"
-TEST_ROLE_NAME = settings.db_user
-TEST_ROLE_PASSWORD = settings.db_password
+TEST_ROLE_NAME = "notifications_test_role"
+TEST_ROLE_PASSWORD = "notifications_test_role_password"
 TEST_DATABASE_URL = (
     f"postgresql+psycopg://{TEST_ROLE_NAME}:{TEST_ROLE_PASSWORD}"
     f"@{settings.db_host}:{settings.db_port}/{TEST_DB_NAME}"
@@ -38,23 +38,6 @@ TestingSessionLocal = sessionmaker(
 )
 
 
-def _ensure_notifications_role(conn) -> None:  # type: ignore[no-untyped-def]
-    """Идемпотентно създава изолирана роля notifications без права върху commerce."""
-    escaped_pw = TEST_ROLE_PASSWORD.replace("'", "''")
-    exists = conn.execute(
-        text("SELECT 1 FROM pg_roles WHERE rolname = :r"),
-        {"r": TEST_ROLE_NAME},
-    ).scalar()
-    if not exists:
-        conn.execute(
-            text(f"CREATE ROLE {TEST_ROLE_NAME} LOGIN PASSWORD '{escaped_pw}'")
-        )
-    else:
-        conn.execute(
-            text(f"ALTER ROLE {TEST_ROLE_NAME} WITH LOGIN PASSWORD '{escaped_pw}'")
-        )
-
-
 @pytest.fixture
 def session_factory() -> sessionmaker[Session]:
     """Фабрика за нови независими сесии към тестовата БД на Notifications."""
@@ -63,19 +46,25 @@ def session_factory() -> sessionmaker[Session]:
 
 @pytest.fixture(scope="session", autouse=True)
 def setup_test_database() -> Generator[None]:
-    """Инициализира notifications_test със собствена роля и реални Alembic миграции."""
+    """Инициализира notifications_test с отделна тестова роля (без да пипа работните роли)."""
     admin_engine = create_engine(
         settings.admin_database_url,
         isolation_level="AUTOCOMMIT",
     )
+    escaped_pw = TEST_ROLE_PASSWORD.replace("'", "''")
     with admin_engine.connect() as conn:
-        _ensure_notifications_role(conn)
         conn.execute(text(f"DROP DATABASE IF EXISTS {TEST_DB_NAME} WITH (FORCE)"))
-        conn.execute(text(f"CREATE DATABASE {TEST_DB_NAME} OWNER {TEST_ROLE_NAME}"))
+        conn.execute(text(f"DROP ROLE IF EXISTS {TEST_ROLE_NAME}"))
         conn.execute(
             text(
-                f"REVOKE ALL ON DATABASE {settings.db_admin_name} FROM {TEST_ROLE_NAME}"
+                f"CREATE ROLE {TEST_ROLE_NAME} "
+                f"WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '{escaped_pw}'"
             )
+        )
+        conn.execute(text(f"CREATE DATABASE {TEST_DB_NAME} OWNER {TEST_ROLE_NAME}"))
+        conn.execute(text(f"REVOKE ALL ON DATABASE {TEST_DB_NAME} FROM PUBLIC"))
+        conn.execute(
+            text(f"GRANT CONNECT, TEMP ON DATABASE {TEST_DB_NAME} TO {TEST_ROLE_NAME}")
         )
 
     alembic_cfg = Config("alembic.ini")
@@ -87,6 +76,7 @@ def setup_test_database() -> Generator[None]:
     test_engine.dispose()
     with admin_engine.connect() as conn:
         conn.execute(text(f"DROP DATABASE IF EXISTS {TEST_DB_NAME} WITH (FORCE)"))
+        conn.execute(text(f"DROP ROLE IF EXISTS {TEST_ROLE_NAME}"))
     admin_engine.dispose()
 
 

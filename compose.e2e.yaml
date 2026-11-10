@@ -4,13 +4,13 @@ services:
   db-e2e:
     image: postgres:17-alpine
     environment:
-      POSTGRES_USER: commerce
-      POSTGRES_PASSWORD: commerce
-      POSTGRES_DB: commerce
+      POSTGRES_USER: pgadmin
+      POSTGRES_PASSWORD: pgadmin_e2e_password
+      POSTGRES_DB: postgres
     ports:
       - "127.0.0.1:55432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U commerce -d commerce"]
+      test: ["CMD-SHELL", "pg_isready -U pgadmin -d postgres"]
       interval: 2s
       timeout: 3s
       retries: 15
@@ -23,17 +23,21 @@ services:
       db-e2e:
         condition: service_healthy
     environment:
-      POSTGRES_USER: commerce
-      POSTGRES_PASSWORD: commerce
-      POSTGRES_DB: commerce
+      POSTGRES_USER: pgadmin
+      POSTGRES_PASSWORD: pgadmin_e2e_password
     restart: "no"
     command:
       - sh
       - -c
       - |
-        PGPASSWORD="$$POSTGRES_PASSWORD" psql -h db-e2e -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'notifications') THEN CREATE ROLE notifications LOGIN PASSWORD 'notifications'; END IF; END \$\$;"
-        PGPASSWORD="$$POSTGRES_PASSWORD" psql -h db-e2e -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_database WHERE datname = 'notifications'" | grep -q 1 || PGPASSWORD="$$POSTGRES_PASSWORD" psql -h db-e2e -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "CREATE DATABASE notifications OWNER notifications;"
-        PGPASSWORD="$$POSTGRES_PASSWORD" psql -h db-e2e -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "REVOKE CONNECT ON DATABASE commerce FROM PUBLIC; GRANT CONNECT ON DATABASE commerce TO commerce;"
+        export PGPASSWORD="$$POSTGRES_PASSWORD"
+        psql -h db-e2e -U "$$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_roles WHERE rolname = 'commerce_app'" | grep -q 1 || psql -h db-e2e -U "$$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE commerce_app WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD 'commerce_app';"
+        psql -h db-e2e -U "$$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_roles WHERE rolname = 'notifications_app'" | grep -q 1 || psql -h db-e2e -U "$$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE notifications_app WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD 'notifications_app';"
+        psql -h db-e2e -U "$$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_database WHERE datname = 'commerce'" | grep -q 1 || psql -h db-e2e -U "$$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE commerce OWNER commerce_app;"
+        psql -h db-e2e -U "$$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_database WHERE datname = 'notifications'" | grep -q 1 || psql -h db-e2e -U "$$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE notifications OWNER notifications_app;"
+        psql -h db-e2e -U "$$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -c "REVOKE ALL ON DATABASE commerce FROM PUBLIC; GRANT CONNECT, TEMP ON DATABASE commerce TO commerce_app; REVOKE ALL ON DATABASE notifications FROM PUBLIC; GRANT CONNECT, TEMP ON DATABASE notifications TO notifications_app;"
+        psql -h db-e2e -U "$$POSTGRES_USER" -d commerce -v ON_ERROR_STOP=1 -c "ALTER SCHEMA public OWNER TO commerce_app;"
+        psql -h db-e2e -U "$$POSTGRES_USER" -d notifications -v ON_ERROR_STOP=1 -c "ALTER SCHEMA public OWNER TO notifications_app;"
 
   rabbitmq-e2e:
     image: rabbitmq:4-management-alpine
@@ -84,13 +88,13 @@ services:
       context: ./services/commerce
       dockerfile: Dockerfile
     depends_on:
-      db-e2e:
-        condition: service_healthy
+      db-init-e2e:
+        condition: service_completed_successfully
     environment:
       DB_HOST: db-e2e
       DB_PORT: "5432"
-      DB_USER: commerce
-      DB_PASSWORD: commerce
+      DB_USER: commerce_app
+      DB_PASSWORD: commerce_app
       DB_NAME: commerce
       JWT_SECRET: k4-e2e-test-jwt-secret-key-at-least-32-bytes-long!
       STRIPE_MODE: test
@@ -116,15 +120,15 @@ services:
       context: ./services/commerce
       dockerfile: Dockerfile
     depends_on:
-      db-e2e:
-        condition: service_healthy
+      db-init-e2e:
+        condition: service_completed_successfully
       commerce-api-e2e:
         condition: service_healthy
     environment:
       DB_HOST: db-e2e
       DB_PORT: "5432"
-      DB_USER: commerce
-      DB_PASSWORD: commerce
+      DB_USER: commerce_app
+      DB_PASSWORD: commerce_app
       DB_NAME: commerce
       JWT_SECRET: k4-e2e-test-jwt-secret-key-at-least-32-bytes-long!
       RABBITMQ_HOST: rabbitmq-e2e
@@ -147,8 +151,8 @@ services:
     environment:
       DB_HOST: db-e2e
       DB_PORT: "5432"
-      DB_USER: notifications
-      DB_PASSWORD: notifications
+      DB_USER: notifications_app
+      DB_PASSWORD: notifications_app
       DB_NAME: notifications
       RABBITMQ_HOST: rabbitmq-e2e
       RABBITMQ_PORT: "5672"
@@ -169,4 +173,3 @@ volumes:
   postgres_e2e_data:
   rabbitmq_e2e_data:
   mailpit_e2e_data:
-

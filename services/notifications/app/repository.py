@@ -2,6 +2,7 @@
 
 import datetime
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
@@ -182,34 +183,39 @@ class NotificationRepository:
     def claim_due_deliveries(
         self,
         *,
-        limit: int = 20,
+        limit: int = 1,
         lease_seconds: int = 60,
         now: datetime.datetime | None = None,
+        exclude_delivery_ids: Collection[int] | None = None,
     ) -> list[ClaimedDelivery]:
         """Заключва готовите за обработка или изтекли (crash recovery) задачи по канали."""
         current_time = now or datetime.datetime.now(datetime.UTC)
         self.expire_exhausted_processing_leases(now=current_time)
 
-        stmt = (
-            select(NotificationDelivery)
-            .where(
-                or_(
-                    and_(
-                        NotificationDelivery.status == "pending",
-                        NotificationDelivery.next_retry_at <= current_time,
-                        NotificationDelivery.attempt_count
-                        < NotificationDelivery.max_attempts,
-                    ),
-                    and_(
-                        NotificationDelivery.status == "processing",
-                        NotificationDelivery.locked_until.is_not(None),
-                        NotificationDelivery.locked_until <= current_time,
-                        NotificationDelivery.attempt_count
-                        < NotificationDelivery.max_attempts,
-                    ),
-                )
+        stmt = select(NotificationDelivery).where(
+            or_(
+                and_(
+                    NotificationDelivery.status == "pending",
+                    NotificationDelivery.next_retry_at <= current_time,
+                    NotificationDelivery.attempt_count
+                    < NotificationDelivery.max_attempts,
+                ),
+                and_(
+                    NotificationDelivery.status == "processing",
+                    NotificationDelivery.locked_until.is_not(None),
+                    NotificationDelivery.locked_until <= current_time,
+                    NotificationDelivery.attempt_count
+                    < NotificationDelivery.max_attempts,
+                ),
             )
-            .order_by(
+        )
+        if exclude_delivery_ids:
+            stmt = stmt.where(
+                NotificationDelivery.id.notin_(list(exclude_delivery_ids))
+            )
+
+        stmt = (
+            stmt.order_by(
                 NotificationDelivery.next_retry_at.asc(),
                 NotificationDelivery.id.asc(),
             )

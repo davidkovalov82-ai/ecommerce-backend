@@ -2,14 +2,17 @@
 
 import datetime
 import json
+import threading
 import uuid
 from unittest.mock import MagicMock
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
+from app.config import Settings
 from app.contracts import parse_and_validate_event
-from app.email_sender import EmailSenderProtocol
+from app.email_sender import EmailSender, EmailSenderProtocol
 from app.models import NotificationDelivery
 from app.repository import NotificationRepository
 from app.sms_sender import SmsDeliveryError, SmsSenderProtocol, SmsSendResult
@@ -19,6 +22,7 @@ from app.worker import DeliveryWorker
 def _ingest_paid(
     session_factory: sessionmaker,
     *,
+    order_id: int = 777,
     phone: str | None = "+359888123456",
     email: str | None = "buyer@example.com",
     email_max_attempts: int = 5,
@@ -27,7 +31,7 @@ def _ingest_paid(
 ) -> str:
     event_id = str(uuid.uuid4())
     data: dict[str, object] = {
-        "order_id": 777,
+        "order_id": order_id,
         "customer_email": email,
         "total_minor": 4500,
         "currency": "EUR",
@@ -254,3 +258,171 @@ def test_channel_max_attempts_transitions_to_failed_independently(
         assert rows["email"].status == "sent"
         assert rows["sms"].status == "failed"
         assert rows["sms"].attempt_count == 3
+
+
+def test_two_workers_with_slow_first_delivery_no_duplicate_sends(
+    session_factory: sessionmaker,
+) -> None:
+    """Детерминистичен тест с 2 воркъра и бавна първа доставка: без повторно пращане."""
+    t0 = datetime.datetime(2026, 11, 10, 10, 0, 0, tzinfo=datetime.UTC)
+    ev1 = _ingest_paid(session_factory, order_id=1001, phone=None, now=t0)
+    ev2 = _ingest_paid(session_factory, order_id=1002, phone=None, now=t0)
+
+    # 1. Първа проверка: два паралелни воркъра по време на бавна първа доставка (Worker 1 държи 1001, Worker 2 поема 1002)
+    task1_started = threading.Event()
+    allow_task1_finish = threading.Event()
+    sent_orders: list[int] = []
+    sent_lock = threading.Lock()
+
+    class _SlowEmailSenderWorker1:
+        timeout = 2.0
+
+        def send_order_paid_email(self, *, order_id: int, **_kwargs: object) -> None:
+            if order_id == 1001:
+                task1_started.set()
+                assert allow_task1_finish.wait(timeout=5.0)
+            with sent_lock:
+                sent_orders.append(order_id)
+
+        def send_shipment_shipped_email(self, **_kwargs: object) -> None:
+            pass
+
+    class _FastEmailSenderWorker2:
+        timeout = 2.0
+
+        def send_order_paid_email(self, *, order_id: int, **_kwargs: object) -> None:
+            with sent_lock:
+                sent_orders.append(order_id)
+
+        def send_shipment_shipped_email(self, **_kwargs: object) -> None:
+            pass
+
+    w1_clock_state = [t0]
+    w1 = DeliveryWorker(
+        session_factory=session_factory,
+        email_sender=_SlowEmailSenderWorker1(),
+        sms_sender=MagicMock(spec=SmsSenderProtocol),
+        delivery_lease_seconds=10,
+        clock=lambda: w1_clock_state[0],
+    )
+    w2 = DeliveryWorker(
+        session_factory=session_factory,
+        email_sender=_FastEmailSenderWorker2(),
+        sms_sender=MagicMock(spec=SmsSenderProtocol),
+        delivery_lease_seconds=10,
+        clock=lambda: t0 + datetime.timedelta(seconds=5),
+    )
+
+    w1_stats: dict[str, int] = {}
+
+    def _run_w1() -> None:
+        w1_stats.update(w1.process_once(limit=20))
+
+    t_w1 = threading.Thread(target=_run_w1)
+    t_w1.start()
+    assert task1_started.wait(timeout=5.0)
+
+    # Докато Worker 1 обработва бавната #1001, Worker 2 поема само #1002 (не пипа #1001)
+    w2_stats = w2.process_once(limit=20)
+    assert w2_stats["claimed"] == 1
+    assert w2_stats["sent"] == 1
+
+    allow_task1_finish.set()
+    t_w1.join(timeout=5.0)
+    assert not t_w1.is_alive()
+    assert w1_stats["claimed"] == 1
+    assert w1_stats["sent"] == 1
+    assert sorted(sent_orders) == [1001, 1002]
+
+    # 2. Втора проверка: последователен захват на партида с бавна първа доставка (9s при lease=10s)
+    # Доказва, че втората задача получава пресен lease при започването си, а не изтекъл от t0+10s
+    ev3 = _ingest_paid(session_factory, order_id=1003, phone=None, now=t0)
+    ev4 = _ingest_paid(session_factory, order_id=1004, phone=None, now=t0)
+
+    seq_clock = [t0]
+    task4_started = threading.Event()
+    allow_task4_finish = threading.Event()
+    seq_sent_orders: list[int] = []
+
+    class _SeqSlowSender:
+        timeout = 2.0
+
+        def send_order_paid_email(self, *, order_id: int, **_kwargs: object) -> None:
+            if order_id == 1003:
+                # Бавна първа доставка отнема 9s (при lease=10s). При стар партиден захват
+                # на 1004 му оставаше само 1s lease и на 11-тата секунда щеше да бъде откраднат!
+                seq_clock[0] = t0 + datetime.timedelta(seconds=9)
+            elif order_id == 1004:
+                seq_clock[0] = t0 + datetime.timedelta(seconds=11)
+                task4_started.set()
+                assert allow_task4_finish.wait(timeout=5.0)
+            with sent_lock:
+                seq_sent_orders.append(order_id)
+
+        def send_shipment_shipped_email(self, **_kwargs: object) -> None:
+            pass
+
+    w_seq = DeliveryWorker(
+        session_factory=session_factory,
+        email_sender=_SeqSlowSender(),
+        sms_sender=MagicMock(spec=SmsSenderProtocol),
+        delivery_lease_seconds=10,
+        clock=lambda: seq_clock[0],
+    )
+    w2_late = DeliveryWorker(
+        session_factory=session_factory,
+        email_sender=_FastEmailSenderWorker2(),
+        sms_sender=MagicMock(spec=SmsSenderProtocol),
+        delivery_lease_seconds=10,
+        clock=lambda: t0 + datetime.timedelta(seconds=11),
+    )
+
+    seq_stats: dict[str, int] = {}
+
+    def _run_seq() -> None:
+        seq_stats.update(w_seq.process_once(limit=20))
+
+    t_seq = threading.Thread(target=_run_seq)
+    t_seq.start()
+    assert task4_started.wait(timeout=5.0)
+
+    # На t0+11s (> стария общ lease от t0+10s!) задача #1004 има активен пресен lease до t0+19s
+    w2_late_stats = w2_late.process_once(limit=20)
+    assert w2_late_stats["claimed"] == 0
+    assert w2_late_stats["sent"] == 0
+
+    allow_task4_finish.set()
+    t_seq.join(timeout=5.0)
+    assert not t_seq.is_alive()
+    assert seq_stats["sent"] == 2
+    assert seq_sent_orders == [1003, 1004]
+
+    with session_factory() as s:
+        deliveries = (
+            s.execute(
+                select(NotificationDelivery).where(
+                    NotificationDelivery.event_id.in_([ev1, ev2, ev3, ev4]),
+                    NotificationDelivery.channel == "email",
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(deliveries) == 4
+        assert all(d.status == "sent" and d.attempt_count == 1 for d in deliveries)
+
+
+def test_delivery_worker_and_settings_align_provider_timeout_and_lease(
+    session_factory: sessionmaker,
+) -> None:
+    """Срокът на захвата (lease) трябва да е съгласуван (поне 3x) спрямо таймаута на провайдъра."""
+    with pytest.raises(ValueError, match="DELIVERY_LEASE_SECONDS"):
+        Settings(smtp_timeout_seconds=10.0, delivery_lease_seconds=20)
+
+    with pytest.raises(ValueError, match="delivery_lease_seconds"):
+        DeliveryWorker(
+            session_factory=session_factory,
+            email_sender=EmailSender(timeout=5.0),
+            sms_sender=MagicMock(spec=SmsSenderProtocol),
+            delivery_lease_seconds=10,
+        )

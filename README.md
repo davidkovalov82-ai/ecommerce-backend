@@ -223,7 +223,7 @@ docker compose --env-file services/commerce/.env up --build -d
 > [!NOTE]
 > **SMS адаптер**: Използва се `TwilioSmsProvider` (`services/notifications/app/sms_sender.py`), който в конфигурацията по подразбиране (`SMS_MODE=test`) работи без реални платени заявки към външен провайдър.
 >
-> **At-least-once гаранция**: Ако SMTP приеме писмото миг преди падане на worker-а, lease-ът на задачата (`processing`) изтича и друг worker ще я повтори след `DELIVERY_LEASE_SECONDS`, поради което строго еднократна доставка до крайната пощенска кутия не се обещава.
+> **Изолация на PostgreSQL роли и sequential lease**: В `compose.yaml` административната роля (`POSTGRES_ADMIN_USER`, по подразбиране `commerce` за съвместимост със съществуващия volume) само инициализира БД; `api`/`commerce-outbox` работят като не-superuser `commerce_app`, а `notifications` — като `notifications`, без достъп до чуждата БД. `DeliveryWorker` захваща по 1 задача непосредствено преди изпращане (`DELIVERY_LEASE_SECONDS >= 3 * max(SMTP_TIMEOUT_SECONDS, SMS_TIMEOUT_SECONDS)`). Ако SMTP приеме писмото миг преди падане на worker-а, lease-ът на задачата (`processing`) изтича и друг worker ще я повтори след `DELIVERY_LEASE_SECONDS`, поради което строго еднократна доставка до крайната пощенска кутия не се обещава.
 
 #### Ръчно публикуване на Outbox и пускане на Notifications локално
 
@@ -239,8 +239,8 @@ cd services/notifications && uv run alembic upgrade head && uv run python -m app
 
 #### Безопасен ред за преминаване от стария Commerce SMTP Outbox към К4
 1. Спрете стария Commerce SMTP outbox процес и изчакайте активната партида да приключи (за да няма паралелно изпращане).
-2. Приложете Alembic миграциите в `services/commerce` (`uv run alembic upgrade head`): историческите `'sent'` записи се преобразуват в `'legacy_sent'` (никога не се изпращат повторно), а `'pending'` остават чакащи.
-3. Инициализирайте ролята/БД `notifications`, приложете миграциите в `services/notifications` и стартирайте `rabbitmq` и `notifications`.
+2. Приложете Alembic миграциите в `services/commerce` (`uv run alembic upgrade head`): историческите `'sent'` записи се преобразуват в `'legacy_sent'` (никога не се изпращат повторно), а `'pending'` остават чакащи. Забележка: `alembic downgrade` на К4 миграцията `f7a8b9c0d1e2` отказва преди промяна на схемата, ако съществуват `'published'` събития (доставката им в `notifications` не може да се докаже от Commerce БД).
+3. Инициализирайте изолираните роли/БД (`commerce_app` / `notifications`), приложете миграциите в `services/notifications` и стартирайте `rabbitmq` и `notifications`.
 4. Обновете Commerce API и стартирайте новия `commerce-outbox` издател към RabbitMQ (той обработва само `'pending'`).
 
 ---
