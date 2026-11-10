@@ -339,6 +339,51 @@ class StandaloneUsersClient(UsersClient):
                 },
             )
 
+        elif (
+            path.startswith("/users/")
+            and path.endswith("/unblock")
+            and method == "POST"
+        ):
+            c, u_or_err, hdrs = _get_auth()
+            if c != 200:
+                return httpx.Response(c, json=u_or_err, headers=hdrs)
+            target_id = int(path.split("/")[2])
+            target = self.users.get(target_id)
+            if not target:
+                with self.session_factory() as s:
+                    db_u = s.get(User, target_id)
+                    if db_u:
+                        target = _MockUser(
+                            id=db_u.id,
+                            email=db_u.email,
+                            password_hash=db_u.password_hash,
+                            role=db_u.role,
+                            status=db_u.status,
+                            token_version=db_u.token_version,
+                            display_name=db_u.display_name,
+                        )
+                        self.users[target.id] = target
+                        self.email_map[target.email.lower()] = target.id
+            if target:
+                target.status = "active"
+                target.token_version += 1
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": target.id,
+                        "action": "unblocked",
+                        "status": "active",
+                        "user_id": target.id,
+                    },
+                    headers={"content-type": "application/json"},
+                )
+            return httpx.Response(
+                404,
+                json={
+                    "detail": {"code": "USER_NOT_FOUND", "message": "User not found"}
+                },
+            )
+
         return httpx.Response(404)
 
 
@@ -446,73 +491,287 @@ def test_new_buyer_registers_via_public_url_and_places_order_without_commerce_us
     db_session: Session,
 ) -> None:
     """2. Нов купувач се регистрира, използва количка и оформя поръчка без запис в Commerce users."""
-    email = "new_standalone_buyer@example.com"
-    password = "NewBuyerSecurePassword123!"
+    password = "SecurePassword123!"
 
-    # 1. Регистрация през публичния URL
-    reg_res = client.post("/users", json={"email": email, "password": password})
-    assert reg_res.status_code == 201, reg_res.text
-    new_user_id = reg_res.json()["id"]
+    # 1. Регистрация на нов продавач през публичния URL
+    seller_email = "real_marketplace_seller@example.com"
+    reg_seller = client.post(
+        "/users", json={"email": seller_email, "password": password}
+    )
+    assert reg_seller.status_code == 201, reg_seller.text
+    assert reg_seller.json()["id"] > 0
 
-    # 2. Уверяваме се, че в старата таблица users в Commerce НЯМА запис за този потребител
-    user_in_commerce = db_session.execute(
-        text("SELECT id FROM users WHERE email = :email"),
-        {"email": email},
-    ).scalar_one_or_none()
-    assert user_in_commerce is None, (
-        "В Commerce users не трябва да се създава shadow ред!"
+    # 2. Вход на продавача и създаване на артикул през API
+    seller_login = client.post(
+        "/auth/login", json={"email": seller_email, "password": password}
+    )
+    assert seller_login.status_code == 200
+    seller_token = seller_login.json()["access_token"]
+    seller_headers = {"Authorization": f"Bearer {seller_token}"}
+
+    prod_res = client.post(
+        "/products",
+        headers=seller_headers,
+        json={
+            "title": "Валиден артикул",
+            "price_minor": 1500,
+            "currency": "EUR",
+            "stock": 20,
+        },
+    )
+    assert prod_res.status_code == 201, prod_res.text
+    valid_product_id = prod_res.json()["id"]
+
+    # 3. Регистрация и вход на купувача през публичните ендпойнти
+    buyer_email = "new_standalone_buyer@example.com"
+    reg_buyer = client.post("/users", json={"email": buyer_email, "password": password})
+    assert reg_buyer.status_code == 201, reg_buyer.text
+    new_user_id = reg_buyer.json()["id"]
+
+    # 4. В старата таблица users в Commerce НЯМА запис за продавача или купувача
+    users_in_commerce = db_session.execute(
+        text("SELECT id FROM users WHERE email IN (:b, :s)"),
+        {"b": buyer_email, "s": seller_email},
+    ).fetchall()
+    assert users_in_commerce == [], (
+        "В Commerce users не трябва да се създават shadow редове!"
     )
 
-    # 3. Вход през публичния вход
-    login_res = client.post("/auth/login", json={"email": email, "password": password})
-    assert login_res.status_code == 200
-    token = login_res.json()["access_token"]
-    auth_header = {"Authorization": f"Bearer {token}"}
+    buyer_login = client.post(
+        "/auth/login", json={"email": buyer_email, "password": password}
+    )
+    assert buyer_login.status_code == 200
+    buyer_token = buyer_login.json()["access_token"]
+    buyer_headers = {"Authorization": f"Bearer {buyer_token}"}
 
-    # 4. Продукт в каталога
-    product = Product(
-        title="Нов тестов артикул",
+    # 5. Отрицателен сценарий: продукт с неизвестен продавач (seller_id=999) в количката
+    unknown_seller_prod = Product(
+        title="Артикул с неизвестен продавач",
         price_minor=1500,
         stock=20,
         active=True,
         seller_id=999,
     )
-    db_session.add(product)
+    db_session.add(unknown_seller_prod)
     db_session.commit()
 
-    # 5. Добавяне в количката
-    add_cart = client.put(
-        f"/cart/items/{product.id}",
+    add_unknown = client.put(
+        f"/cart/items/{unknown_seller_prod.id}",
         json={"quantity": 3},
-        headers=auth_header,
+        headers=buyer_headers,
     )
-    assert add_cart.status_code == 200, add_cart.text
+    assert add_unknown.status_code == 200
 
-    # 6. Оформяне на поръчка
-    order_headers = {
-        **auth_header,
+    order_fail_headers = {
+        **buyer_headers,
         "Idempotency-Key": str(uuid.uuid4()),
     }
-    order_res = client.post("/orders", json=ORDER_PAYLOAD, headers=order_headers)
+    order_fail_res = client.post(
+        "/orders", json=ORDER_PAYLOAD, headers=order_fail_headers
+    )
+    assert order_fail_res.status_code == 409
+    assert order_fail_res.json()["detail"]["code"] == "CART_PRODUCT_UNAVAILABLE"
+    assert order_fail_res.json()["detail"]["product_id"] == unknown_seller_prod.id
+
+    # При отказ: поръчка не е създадена, наличността и количката са непроменени
+    db_session.expire_all()
+    orders_count = db_session.execute(
+        text("SELECT count(*) FROM orders WHERE user_id = :uid"),
+        {"uid": new_user_id},
+    ).scalar()
+    assert orders_count == 0
+    refreshed_unknown = db_session.get(Product, unknown_seller_prod.id)
+    assert refreshed_unknown is not None
+    assert refreshed_unknown.stock == 20
+    cart_check = client.get("/cart", headers=buyer_headers)
+    assert len(cart_check.json()["items"]) == 1
+
+    # Изчистваме невалидния продукт от количката
+    client.delete(f"/cart/items/{unknown_seller_prod.id}", headers=buyer_headers)
+
+    # 6. Положителен сценарий: покупка на продукт от валидния продавач
+    add_valid = client.put(
+        f"/cart/items/{valid_product_id}",
+        json={"quantity": 3},
+        headers=buyer_headers,
+    )
+    assert add_valid.status_code == 200
+
+    idempotency_key = str(uuid.uuid4())
+    order_success_headers = {
+        **buyer_headers,
+        "Idempotency-Key": idempotency_key,
+    }
+    order_res = client.post(
+        "/orders", json=ORDER_PAYLOAD, headers=order_success_headers
+    )
     assert order_res.status_code == 201, order_res.text
     order_data = order_res.json()
     assert order_data["total_minor"] == 4500
 
-    # 7. Проверка в БД: поръчката съществува с правилния user_id и customer_email
+    # 7. Проверка за състоянието: поръчката съществува в БД, наличността е намалена, количката е празна
+    db_session.expire_all()
     order_row = db_session.execute(
         text("SELECT user_id, customer_email FROM orders WHERE id = :order_id"),
         {"order_id": order_data["id"]},
     ).fetchone()
     assert order_row is not None
     assert order_row[0] == new_user_id
-    assert order_row[1] == email
+    assert order_row[1] == buyer_email
 
-    # 8. Отново проверяваме, че в Commerce users все още няма запис
-    user_still_absent = db_session.execute(
-        text("SELECT id FROM users WHERE email = :email"),
-        {"email": email},
-    ).scalar_one_or_none()
-    assert user_still_absent is None
+    refreshed_valid = db_session.get(Product, valid_product_id)
+    assert refreshed_valid is not None
+    assert refreshed_valid.stock == 17
+
+    cart_empty_check = client.get("/cart", headers=buyer_headers)
+    assert cart_empty_check.json()["items"] == []
+
+    # 8. Повторен опит със същия Idempotency-Key връща съществуващата поръчка
+    repeat_res = client.post(
+        "/orders", json=ORDER_PAYLOAD, headers=order_success_headers
+    )
+    assert repeat_res.status_code == 201
+    assert repeat_res.json()["id"] == order_data["id"]
+
+    # 9. Потребителите все още отсъстват от таблицата users в Commerce
+    users_still_absent = db_session.execute(
+        text("SELECT id FROM users WHERE email IN (:b, :s)"),
+        {"b": buyer_email, "s": seller_email},
+    ).fetchall()
+    assert users_still_absent == []
+
+
+def test_multi_seller_cart_with_one_blocked_seller_prevents_partial_order(
+    db_session: Session,
+) -> None:
+    """Проверка за количка с двама продавачи: ако единият е блокиран, не се оформя дори част от поръчката."""
+    password = "SecurePassword123!"
+
+    # 1. Администратор за модерация
+    admin_email = "admin_multi_mod@example.com"
+    reg_admin = client.post("/users", json={"email": admin_email, "password": password})
+    assert reg_admin.status_code == 201
+    admin_id = reg_admin.json()["id"]
+    admin_token = create_access_token(user_id=admin_id, role="admin", email=admin_email)
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+
+    # 2. Продавач 1 (активен)
+    s1_email = "seller_one@example.com"
+    r_s1 = client.post("/users", json={"email": s1_email, "password": password})
+    assert r_s1.status_code == 201
+    token_s1 = client.post(
+        "/auth/login", json={"email": s1_email, "password": password}
+    ).json()["access_token"]
+    h_s1 = {"Authorization": f"Bearer {token_s1}"}
+
+    prod1 = client.post(
+        "/products",
+        headers=h_s1,
+        json={
+            "title": "Стока от Продавач 1",
+            "price_minor": 1000,
+            "stock": 10,
+            "currency": "EUR",
+        },
+    ).json()
+
+    # 3. Продавач 2 (ще бъде блокиран)
+    s2_email = "seller_two_blocked@example.com"
+    r_s2 = client.post("/users", json={"email": s2_email, "password": password})
+    assert r_s2.status_code == 201
+    s2_id = r_s2.json()["id"]
+    token_s2 = client.post(
+        "/auth/login", json={"email": s2_email, "password": password}
+    ).json()["access_token"]
+    h_s2 = {"Authorization": f"Bearer {token_s2}"}
+
+    prod2 = client.post(
+        "/products",
+        headers=h_s2,
+        json={
+            "title": "Стока от Продавач 2",
+            "price_minor": 2000,
+            "stock": 10,
+            "currency": "EUR",
+        },
+    ).json()
+
+    # Администраторът блокира Продавач 2
+    block_res = client.post(
+        f"/users/{s2_id}/block",
+        headers=admin_headers,
+        json={"reason": "Terms violation"},
+    )
+    assert block_res.status_code == 200
+
+    # 4. Купувачът добавя и двете стоки в количката
+    buyer_email = "buyer_mixed_cart@example.com"
+    r_b = client.post("/users", json={"email": buyer_email, "password": password})
+    assert r_b.status_code == 201
+    buyer_id = r_b.json()["id"]
+    token_b = client.post(
+        "/auth/login", json={"email": buyer_email, "password": password}
+    ).json()["access_token"]
+    h_b = {"Authorization": f"Bearer {token_b}"}
+
+    client.put(f"/cart/items/{prod1['id']}", json={"quantity": 2}, headers=h_b)
+    client.put(f"/cart/items/{prod2['id']}", json={"quantity": 3}, headers=h_b)
+
+    cart_before = client.get("/cart", headers=h_b).json()
+    assert len(cart_before["items"]) == 2
+
+    # 5. Опит за поръчка: очакваме 409 заради блокирания продавач
+    idemp_key = str(uuid.uuid4())
+    order_headers = {**h_b, "Idempotency-Key": idemp_key}
+    res_order = client.post("/orders", json=ORDER_PAYLOAD, headers=order_headers)
+    assert res_order.status_code == 409
+    assert res_order.json()["detail"]["code"] == "CART_PRODUCT_UNAVAILABLE"
+    assert res_order.json()["detail"]["product_id"] == prod2["id"]
+
+    # 6. Проверка, че НИКАКВА част от поръчката не е създадена и наличностите са непроменени
+    db_session.expire_all()
+    orders_cnt = db_session.execute(
+        text("SELECT count(*) FROM orders WHERE user_id = :uid"),
+        {"uid": buyer_id},
+    ).scalar()
+    assert orders_cnt == 0
+
+    p1_db = db_session.get(Product, prod1["id"])
+    p2_db = db_session.get(Product, prod2["id"])
+    assert p1_db is not None and p1_db.stock == 10
+    assert p2_db is not None and p2_db.stock == 10
+
+    # Количката на купувача остава непроменена
+    cart_after = client.get("/cart", headers=h_b).json()
+    assert len(cart_after["items"]) == 2
+
+    # 7. Повторение със същия Idempotency-Key при блокиран продавач все така отказва
+    retry_order = client.post("/orders", json=ORDER_PAYLOAD, headers=order_headers)
+    assert retry_order.status_code == 409
+    assert retry_order.json()["detail"]["code"] == "CART_PRODUCT_UNAVAILABLE"
+
+    # 8. Администраторът отблокира Продавач 2
+    unblock_res = client.post(
+        f"/users/{s2_id}/unblock",
+        headers=admin_headers,
+    )
+    assert unblock_res.status_code == 200
+
+    # 9. Опит за поръчка сега успява
+    res_success = client.post(
+        "/orders",
+        json=ORDER_PAYLOAD,
+        headers={**h_b, "Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert res_success.status_code == 201
+    order_success = res_success.json()
+    assert len(order_success["shipments"]) == 2
+
+    db_session.expire_all()
+    p1_after = db_session.get(Product, prod1["id"])
+    p2_after = db_session.get(Product, prod2["id"])
+    assert p1_after is not None and p1_after.stock == 8
+    assert p2_after is not None and p2_after.stock == 7
 
 
 def test_seller_owns_product_and_can_update_while_non_owner_is_denied(
@@ -678,6 +937,14 @@ def test_users_service_downtime_protected_fails_with_503_while_catalog_read_retu
         orders_res = client.get("/orders", headers=auth_header)
         assert orders_res.status_code == 503
         assert orders_res.json()["detail"]["code"] == "USERS_SERVICE_UNAVAILABLE"
+
+        order_post_res = client.post(
+            "/orders",
+            json=ORDER_PAYLOAD,
+            headers={**auth_header, "Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert order_post_res.status_code == 503
+        assert order_post_res.json()["detail"]["code"] == "USERS_SERVICE_UNAVAILABLE"
 
         # 3. Публичният преглед на каталога НЕ зависи от Users и продължава да работи успешно (200)
         catalog_list = client.get("/products")

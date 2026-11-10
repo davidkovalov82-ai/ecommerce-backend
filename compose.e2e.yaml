@@ -175,6 +175,40 @@ services:
       DB_NAME: commerce
     command: sh -c "alembic upgrade head"
 
+  users-migrations-e2e:
+    build:
+      context: ./services/users
+      dockerfile: Dockerfile
+    restart: "no"
+    depends_on:
+      db-init-e2e:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: db-e2e
+      DB_PORT: "5432"
+      DB_USER: users_app
+      DB_PASSWORD: users_app
+      DB_NAME: users
+    command: sh -c "alembic upgrade head"
+
+  users-accounts-migration-e2e:
+    build:
+      context: ./services/users
+      dockerfile: Dockerfile
+    restart: "no"
+    depends_on:
+      commerce-migrations-e2e:
+        condition: service_completed_successfully
+      users-migrations-e2e:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: db-e2e
+      DB_PORT: "5432"
+      DB_USER: users_app
+      DB_PASSWORD: users_app
+      DB_NAME: users
+    command: sh -c "python scripts/migrate_from_commerce.py --apply --commerce-url postgresql://commerce_app:commerce_app@db-e2e:5432/commerce --users-url postgresql://users_app:users_app@db-e2e:5432/users"
+
   users-e2e:
     build:
       context: ./services/users
@@ -182,9 +216,7 @@ services:
     container_name: users-api-e2e
     restart: unless-stopped
     depends_on:
-      db-init-e2e:
-        condition: service_completed_successfully
-      commerce-migrations-e2e:
+      users-accounts-migration-e2e:
         condition: service_completed_successfully
     environment:
       DB_HOST: db-e2e
@@ -211,7 +243,7 @@ services:
       default:
         aliases:
           - users
-    command: sh -c "alembic upgrade head && python scripts/migrate_from_commerce.py --apply --commerce-url postgresql://commerce_app:commerce_app@db-e2e:5432/commerce --users-url postgresql://users_app:users_app@db-e2e:5432/users && uvicorn app.main:app --host 0.0.0.0 --port 8002"
+    command: sh -c "uvicorn app.main:app --host 0.0.0.0 --port 8002"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=2)"]
       interval: 2s

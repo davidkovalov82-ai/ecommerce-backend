@@ -1,17 +1,15 @@
 # Session State
 
-- **Текуща задача**: Етап K6.1 — възпроизводим E2E Commerce → Users от чист checkout, изолация на ключове и CI.
+- **Текуща задача**: K6.1 — валидация на статус на продавачите през Users при `POST /orders`, изолация на миграцията в Compose.
 - **Реализирано**:
-  - `scripts/prepare_e2e_keys.sh`: обща подготовка на временна 2048-битова RSA-двойка (Users: двата ключа, Commerce: само публичния; ключовете на разработчика не се докосват; почистване при изход).
-  - `compose.e2e.yaml`: контейнер `commerce-migrations-e2e` за предварителна подготовка на БД; `users-e2e` мигрира предишните акаунти и синхронизира брояча преди пускане на регистрацията.
-  - `scripts/users_e2e_verify.py`: усилена проверка (Users ред с ID от API, без съвпадение по email или ID в `commerce.users`, `GET /cart` връща празен `items`).
-  - `.github/workflows/ci.yml`: добавена стъпка `users-e2e-checks` с `make test-users-e2e`.
+  - `compose.e2e.yaml`: отделна еднократна задача `users-accounts-migration-e2e` (`restart: "no"`); рестартът на Users не повтаря миграцията и запазва промените в профилите.
+  - `OrderService.create_order`: статусът на продавачите се проверява единствено през `UsersClient.get_user_status`; неактивен/блокиран/непознат връща 409 `CART_PRODUCT_UNAVAILABLE`; недостъпен Users връща 503; при отказ няма създадена поръчка, остатъците и количката са непроменени; запазена идемпотентност.
+  - `scripts/users_e2e_verify.py` & `test_users_e2e.sh`: реални продавач и купувач, отказ при невалиден продавач, успешна поръчка при валиден, запазване на профил при рестарт на Users контейнера.
 - **Проверено локално**:
-  - `make test-users-e2e`: успешно на чист стенд (ID=2, без колизия, празна количка);
-  - `make test-k4-e2e`: успешно (всички 5 сценария + DLQ);
-  - `make test-k5-e2e`: успешно (всички K5 сценарии + cutover);
-  - `ruff check .` и `ruff format --check .` в `services/commerce` (118) и `services/users` (33) чисти.
-- **Непроверено**: финално архивиране на старите потребителски модели в Commerce.
-- **Работещи команди**: `make test-users-e2e`, `make test-k4-e2e`, `make test-k5-e2e`.
-- **Засегнати файлове**: `compose.e2e.yaml`, `scripts/{prepare_e2e_keys.sh,test_*_e2e.sh,users_e2e_verify.py}`, `.github/workflows/ci.yml`, `docs/session-state.md`.
-- **Следваща стъпка**: Пълно затваряне на K6.1 след преглед на CI.
+  - `make test-users-e2e`: успешно (отказ 409, успех 201, намален остатък 10->8, чиста количка, запазен профил след рестарт);
+  - `make test-k4-e2e` & `make test-k5-e2e`: успешно;
+  - `commerce` pytest: 310 passed; `users` pytest: 57 passed; Ruff (check/format) чист в двата сервиза.
+- **Непроверено**: няма.
+- **Работещи команди**: `make test-users-e2e`, `make test-k4-e2e`, `make test-k5-e2e`, `uv run --locked pytest -q`.
+- **Засегнати файлове**: `compose.e2e.yaml`, `scripts/{test_users_e2e.sh,users_e2e_verify.py}`, `services/commerce/app/modules/orders/{api.py,dependencies.py,service.py}`, `services/commerce/tests/integration/test_users_integration.py`, `docs/session-state.md`.
+- **Следваща стъпка**: Преглед от потребителя и commit.

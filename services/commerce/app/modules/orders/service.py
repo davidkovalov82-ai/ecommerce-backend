@@ -191,23 +191,28 @@ class OrderService:
             )
             products_by_id = {p.id: p for p in locked_products}
 
-            # 5. Проверка на активност, наличност и статус на продавачите
-            seller_ids = [p.seller_id for p in locked_products]
+            # 5. Проверка на активност, наличност и статус на продавачите през Users
+            if self._users_client is None:
+                raise UsersServiceUnavailableError(
+                    "Users service client is not configured"
+                )
+
+            unique_seller_ids = sorted(
+                {p.seller_id for p in locked_products if p.seller_id is not None}
+            )
             sellers_by_id: dict[int, object] = {}
-            if self._user_repository is not None:
-                sellers = self._user_repository.get_by_ids(seller_ids)
-                sellers_by_id = {u.id: u for u in sellers}
-            if self._users_client is not None:
-                for sid in seller_ids:
-                    if sid not in sellers_by_id:
-                        try:
-                            remote_u = self._users_client.get_user_status(sid)
-                            if remote_u:
-                                sellers_by_id[sid] = remote_u
-                        except (UsersServiceUnavailableError, UsersServiceAuthError):
-                            logger.warning(
-                                "Failed to fetch seller status for seller_id=%d", sid
-                            )
+
+            for sid in unique_seller_ids:
+                remote_seller = self._users_client.get_user_status(sid)
+                if remote_seller is None or remote_seller.status != "active":
+                    offending_item = next(
+                        item
+                        for item in cart_items
+                        if products_by_id.get(item.product_id)
+                        and products_by_id[item.product_id].seller_id == sid
+                    )
+                    raise CartProductUnavailable(offending_item.product_id)
+                sellers_by_id[sid] = remote_seller
 
             order_items_data: list[tuple[int, str, int, int, int, int]] = []
             total_minor = 0
@@ -217,8 +222,7 @@ class OrderService:
                 if product is None or not product.active:
                     raise CartProductUnavailable(item.product_id)
 
-                seller = sellers_by_id.get(product.seller_id)
-                if seller is not None and getattr(seller, "status", None) != "active":
+                if product.seller_id is None or product.seller_id not in sellers_by_id:
                     raise CartProductUnavailable(item.product_id)
 
                 if product.stock < item.quantity:

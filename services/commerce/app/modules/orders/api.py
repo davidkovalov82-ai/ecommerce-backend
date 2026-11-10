@@ -4,6 +4,10 @@ from typing import Annotated
 from fastapi import APIRouter, Header, HTTPException, Query, status
 
 from app.modules.accounts.dependencies import CurrentUserDep
+from app.modules.accounts.users_client import (
+    UsersServiceAuthError,
+    UsersServiceUnavailableError,
+)
 from app.modules.orders.dependencies import OrderServiceDep
 from app.modules.orders.payments_client import (
     PaymentGatewayError,
@@ -88,6 +92,14 @@ def create_order(
                 "code": "INSUFFICIENT_STOCK",
                 "message": f"Insufficient stock for product {e.product_id}",
                 "product_id": e.product_id,
+            },
+        )
+    except (UsersServiceUnavailableError, UsersServiceAuthError):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "USERS_SERVICE_UNAVAILABLE",
+                "message": "Users service is unavailable",
             },
         )
 

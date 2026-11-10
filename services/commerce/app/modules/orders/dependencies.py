@@ -3,8 +3,9 @@ from typing import Annotated
 from fastapi import Depends
 
 from app.dependencies import DbSession
-from app.modules.accounts.dependencies import get_user_repository
+from app.modules.accounts.dependencies import get_user_repository, get_users_client
 from app.modules.accounts.repository import UserRepository
+from app.modules.accounts.users_client import UsersClient
 from app.modules.cart.dependencies import get_cart_repository
 from app.modules.cart.repository import CartRepository
 from app.modules.catalog.dependencies import get_product_repository
@@ -31,6 +32,7 @@ def get_order_service(
     product_repository: Annotated[ProductRepository, Depends(get_product_repository)],
     user_repository: Annotated[UserRepository, Depends(get_user_repository)],
     payments_client: Annotated[PaymentsClient, Depends(get_payments_client)],
+    users_client: Annotated[UsersClient, Depends(get_users_client)],
 ) -> OrderService:
     """Фабрика за OrderService, осигуряваща споделена сесия за всички участващи хранилища."""
     return OrderService(
@@ -40,6 +42,7 @@ def get_order_service(
         user_repository=user_repository,
         session=session,
         payments_client=payments_client,
+        users_client=users_client,
     )
 
 
