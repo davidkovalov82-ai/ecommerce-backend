@@ -13,6 +13,7 @@ from app.config import settings
 from app.dependencies import get_stripe_client
 from app.main import app
 from app.models import (
+    PaymentAttempt,
     PaymentOutboxEvent,
     StripeCheckoutSession,
 )
@@ -246,6 +247,199 @@ def test_repeatable_cutover_migration_preserves_old_data_and_handles_legacy_webh
                 db_session.query(StripeCheckoutSession).filter_by(order_id=903).one()
             )
             assert new_sess.id > 16
+        finally:
+            app.dependency_overrides.pop(get_stripe_client, None)
+    finally:
+        source_engine.dispose()
+        payments_engine.dispose()
+        with admin_engine.connect() as conn:
+            conn.execute(text(f"DROP DATABASE IF EXISTS {source_db} WITH (FORCE)"))
+        admin_engine.dispose()
+
+
+def test_migrate_terminal_sessions_order_allows_fresh_attempt_and_preserves_open(
+    db_session: Session,
+) -> None:
+    """Пренос на pending_payment поръчка с терминални стари сесии (failed/expired) + отворена сесия за друга поръчка."""
+    source_db = "commerce_k5_terminal_migration_test"
+    admin_engine = create_engine(
+        settings.admin_database_url, isolation_level="AUTOCOMMIT"
+    )
+    with admin_engine.connect() as conn:
+        conn.execute(text(f"DROP DATABASE IF EXISTS {source_db} WITH (FORCE)"))
+        conn.execute(text(f"CREATE DATABASE {source_db}"))
+
+    source_url = (
+        f"postgresql+psycopg://{settings.db_admin_user}:{settings.db_admin_password}"
+        f"@{settings.db_host}:{settings.db_port}/{source_db}"
+    )
+    source_engine = create_engine(source_url)
+    payments_engine = create_engine(TEST_DATABASE_URL)
+
+    try:
+        future = datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=25)
+        with source_engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE orders (
+                        id BIGINT PRIMARY KEY,
+                        expires_at TIMESTAMPTZ
+                    );
+                    CREATE TABLE stripe_checkout_sessions (
+                        id BIGINT PRIMARY KEY,
+                        order_id BIGINT NOT NULL,
+                        status VARCHAR(20) NOT NULL,
+                        amount_minor BIGINT NOT NULL,
+                        currency VARCHAR(3) NOT NULL,
+                        stripe_session_id VARCHAR(255),
+                        checkout_url VARCHAR(2048),
+                        idempotency_key VARCHAR(255) NOT NULL UNIQUE,
+                        mode VARCHAR(10) NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL
+                    );
+                    CREATE TABLE payment_attempts (
+                        id BIGINT PRIMARY KEY,
+                        order_id BIGINT NOT NULL,
+                        payment_method VARCHAR(20) NOT NULL,
+                        status VARCHAR(20) NOT NULL,
+                        amount_minor BIGINT NOT NULL,
+                        currency VARCHAR(3) NOT NULL,
+                        idempotency_key VARCHAR(255) NOT NULL UNIQUE,
+                        created_at TIMESTAMPTZ NOT NULL
+                    );
+                    CREATE TABLE stripe_processed_events (
+                        id BIGINT PRIMARY KEY,
+                        stripe_event_id VARCHAR(255) NOT NULL UNIQUE,
+                        event_type VARCHAR(100) NOT NULL,
+                        order_id BIGINT,
+                        created_at TIMESTAMPTZ NOT NULL
+                    );
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO orders (id, expires_at)
+                    VALUES (950, :future), (951, :future)
+                    """
+                ),
+                {"future": future},
+            )
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO stripe_checkout_sessions (
+                        id, order_id, status, amount_minor, currency,
+                        stripe_session_id, checkout_url, idempotency_key,
+                        mode, created_at, updated_at
+                    ) VALUES
+                        (
+                            31, 950, 'failed', 6200, 'EUR',
+                            'cs_legacy_950_1', 'https://checkout.stripe.com/pay/cs_legacy_950_1',
+                            'order_950_attempt_1', 'test', NOW(), NOW()
+                        ),
+                        (
+                            32, 950, 'expired', 6200, 'EUR',
+                            'cs_legacy_950_2', 'https://checkout.stripe.com/pay/cs_legacy_950_2',
+                            'order_950_attempt_2', 'test', NOW(), NOW()
+                        ),
+                        (
+                            33, 951, 'open', 7100, 'EUR',
+                            'cs_legacy_951_1', 'https://checkout.stripe.com/pay/cs_legacy_951_1',
+                            'order_951_attempt_1', 'test', NOW(), NOW()
+                        )
+                    """
+                )
+            )
+
+        first = migrate_commerce_payment_state(source_engine, payments_engine)
+        assert first == {
+            "sessions_inserted": 3,
+            "legacy_attempts_inserted": 0,
+            "processed_events_inserted": 0,
+        }
+        second = migrate_commerce_payment_state(source_engine, payments_engine)
+        assert second == {
+            "sessions_inserted": 0,
+            "legacy_attempts_inserted": 0,
+            "processed_events_inserted": 0,
+        }
+
+        migrated_950 = (
+            db_session.query(PaymentAttempt)
+            .filter_by(order_id=950)
+            .order_by(PaymentAttempt.id.asc())
+            .all()
+        )
+        assert [(a.attempt_key, a.status) for a in migrated_950] == [
+            ("order_950_attempt_1", "failed"),
+            ("order_950_attempt_2", "expired"),
+        ]
+
+        mock_stripe = MagicMock(spec=StripeClient)
+        mock_stripe.create_checkout_session.return_value = SimpleNamespace(
+            id="cs_post_cutover_950_3",
+            url="https://checkout.stripe.com/pay/cs_post_cutover_950_3",
+        )
+        app.dependency_overrides[get_stripe_client] = lambda: mock_stripe
+        try:
+            # Старият терминален ключ се отказва с ATTEMPT_TERMINAL
+            r_stale = client.post(
+                "/internal/payments/checkout-sessions",
+                json={
+                    "order_id": 950,
+                    "attempt_key": "order_950_attempt_2",
+                    "amount_minor": 6200,
+                    "currency": "EUR",
+                    "line_items": [
+                        {"name": "Item", "unit_amount": 6200, "quantity": 1}
+                    ],
+                },
+                headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+            )
+            assert r_stale.status_code == 409
+            assert r_stale.json()["detail"]["code"] == "ATTEMPT_TERMINAL"
+            mock_stripe.create_checkout_session.assert_not_called()
+
+            # Свежият ключ след обновената Commerce миграция отваря нова сесия без грешка
+            r_fresh = client.post(
+                "/internal/payments/checkout-sessions",
+                json={
+                    "order_id": 950,
+                    "attempt_key": "order_950_attempt_3",
+                    "amount_minor": 6200,
+                    "currency": "EUR",
+                    "line_items": [
+                        {"name": "Item", "unit_amount": 6200, "quantity": 1}
+                    ],
+                },
+                headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+            )
+            assert r_fresh.status_code == 200
+            assert r_fresh.json()["session_id"] == "cs_post_cutover_950_3"
+            mock_stripe.create_checkout_session.assert_called_once()
+
+            # Мигрираната отворена сесия на поръчка 951 се преизползва идемпотентно без нов Stripe повик
+            mock_stripe.create_checkout_session.reset_mock()
+            r_open = client.post(
+                "/internal/payments/checkout-sessions",
+                json={
+                    "order_id": 951,
+                    "attempt_key": "order_951_attempt_1",
+                    "amount_minor": 7100,
+                    "currency": "EUR",
+                    "line_items": [
+                        {"name": "Open Item", "unit_amount": 7100, "quantity": 1}
+                    ],
+                },
+                headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+            )
+            assert r_open.status_code == 200
+            assert r_open.json()["session_id"] == "cs_legacy_951_1"
+            mock_stripe.create_checkout_session.assert_not_called()
         finally:
             app.dependency_overrides.pop(get_stripe_client, None)
     finally:

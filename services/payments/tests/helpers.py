@@ -2,11 +2,18 @@
 
 import hashlib
 import hmac
+import os
 import time
 from typing import Any
 
+os.environ.setdefault(
+    "PAYMENTS_INTERNAL_AUTH_TOKEN", "test-internal-payments-token-32b!"
+)
+
+from app.config import settings
+
 TEST_WEBHOOK_SECRET = "whsec_test_secret_stripe_payments_32_bytes_ok"
-TEST_INTERNAL_TOKEN = "test-internal-payments-token-32b!"
+TEST_INTERNAL_TOKEN = settings.internal_auth_token
 
 
 def build_internal_checkout_payload(

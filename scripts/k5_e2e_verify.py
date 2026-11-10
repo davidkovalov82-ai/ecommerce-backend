@@ -900,6 +900,46 @@ def verify_cancel_and_late_payment_discrepancy(seller_token: str) -> None:
     assert get_mailpit_messages(email) == []
     assert get_sms_sent_for_phone(phone) == []
 
+    # Допълнителна проверка #2: cancel без предишен опит записва closure и блокира закъснял checkout към Payments
+    _, buyer_closed = register_and_login(f"k5_close_{uuid.uuid4().hex[:8]}@example.com")
+    pid_close = create_product(
+        seller_token, title="K5 Close Race Prod", price_minor=1500, stock=6
+    )
+    add_to_cart(buyer_closed, pid_close, 2)  # stock=4
+    order_close = create_order(buyer_closed)
+    oid_close = int(order_close["id"])
+
+    r_close_cancel = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid_close}/cancel",
+        headers={"Authorization": f"Bearer {buyer_closed}"},
+        timeout=5.0,
+    )
+    assert r_close_cancel.status_code == 200
+    assert r_close_cancel.json()["status"] == "cancelled"
+    assert get_product_stock(pid_close) == 6
+
+    r_delayed_checkout = httpx.post(
+        f"{PAYMENTS_API_URL}/internal/payments/checkout-sessions",
+        json={
+            "order_id": oid_close,
+            "attempt_key": f"order_{oid_close}_attempt_1",
+            "amount_minor": 3000,
+            "currency": "EUR",
+            "line_items": [
+                {"name": "K5 Close Race Prod", "unit_amount": 1500, "quantity": 2}
+            ],
+        },
+        headers={"X-Internal-Token": INTERNAL_TOKEN},
+        timeout=5.0,
+    )
+    assert r_delayed_checkout.status_code == 409
+    assert r_delayed_checkout.json()["detail"]["code"] == "ORDER_STATUS_CONFLICT"
+    all_sessions = httpx.get(f"{STRIPE_MOCK_URL}/_sessions", timeout=5.0).json()[
+        "sessions"
+    ]
+    assert not any(s.get("client_reference_id") == str(oid_close) for s in all_sessions)
+    assert get_product_stock(pid_close) == 6
+
 
 def verify_reconciliation_scripts(seller_token: str) -> None:
     print(
@@ -985,6 +1025,110 @@ def verify_reconciliation_scripts(seller_token: str) -> None:
     wait_until(
         "Reconcile delivered 1 SMS",
         lambda: s if len(s := get_sms_sent_for_phone(phone2)) == 1 else None,
+    )
+
+    # C) Изгубен отговор при Stripe create -> initiated без stripe_session_id + изтекъл резерв
+    # Нито reconcile_orders.py, нито reconcile_payments.py не освобождават stock, докато изходът е неизвестен
+    email3 = f"k5_lost_exp_{uuid.uuid4().hex[:8]}@example.com"
+    phone3 = f"+359881{uuid.uuid4().int % 1000000:06d}"
+    _, buyer3 = register_and_login(email3)
+    add_to_cart(buyer3, pid, 3)  # stock 8 -> 5
+    o3 = create_order(buyer3, phone=phone3)
+    oid3 = int(o3["id"])
+
+    httpx.post(
+        f"{STRIPE_MOCK_URL}/_control",
+        json={"drop_next_create_after_commit": True},
+        timeout=5.0,
+    ).raise_for_status()
+    r_drop = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid3}/checkout-session",
+        headers={"Authorization": f"Bearer {buyer3}"},
+        timeout=10.0,
+    )
+    assert r_drop.status_code == 502
+
+    expired_ts = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=30)
+    with psycopg.connect(COMMERCE_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE orders SET expires_at = %s WHERE id = %s", (expired_ts, oid3)
+        )
+        conn.commit()
+    with psycopg.connect(PAYMENTS_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE payment_attempts SET order_expires_at = %s WHERE order_id = %s",
+            (expired_ts, oid3),
+        )
+        conn.commit()
+
+    compose_cmd(
+        "exec",
+        "-T",
+        "commerce-api-e2e",
+        "python",
+        "scripts/reconcile_orders.py",
+        capture_output=True,
+    )
+    compose_cmd(
+        "exec",
+        "-T",
+        "payments-e2e",
+        "python",
+        "scripts/reconcile_payments.py",
+        capture_output=True,
+    )
+    assert get_order_detail(buyer3, oid3)["status"] == "pending_payment"
+    assert get_product_stock(pid) == 5
+
+    # Истинският webhook намира сесията, създадена преди изгубения отговор, и завършва поръчката в paid
+    sessions_snap = httpx.get(f"{STRIPE_MOCK_URL}/_sessions", timeout=5.0).json()[
+        "sessions"
+    ]
+    lost_sessions = [
+        s for s in sessions_snap if s.get("client_reference_id") == str(oid3)
+    ]
+    assert len(lost_sessions) == 1
+    lost_sid = lost_sessions[0]["id"]
+    with psycopg.connect(PAYMENTS_DSN) as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM payment_attempts WHERE order_id = %s", (oid3,))
+        lost_attempt_id = cur.fetchone()[0]
+
+    r_recover_wh = sign_and_post_stripe_webhook(
+        {
+            "id": f"evt_lost_exp_recover_{uuid.uuid4().hex[:10]}",
+            "type": "checkout.session.completed",
+            "livemode": False,
+            "data": {
+                "object": {
+                    "id": lost_sid,
+                    "livemode": False,
+                    "payment_status": "paid",
+                    "amount_total": 5400,
+                    "currency": "eur",
+                    "client_reference_id": str(oid3),
+                    "metadata": {
+                        "order_id": str(oid3),
+                        "attempt_key": f"order_{oid3}_attempt_1",
+                        "payment_attempt_id": str(lost_attempt_id),
+                    },
+                }
+            },
+        }
+    )
+    assert r_recover_wh.status_code == 200
+    assert r_recover_wh.json()["status"] == "success"
+    wait_until(
+        "Lost initiated response after reserve expiry still reaches paid via webhook",
+        lambda: True if get_order_detail(buyer3, oid3)["status"] == "paid" else None,
+    )
+    assert get_product_stock(pid) == 5
+    wait_until(
+        "Lost expired recovery delivered 1 email",
+        lambda: m if len(m := get_mailpit_messages(email3)) == 1 else None,
+    )
+    wait_until(
+        "Lost expired recovery delivered 1 SMS",
+        lambda: s if len(s := get_sms_sent_for_phone(phone3)) == 1 else None,
     )
 
 
@@ -1195,6 +1339,57 @@ def verify_repeatable_cutover_migration(seller_token: str) -> None:
         "Legacy cutover delivered 1 SMS",
         lambda: s if len(s := get_sms_sent_for_phone(phone)) == 1 else None,
     )
+
+    # Допълнителна проверка #6: мигрирана pending_payment поръчка с терминална (expired) сесия получава нов attempt_2 при checkout
+    email_term = f"k5_cutover_term_{uuid.uuid4().hex[:8]}@example.com"
+    _, buyer_term = register_and_login(email_term)
+    add_to_cart(buyer_term, pid, 1)
+    order_term = create_order(buyer_term)
+    oid_term = int(order_term["id"])
+    old_exp_sid = f"cs_legacy_exp_{uuid.uuid4().hex[:10]}"
+    with psycopg.connect(COMMERCE_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO stripe_checkout_sessions
+                (order_id, status, amount_minor, currency, mode, stripe_session_id, checkout_url, idempotency_key)
+            VALUES (%s, 'expired', 4500, 'EUR', 'test', %s, %s, %s)
+            """,
+            (
+                oid_term,
+                old_exp_sid,
+                f"https://checkout.stripe.mock/pay/{old_exp_sid}",
+                f"order_{oid_term}_attempt_1",
+            ),
+        )
+        cur.execute(
+            "UPDATE orders SET payment_attempt_seq = 2, active_attempt_key = %s WHERE id = %s",
+            (f"order_{oid_term}_attempt_2", oid_term),
+        )
+        conn.commit()
+
+    mig_term = compose_cmd(
+        "exec",
+        "-T",
+        "payments-e2e",
+        "python",
+        "scripts/migrate_from_commerce.py",
+        "--commerce-url",
+        ADMIN_COMMERCE_DSN,
+        "--payments-url",
+        CONTAINER_PAYMENTS_DSN,
+        capture_output=True,
+    )
+    assert mig_term.returncode == 0, f"Terminal migration failed: {mig_term.stderr}"
+
+    co_fresh = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid_term}/checkout-session",
+        headers={"Authorization": f"Bearer {buyer_term}"},
+        timeout=10.0,
+    )
+    assert co_fresh.status_code == 200, (
+        f"Expected fresh checkout session after expired cutover, got {co_fresh.text}"
+    )
+    assert co_fresh.json()["session_id"] != old_exp_sid
 
 
 def main() -> None:

@@ -10,6 +10,8 @@ from sqlalchemy.orm import Session
 
 from app.models import (
     PaymentAttempt,
+    PaymentDiscrepancy,
+    PaymentOrderClosure,
     PaymentOutboxEvent,
     StripeCheckoutSession,
     StripeProcessedEvent,
@@ -233,6 +235,29 @@ class PaymentRepository:
         )
         return self._session.scalars(stmt).all()
 
+    def get_order_closure_for_update(self, order_id: int) -> PaymentOrderClosure | None:
+        stmt = (
+            select(PaymentOrderClosure)
+            .where(PaymentOrderClosure.order_id == order_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return self._session.scalars(stmt).first()
+
+    def record_order_closure_idempotent(
+        self, *, order_id: int, status: str, reason: str
+    ) -> None:
+        stmt = (
+            pg_insert(PaymentOrderClosure)
+            .values(order_id=order_id, status=status, reason=reason)
+            .on_conflict_do_nothing(index_elements=["order_id"])
+        )
+        self._session.execute(stmt)
+
+    def record_discrepancy(self, discrepancy: PaymentDiscrepancy) -> PaymentDiscrepancy:
+        self._session.add(discrepancy)
+        return discrepancy
+
     def sync_sequences(self) -> None:
         """Синхронизира PostgreSQL sequence броячите след пренос на исторически данни."""
         for table in (
@@ -240,6 +265,7 @@ class PaymentRepository:
             "stripe_checkout_sessions",
             "stripe_processed_events",
             "payment_outbox_events",
+            "payment_discrepancies",
         ):
             self._session.execute(
                 text(
@@ -258,5 +284,6 @@ class PaymentRepository:
                 ("stripe_checkout_sessions", StripeCheckoutSession),
                 ("stripe_processed_events", StripeProcessedEvent),
                 ("payment_outbox_events", PaymentOutboxEvent),
+                ("payment_discrepancies", PaymentDiscrepancy),
             )
         }

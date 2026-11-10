@@ -283,3 +283,62 @@ class PaymentOutboxEvent(Base):
         default=lambda: datetime.datetime.now(datetime.UTC),
         server_default=func.now(),
     )
+
+
+class PaymentOrderClosure(Base):
+    """Окончателно затваряне на плащанията за отказана или просрочена поръчка."""
+
+    __tablename__ = "payment_order_closures"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('cancelled', 'expired')",
+            name="ck_payment_order_closures_status_valid",
+        ),
+    )
+
+    order_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    reason: Mapped[str] = mapped_column(String(50), nullable=False)
+    closed_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.datetime.now(datetime.UTC),
+        server_default=func.now(),
+    )
+
+
+class PaymentDiscrepancy(Base):
+    """Диагностичен дневник за несъответствия при проверка на потвърдено Stripe плащане."""
+
+    __tablename__ = "payment_discrepancies"
+    __table_args__ = (
+        CheckConstraint(
+            "source IN ('webhook', 'reconcile', 'cancel_conflict')",
+            name="ck_payment_discrepancies_source_valid",
+        ),
+        Index("ix_payment_discrepancies_order_id", "order_id"),
+        Index("ix_payment_discrepancies_attempt_id", "payment_attempt_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    order_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    payment_attempt_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    stripe_session_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    stripe_event_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    source: Mapped[str] = mapped_column(String(50), nullable=False)
+    reason: Mapped[str] = mapped_column(String(100), nullable=False)
+    expected_amount_minor: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    actual_amount_minor: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    expected_currency: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    actual_currency: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    details: Mapped[dict[str, Any]] = mapped_column(
+        JSON,
+        nullable=False,
+        default=dict,
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.datetime.now(datetime.UTC),
+        server_default=func.now(),
+    )

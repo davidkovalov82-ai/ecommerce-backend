@@ -16,6 +16,7 @@ from app.dependencies import get_stripe_client
 from app.main import app
 from app.models import (
     PaymentAttempt,
+    PaymentDiscrepancy,
     PaymentOutboxEvent,
     StripeCheckoutSession,
     StripeProcessedEvent,
@@ -427,6 +428,322 @@ def test_webhook_delayed_payment_out_of_order_and_failure_lifecycle(
     assert (
         db_session.query(PaymentOutboxEvent)
         .filter_by(order_id=321, event_type="payment.failed")
+        .count()
+        == 1
+    )
+
+
+def _post_signed_webhook(event_payload: dict[str, Any]):
+    body = json.dumps(event_payload).encode("utf-8")
+    sig = generate_stripe_signature(body, TEST_WEBHOOK_SECRET)
+    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
+        return client.post(
+            "/webhooks/stripe",
+            content=body,
+            headers={"Stripe-Signature": sig, "Content-Type": "application/json"},
+        )
+
+
+def test_webhook_paid_and_mode_mismatches_reject_and_record_discrepancy(
+    db_session: Session,
+) -> None:
+    """Webhook проверките за сума/валута/livemode/сесия отказват paid преход и записват PaymentDiscrepancy."""
+    attempt, _ = _seed_attempt_and_session(
+        db_session,
+        order_id=325,
+        attempt_key="order_325_attempt_1",
+        status="processing",
+        session_status="processing",
+        stripe_session_id="cs_guard_325",
+        amount_minor=5000,
+        mode="test",
+    )
+
+    # 1. livemode=True при STRIPE_MODE=test
+    r_mode = _post_signed_webhook(
+        {
+            "id": "evt_guard_mode_1",
+            "type": "checkout.session.completed",
+            "livemode": True,
+            "data": {
+                "object": {
+                    "id": "cs_guard_325",
+                    "livemode": True,
+                    "payment_status": "paid",
+                    "amount_total": 5000,
+                    "currency": "eur",
+                    "client_reference_id": "325",
+                    "metadata": {
+                        "order_id": "325",
+                        "attempt_key": "order_325_attempt_1",
+                        "payment_attempt_id": str(attempt.id),
+                    },
+                }
+            },
+        }
+    )
+    assert r_mode.status_code == 200
+    assert r_mode.json()["status"] == "ignored"
+    assert r_mode.json()["reason"] == "mode_mismatch"
+
+    # 2. Несъответстващ session.id спрямо записаната сесия
+    r_sess = _post_signed_webhook(
+        {
+            "id": "evt_guard_sess_1",
+            "type": "checkout.session.completed",
+            "livemode": False,
+            "data": {
+                "object": {
+                    "id": "cs_foreign_999",
+                    "livemode": False,
+                    "payment_status": "paid",
+                    "amount_total": 5000,
+                    "currency": "eur",
+                    "client_reference_id": "325",
+                    "metadata": {
+                        "order_id": "325",
+                        "attempt_key": "order_325_attempt_1",
+                        "payment_attempt_id": str(attempt.id),
+                    },
+                }
+            },
+        }
+    )
+    assert r_sess.status_code == 200
+    assert r_sess.json()["status"] == "mismatched"
+    assert r_sess.json()["reason"] == "session_id_mismatch"
+
+    # 3. Разминаване в async_payment_succeeded: сума, валута, чужд order_id в metadata
+    mismatch_cases = [
+        (
+            "evt_guard_amt_1",
+            {
+                "id": "cs_guard_325",
+                "livemode": False,
+                "payment_status": "paid",
+                "amount_total": 4900,
+                "currency": "eur",
+                "client_reference_id": "325",
+                "metadata": {
+                    "order_id": "325",
+                    "attempt_key": "order_325_attempt_1",
+                    "payment_attempt_id": str(attempt.id),
+                },
+            },
+            "amount_mismatch",
+        ),
+        (
+            "evt_guard_curr_1",
+            {
+                "id": "cs_guard_325",
+                "livemode": False,
+                "payment_status": "paid",
+                "amount_total": 5000,
+                "currency": "usd",
+                "client_reference_id": "325",
+                "metadata": {
+                    "order_id": "325",
+                    "attempt_key": "order_325_attempt_1",
+                    "payment_attempt_id": str(attempt.id),
+                },
+            },
+            "currency_mismatch",
+        ),
+        (
+            "evt_guard_meta_order_1",
+            {
+                "id": "cs_guard_325",
+                "livemode": False,
+                "payment_status": "paid",
+                "amount_total": 5000,
+                "currency": "eur",
+                "client_reference_id": "325",
+                "metadata": {
+                    "order_id": "99999",
+                    "attempt_key": "order_325_attempt_1",
+                    "payment_attempt_id": str(attempt.id),
+                },
+            },
+            "invalid_attempt",
+        ),
+        (
+            "evt_guard_cref_order_1",
+            {
+                "id": "cs_guard_325",
+                "livemode": False,
+                "payment_status": "paid",
+                "amount_total": 5000,
+                "currency": "eur",
+                "client_reference_id": "99999",
+                "metadata": {
+                    "order_id": "325",
+                    "attempt_key": "order_325_attempt_1",
+                    "payment_attempt_id": str(attempt.id),
+                },
+            },
+            "session_order_mismatch",
+        ),
+    ]
+    for event_id, session_obj, expected_reason in mismatch_cases:
+        resp = _post_signed_webhook(
+            {
+                "id": event_id,
+                "type": "checkout.session.async_payment_succeeded",
+                "livemode": False,
+                "data": {"object": session_obj},
+            }
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "mismatched"
+        assert resp.json()["reason"] == expected_reason
+
+    db_session.expire_all()
+    db_session.refresh(attempt)
+    assert attempt.status == "processing"
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=325, event_type="payment.succeeded")
+        .count()
+        == 0
+    )
+    discrepancies = (
+        db_session.query(PaymentDiscrepancy)
+        .filter_by(source="webhook")
+        .order_by(PaymentDiscrepancy.id.asc())
+        .all()
+    )
+    reasons = {row.reason for row in discrepancies}
+    assert {
+        "mode_mismatch",
+        "session_id_mismatch",
+        "amount_mismatch",
+        "currency_mismatch",
+        "invalid_attempt",
+        "session_order_mismatch",
+    }.issubset(reasons)
+
+
+def test_out_of_order_async_failed_then_late_completed_unpaid_preserves_retry(
+    db_session: Session,
+) -> None:
+    """Закъсняло checkout.session.completed(unpaid) след async_payment_failed не връща failed опита в processing."""
+    attempt_1, _ = _seed_attempt_and_session(
+        db_session,
+        order_id=326,
+        attempt_key="order_326_attempt_1",
+        status="open",
+        session_status="open",
+        stripe_session_id="cs_ooo_fail_1",
+        amount_minor=5000,
+        mode="test",
+    )
+
+    r_fail = _post_signed_webhook(
+        {
+            "id": "evt_ooo_fail_1",
+            "type": "checkout.session.async_payment_failed",
+            "livemode": False,
+            "data": {
+                "object": {
+                    "id": "cs_ooo_fail_1",
+                    "livemode": False,
+                    "payment_status": "unpaid",
+                    "client_reference_id": "326",
+                    "metadata": {
+                        "order_id": "326",
+                        "attempt_key": "order_326_attempt_1",
+                        "payment_attempt_id": str(attempt_1.id),
+                    },
+                }
+            },
+        }
+    )
+    assert r_fail.status_code == 200
+    assert r_fail.json()["status"] == "failed"
+
+    attempt_2, _ = _seed_attempt_and_session(
+        db_session,
+        order_id=326,
+        attempt_key="order_326_attempt_2",
+        status="open",
+        session_status="open",
+        stripe_session_id="cs_ooo_retry_2",
+        amount_minor=5000,
+        mode="test",
+    )
+
+    # Закъсняло completed(unpaid) за стария attempt_1 не може да го върне към processing
+    r_late_unpaid = _post_signed_webhook(
+        {
+            "id": "evt_ooo_late_unpaid_1",
+            "type": "checkout.session.completed",
+            "livemode": False,
+            "data": {
+                "object": {
+                    "id": "cs_ooo_fail_1",
+                    "livemode": False,
+                    "payment_status": "unpaid",
+                    "amount_total": 5000,
+                    "currency": "eur",
+                    "client_reference_id": "326",
+                    "metadata": {
+                        "order_id": "326",
+                        "attempt_key": "order_326_attempt_1",
+                        "payment_attempt_id": str(attempt_1.id),
+                    },
+                }
+            },
+        }
+    )
+    assert r_late_unpaid.status_code == 200
+    assert r_late_unpaid.json()["status"] == "ignored"
+
+    db_session.expire_all()
+    db_session.refresh(attempt_1)
+    db_session.refresh(attempt_2)
+    assert attempt_1.status == "failed"
+    assert attempt_2.status == "open"
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=326, event_type="payment.processing")
+        .count()
+        == 0
+    )
+
+    # Повторният опит attempt_2 остава използваем и завършва успешно
+    r_retry_paid = _post_signed_webhook(
+        {
+            "id": "evt_ooo_retry_paid_2",
+            "type": "checkout.session.completed",
+            "livemode": False,
+            "data": {
+                "object": {
+                    "id": "cs_ooo_retry_2",
+                    "livemode": False,
+                    "payment_status": "paid",
+                    "amount_total": 5000,
+                    "currency": "eur",
+                    "client_reference_id": "326",
+                    "metadata": {
+                        "order_id": "326",
+                        "attempt_key": "order_326_attempt_2",
+                        "payment_attempt_id": str(attempt_2.id),
+                    },
+                }
+            },
+        }
+    )
+    assert r_retry_paid.status_code == 200
+    assert r_retry_paid.json()["status"] == "success"
+
+    db_session.expire_all()
+    db_session.refresh(attempt_1)
+    db_session.refresh(attempt_2)
+    assert attempt_1.status == "failed"
+    assert attempt_2.status == "succeeded"
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=326, event_type="payment.succeeded")
         .count()
         == 1
     )

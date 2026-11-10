@@ -1,6 +1,7 @@
 import datetime
 from unittest.mock import MagicMock
 
+import pytest
 from sqlalchemy.orm import Session
 
 from app.modules.accounts.repository import UserRepository
@@ -14,7 +15,7 @@ from app.modules.orders.payments_client import (
     RemotePaymentConflict,
 )
 from app.modules.orders.repository import OrderRepository
-from app.modules.orders.service import OrderService
+from app.modules.orders.service import OrderService, OrderStateConflict
 from tests.payments.helpers import (
     _create_order,
     _create_product,
@@ -115,3 +116,60 @@ def test_reconciliation_service_and_rules(db_session: Session) -> None:
     assert stats2["deferred"] == 3
     db_session.refresh(product)
     assert product.stock == 92
+
+
+def test_expired_reserve_with_unknown_initiated_payment_preserves_stock(
+    db_session: Session,
+) -> None:
+    """Когато Payments върне initiated (изгубен отговор при изтекъл резерв), stock НЕ се възстановява нито при сверка, нито при checkout."""
+    user, _ = _create_user_and_token(db_session)
+    product = _create_product(
+        db_session, "InitiatedReserveItem", stock=20, price_minor=1500
+    )
+
+    now = datetime.datetime.now(datetime.UTC)
+    past = now - datetime.timedelta(minutes=30)
+    order = _create_order(
+        db_session,
+        user.id,
+        product,
+        quantity=4,
+        expires_at=past,
+    )  # stock=16
+
+    mock_client = MagicMock(spec=PaymentsClient)
+    mock_client.cancel_order_payment.side_effect = RemotePaymentConflict(
+        current_status="initiated",
+        message="Payment session creation outcome is still unknown",
+    )
+
+    service = OrderService(
+        order_repository=OrderRepository(db_session),
+        cart_repository=CartRepository(db_session),
+        product_repository=ProductRepository(db_session),
+        user_repository=UserRepository(db_session),
+        session=db_session,
+        payments_client=mock_client,
+    )
+
+    stats = service.reconcile_expired_orders(now=now)
+    assert stats["checked"] == 1
+    assert stats["expired"] == 0
+    assert stats["deferred"] == 1
+    assert mock_client.cancel_order_payment.call_count == 1
+
+    db_session.refresh(order)
+    db_session.refresh(product)
+    assert order.status == "pending_payment"
+    assert product.stock == 16
+
+    # Път 2: запоздал create_stripe_checkout_session за просрочената поръчка също пази резерва
+    with pytest.raises(OrderStateConflict) as exc_info:
+        service.create_stripe_checkout_session(order.id, user.id)
+    assert exc_info.value.current_status == "initiated"
+    assert mock_client.create_checkout_session.call_count == 0
+
+    db_session.refresh(order)
+    db_session.refresh(product)
+    assert order.status == "pending_payment"
+    assert product.stock == 16

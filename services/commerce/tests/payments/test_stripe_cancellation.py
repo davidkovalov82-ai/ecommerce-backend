@@ -1,3 +1,5 @@
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
@@ -9,6 +11,7 @@ from app.modules.orders.dependencies import get_payments_client
 from app.modules.orders.models import Order
 from app.modules.orders.payments_client import (
     CancelPaymentResult,
+    CheckoutSessionResult,
     PaymentGatewayError,
     PaymentsClient,
     PaymentsNotConfigured,
@@ -220,3 +223,99 @@ def test_cannot_cancel_or_create_checkout_in_payment_processing(
     )
     assert r_checkout.status_code == 409
     assert r_checkout.json()["detail"]["code"] == "ORDER_STATUS_CONFLICT"
+
+
+def test_checkout_after_cancel_race_never_creates_stripe_session_or_duplicates_stock_restore(
+    db_session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Гонка checkout/cancel без предишен опит: завършен cancel блокира закъснял checkout и остатъкът се връща веднъж."""
+    user, token = _create_user_and_token(db_session)
+    product = _create_product(db_session, "RaceCancelItem", price_minor=2500, stock=10)
+    order = _create_order(db_session, user.id, product, quantity=3)  # stock=7
+
+    entered_checkout = threading.Event()
+    allow_checkout_resume = threading.Event()
+    lock = threading.Lock()
+    closed_orders: dict[int, str] = {}
+    stripe_sessions_created = 0
+
+    class StatefulRacePaymentsClient:
+        def create_checkout_session(
+            self,
+            *,
+            order_id: int,
+            attempt_key: str,
+            amount_minor: int,
+            currency: str,
+            line_items: list[dict[str, object]],
+            order_expires_at: object,
+        ) -> CheckoutSessionResult:
+            nonlocal stripe_sessions_created
+            entered_checkout.set()
+            assert allow_checkout_resume.wait(timeout=5.0)
+            with lock:
+                if order_id in closed_orders:
+                    raise RemotePaymentConflict(
+                        current_status=closed_orders[order_id],
+                        message="Order already cancelled in Payments",
+                    )
+                stripe_sessions_created += 1
+                return CheckoutSessionResult(
+                    payment_attempt_id=1,
+                    session_id=f"cs_race_{order_id}",
+                    checkout_url=f"https://checkout.stripe.com/pay/cs_race_{order_id}",
+                    status="open",
+                )
+
+        def cancel_order_payment(
+            self,
+            *,
+            order_id: int,
+            reason: str = "cancel",
+            order_expires_at: object = None,
+        ) -> CancelPaymentResult:
+            with lock:
+                closed_orders[order_id] = "cancelled"
+                return CancelPaymentResult(status="can_cancel", action="no_attempt")
+
+    app.dependency_overrides[get_payments_client] = StatefulRacePaymentsClient
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            checkout_future = pool.submit(
+                lambda: client.post(
+                    f"/orders/{order.id}/checkout-session",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            )
+            assert entered_checkout.wait(timeout=5.0)
+
+            r_cancel = client.post(
+                f"/orders/{order.id}/cancel",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert r_cancel.status_code == 200
+            assert r_cancel.json()["status"] == "cancelled"
+
+            allow_checkout_resume.set()
+            r_checkout = checkout_future.result(timeout=5.0)
+            assert r_checkout.status_code == 409
+            assert r_checkout.json()["detail"]["code"] == "ORDER_STATUS_CONFLICT"
+            assert "checkout_url" not in r_checkout.json()
+
+            # Повторна отмяна е идемпотентна (200 cancelled) и не дублира възстановяването на stock
+            r_repeat_cancel = client.post(
+                f"/orders/{order.id}/cancel",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert r_repeat_cancel.status_code == 200
+            assert r_repeat_cancel.json()["status"] == "cancelled"
+    finally:
+        app.dependency_overrides.pop(get_payments_client, None)
+
+    assert stripe_sessions_created == 0
+    with session_factory() as verify_session:
+        refreshed_product = verify_session.get(Product, product.id)
+        refreshed_order = verify_session.get(Order, order.id)
+        assert refreshed_product is not None and refreshed_product.stock == 10
+        assert refreshed_order is not None and refreshed_order.status == "cancelled"

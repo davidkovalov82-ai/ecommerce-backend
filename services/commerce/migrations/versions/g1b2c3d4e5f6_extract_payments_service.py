@@ -37,21 +37,79 @@ def upgrade() -> None:
         ),
     )
 
-    # Попълваме active_attempt_key от последната stripe_checkout_sessions (ако има), иначе order_<id>_attempt_1
+    # Попълваме active_attempt_key и payment_attempt_seq според последната стара Stripe сесия:
+    # - при незавършена/активна (open/initiated/processing/cancelling/completed) запазваме нейния ключ;
+    # - при последна failed/expired сесия задаваме по-голям seq и свеж ключ за следващия checkout.
     op.execute(
         sa.text(
             """
-            UPDATE orders o
-            SET active_attempt_key = COALESCE(
-                (
-                    SELECT s.idempotency_key
+            WITH latest_session AS (
+                SELECT DISTINCT ON (s.order_id)
+                    s.order_id,
+                    s.status,
+                    s.idempotency_key
+                FROM stripe_checkout_sessions s
+                ORDER BY s.order_id, s.id DESC
+            ),
+            order_seq_bounds AS (
+                SELECT
+                    o.id AS order_id,
+                    GREATEST(
+                        COALESCE(sc.cnt, 0),
+                        COALESCE(sc.max_suffix, 0),
+                        COALESCE(pa.max_suffix, 0),
+                        1
+                    ) AS highest_seq
+                FROM orders o
+                LEFT JOIN (
+                    SELECT
+                        s.order_id,
+                        COUNT(*) AS cnt,
+                        MAX(
+                            CASE
+                                WHEN s.idempotency_key ~ '^order_[0-9]+_attempt_[0-9]{1,9}$'
+                                THEN CAST(
+                                    (regexp_match(s.idempotency_key, '^order_[0-9]+_attempt_([0-9]{1,9})$'))[1]
+                                    AS INTEGER
+                                )
+                                ELSE 0
+                            END
+                        ) AS max_suffix
                     FROM stripe_checkout_sessions s
-                    WHERE s.order_id = o.id
-                    ORDER BY s.id DESC
-                    LIMIT 1
-                ),
-                'order_' || o.id::text || '_attempt_1'
+                    GROUP BY s.order_id
+                ) sc ON sc.order_id = o.id
+                LEFT JOIN (
+                    SELECT
+                        p.order_id,
+                        MAX(
+                            CASE
+                                WHEN p.idempotency_key ~ '^order_[0-9]+_attempt_[0-9]{1,9}$'
+                                THEN CAST(
+                                    (regexp_match(p.idempotency_key, '^order_[0-9]+_attempt_([0-9]{1,9})$'))[1]
+                                    AS INTEGER
+                                )
+                                ELSE 0
+                            END
+                        ) AS max_suffix
+                    FROM payment_attempts p
+                    GROUP BY p.order_id
+                ) pa ON pa.order_id = o.id
             )
+            UPDATE orders o
+            SET
+                payment_attempt_seq = CASE
+                    WHEN ls.order_id IS NULL THEN 1
+                    WHEN ls.status IN ('failed', 'expired') THEN osb.highest_seq + 1
+                    ELSE osb.highest_seq
+                END,
+                active_attempt_key = CASE
+                    WHEN ls.order_id IS NULL THEN 'order_' || o.id::text || '_attempt_1'
+                    WHEN ls.status IN ('failed', 'expired') THEN 'order_' || o.id::text || '_attempt_' || (osb.highest_seq + 1)::text
+                    ELSE ls.idempotency_key
+                END
+            FROM order_seq_bounds osb
+            LEFT JOIN latest_session ls ON ls.order_id = osb.order_id
+            WHERE o.id = osb.order_id
             """
         )
     )

@@ -33,6 +33,43 @@ def test_internal_checkout_session_requires_valid_internal_token() -> None:
     )
     assert resp_wrong.status_code == 401
 
+    resp_cancel_wrong = client.post(
+        "/internal/payments/orders/1/cancel",
+        json={"reason": "cancel"},
+        headers={"X-Internal-Token": "wrong-token"},
+    )
+    assert resp_cancel_wrong.status_code == 401
+    assert resp_cancel_wrong.json()["detail"]["code"] == "INVALID_INTERNAL_TOKEN"
+
+
+def test_cancel_without_attempt_blocks_delayed_checkout_session(
+    db_session: Session,
+) -> None:
+    """Ако cancel е потвърден преди да има опит, закъснял checkout не може да създаде Stripe сесия."""
+    cancel_resp = client.post(
+        "/internal/payments/orders/95/cancel",
+        json={"reason": "cancel"},
+        headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+    )
+    assert cancel_resp.status_code == 200
+    assert cancel_resp.json()["status"] == "can_cancel"
+
+    mock_client = MagicMock(spec=StripeClient)
+    app.dependency_overrides[get_stripe_client] = lambda: mock_client
+    try:
+        late_checkout = client.post(
+            "/internal/payments/checkout-sessions",
+            json=build_internal_checkout_payload(order_id=95),
+            headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+        )
+        assert late_checkout.status_code == 409
+        assert late_checkout.json()["detail"]["code"] == "ORDER_STATUS_CONFLICT"
+        assert late_checkout.json()["detail"]["current_status"] == "cancelled"
+        assert mock_client.create_checkout_session.call_count == 0
+        assert db_session.query(PaymentAttempt).filter_by(order_id=95).count() == 0
+    finally:
+        app.dependency_overrides.pop(get_stripe_client, None)
+
 
 def test_checkout_session_amount_limits_and_idempotent_reuse(
     db_session: Session,

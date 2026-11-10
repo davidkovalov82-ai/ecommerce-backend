@@ -341,7 +341,29 @@ def test_extract_payments_service_migration(
             session.execute(
                 text(
                     "INSERT INTO orders (id, user_id, status, total_minor, currency, idempotency_key) "
-                    "VALUES (800, 800, 'pending_payment', 4200, 'EUR', 'idemp_k5_800')"
+                    "VALUES "
+                    "(800, 800, 'pending_payment', 4200, 'EUR', 'idemp_k5_800'), "
+                    "(801, 800, 'pending_payment', 4200, 'EUR', 'idemp_k5_801'), "
+                    "(802, 800, 'pending_payment', 4200, 'EUR', 'idemp_k5_802'), "
+                    "(803, 800, 'pending_payment', 4200, 'EUR', 'idemp_k5_803')"
+                )
+            )
+            session.execute(
+                text(
+                    "INSERT INTO stripe_checkout_sessions "
+                    "(id, order_id, status, amount_minor, currency, idempotency_key, mode) VALUES "
+                    "(8011, 801, 'failed', 4200, 'EUR', 'order_801_attempt_4', 'test'), "
+                    "(8012, 801, 'open', 4200, 'EUR', 'order_801_attempt_5', 'test'), "
+                    "(8021, 802, 'failed', 4200, 'EUR', 'order_802_attempt_1', 'test'), "
+                    "(8031, 803, 'failed', 4200, 'EUR', 'order_803_attempt_2', 'test'), "
+                    "(8032, 803, 'expired', 4200, 'EUR', 'order_803_attempt_4', 'test')"
+                )
+            )
+            session.execute(
+                text(
+                    "INSERT INTO payment_attempts "
+                    "(id, order_id, payment_method, status, amount_minor, currency, idempotency_key) VALUES "
+                    "(8033, 803, 'test_fail', 'declined', 4200, 'EUR', 'order_803_attempt_3')"
                 )
             )
             session.commit()
@@ -350,13 +372,25 @@ def test_extract_payments_service_migration(
         command.upgrade(alembic_cfg, "g1b2c3d4e5f6")
 
         with Session(temp_engine) as session:
-            row = session.execute(
-                text(
-                    "SELECT payment_attempt_seq, active_attempt_key FROM orders WHERE id = 800"
+            rows = (
+                session.execute(
+                    text(
+                        "SELECT id, payment_attempt_seq, active_attempt_key "
+                        "FROM orders WHERE id IN (800, 801, 802, 803) ORDER BY id ASC"
+                    )
                 )
-            ).one()
-            assert row.payment_attempt_seq == 1
-            assert row.active_attempt_key == "order_800_attempt_1"
+                .mappings()
+                .all()
+            )
+            assert [
+                (r["id"], r["payment_attempt_seq"], r["active_attempt_key"])
+                for r in rows
+            ] == [
+                (800, 1, "order_800_attempt_1"),
+                (801, 5, "order_801_attempt_5"),
+                (802, 2, "order_802_attempt_2"),
+                (803, 5, "order_803_attempt_5"),
+            ]
 
             # Запис на разхождение блокира downgrade без загуба на данни
             session.execute(

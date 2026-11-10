@@ -1,8 +1,9 @@
 """Бизнес логика на Payments сервиса: Checkout сесии, Stripe webhooks и сверка."""
 
 import datetime
+import logging
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -10,9 +11,12 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models import (
     PaymentAttempt,
+    PaymentDiscrepancy,
     StripeCheckoutSession,
     StripeProcessedEvent,
 )
+
+logger = logging.getLogger(__name__)
 from app.repository import PaymentRepository
 from app.schemas import (
     InternalCancelPaymentRequest,
@@ -92,6 +96,180 @@ class PaymentService:
             occurred_at=now,
         )
 
+    def _record_discrepancy(
+        self,
+        *,
+        source: Literal["webhook", "reconcile", "cancel_conflict"],
+        reason: str,
+        order_id: int | None = None,
+        payment_attempt_id: int | None = None,
+        stripe_session_id: str | None = None,
+        stripe_event_id: str | None = None,
+        expected_amount_minor: int | None = None,
+        actual_amount_minor: int | None = None,
+        expected_currency: str | None = None,
+        actual_currency: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        logger.warning(
+            "Payment validation discrepancy source=%s reason=%s order_id=%s payment_attempt_id=%s",
+            source,
+            reason,
+            order_id,
+            payment_attempt_id,
+        )
+        self._repo.record_discrepancy(
+            PaymentDiscrepancy(
+                order_id=order_id,
+                payment_attempt_id=payment_attempt_id,
+                stripe_session_id=stripe_session_id,
+                stripe_event_id=stripe_event_id,
+                source=source,
+                reason=reason,
+                expected_amount_minor=expected_amount_minor,
+                actual_amount_minor=actual_amount_minor,
+                expected_currency=expected_currency,
+                actual_currency=actual_currency,
+                details=details or {},
+            )
+        )
+
+    def _validate_and_record_paid_discrepancy(
+        self,
+        *,
+        source: Literal["webhook", "reconcile", "cancel_conflict"],
+        attempt: PaymentAttempt,
+        session_rec: StripeCheckoutSession,
+        session_obj: Any,
+        stripe_event_id: str | None = None,
+        event_livemode: bool | None = None,
+    ) -> str | None:
+        """Единна проверка на потвърдено Stripe плащане (режим, чужда сесия, сума, валута)."""
+        expected_livemode = settings.stripe_mode == "live"
+        retrieved_sid = _read_session_field(session_obj, "id", None)
+        session_livemode = _read_session_field(session_obj, "livemode", None)
+        raw_amount = _read_session_field(session_obj, "amount_total", None)
+        actual_amount = (
+            raw_amount
+            if isinstance(raw_amount, int) and not isinstance(raw_amount, bool)
+            else None
+        )
+        raw_currency = _read_session_field(session_obj, "currency", None)
+        actual_currency = (
+            str(raw_currency).upper() if raw_currency is not None else None
+        )
+
+        mismatch_reason: str | None = None
+        if (
+            event_livemode is not None and bool(event_livemode) != expected_livemode
+        ) or (
+            session_livemode is not None and bool(session_livemode) != expected_livemode
+        ):
+            mismatch_reason = "mode_mismatch"
+        elif (
+            attempt.mode != settings.stripe_mode
+            or session_rec.mode != settings.stripe_mode
+        ):
+            mismatch_reason = "attempt_mode_mismatch"
+        elif (
+            retrieved_sid is not None
+            and session_rec.stripe_session_id is not None
+            and str(retrieved_sid) != session_rec.stripe_session_id
+        ):
+            mismatch_reason = "session_id_mismatch"
+        else:
+            client_ref = _read_session_field(session_obj, "client_reference_id", None)
+            if (
+                client_ref is not None
+                and _parse_optional_int(client_ref) != attempt.order_id
+            ):
+                mismatch_reason = "session_order_mismatch"
+            else:
+                metadata = _read_session_field(session_obj, "metadata", None)
+                meta_oid = (
+                    _read_session_field(metadata, "order_id", None)
+                    if metadata is not None
+                    else None
+                )
+                meta_ak = (
+                    _read_session_field(metadata, "attempt_key", None)
+                    if metadata is not None
+                    else None
+                )
+                meta_paid = (
+                    _read_session_field(metadata, "payment_attempt_id", None)
+                    if metadata is not None
+                    else None
+                )
+                if (
+                    meta_oid is not None
+                    and _parse_optional_int(meta_oid) != attempt.order_id
+                ):
+                    mismatch_reason = "session_order_mismatch"
+                elif meta_ak is not None and str(meta_ak) != attempt.attempt_key:
+                    mismatch_reason = "session_attempt_key_mismatch"
+                elif (
+                    meta_paid is not None
+                    and _parse_optional_int(meta_paid) != attempt.id
+                ):
+                    mismatch_reason = "session_attempt_id_mismatch"
+
+        if mismatch_reason is None and (
+            actual_amount is None
+            or actual_amount != attempt.amount_minor
+            or actual_amount != session_rec.amount_minor
+        ):
+            mismatch_reason = "amount_mismatch"
+
+        if mismatch_reason is None and (
+            not actual_currency
+            or actual_currency != attempt.currency.upper()
+            or actual_currency != session_rec.currency.upper()
+        ):
+            mismatch_reason = "currency_mismatch"
+
+        if mismatch_reason is not None:
+            self._record_discrepancy(
+                source=source,
+                reason=mismatch_reason,
+                order_id=attempt.order_id,
+                payment_attempt_id=attempt.id,
+                stripe_session_id=str(retrieved_sid)
+                if retrieved_sid is not None
+                else session_rec.stripe_session_id,
+                stripe_event_id=stripe_event_id,
+                expected_amount_minor=attempt.amount_minor,
+                actual_amount_minor=actual_amount,
+                expected_currency=attempt.currency.upper(),
+                actual_currency=actual_currency,
+                details={
+                    "expected_mode": settings.stripe_mode,
+                    "session_livemode": session_livemode,
+                    "expected_stripe_session_id": session_rec.stripe_session_id,
+                },
+            )
+            return mismatch_reason
+        return None
+
+    def _complete_verified_payment(
+        self,
+        *,
+        attempt: PaymentAttempt,
+        session_rec: StripeCheckoutSession,
+        retrieved_sid: str | None = None,
+        stripe_event_id: str | None = None,
+    ) -> None:
+        if session_rec.stripe_session_id is None and retrieved_sid:
+            session_rec.stripe_session_id = retrieved_sid
+        attempt.status = "succeeded"
+        session_rec.status = "completed"
+        self._enqueue_outbox_event(
+            attempt=attempt,
+            session_record=session_rec,
+            event_type="payment.succeeded",
+            stripe_event_id=stripe_event_id,
+        )
+
     def _record_ignored_stripe_event(
         self,
         *,
@@ -145,6 +323,14 @@ class PaymentService:
                 is not None
             ):
                 raise OrderAlreadyPaid("Order is already paid")
+
+            closure = self._repo.get_order_closure_for_update(req.order_id)
+            if closure is not None:
+                self._session.commit()
+                raise PaymentStateConflict(
+                    current_status=closure.status,
+                    message=f"Cannot create checkout session for order in status '{closure.status}'",
+                )
 
             same_key_attempt = self._repo.get_attempt_by_order_and_key_for_update(
                 req.order_id, req.attempt_key
@@ -315,8 +501,11 @@ class PaymentService:
                         status="completed",
                     )
 
-                if attempt_rec.status in ("cancelling", "expired") or (
-                    session_rec.status in ("cancelling", "expired")
+                closure_after = self._repo.get_order_closure_for_update(req.order_id)
+                if (
+                    closure_after is not None
+                    or attempt_rec.status in ("cancelling", "expired")
+                    or session_rec.status in ("cancelling", "expired")
                 ):
                     attempt_rec.status = "cancelling"
                     session_rec.status = "cancelling"
@@ -340,8 +529,13 @@ class PaymentService:
                     if session_rec is not None:
                         session_rec.status = "expired"
                     self._session.commit()
+                    conflict_status = (
+                        closure_after.status
+                        if closure_after is not None
+                        else "cancelled"
+                    )
                     raise PaymentStateConflict(
-                        current_status="cancelled",
+                        current_status=conflict_status,
                         message="Order was cancelled while creating checkout session",
                     )
 
@@ -373,6 +567,7 @@ class PaymentService:
         req: InternalCancelPaymentRequest,
     ) -> InternalCancelPaymentResponse:
         """Проверява и прекратява активна Stripe сесия при отказ от поръчка или изтичане на резерва."""
+        closure_status = "cancelled" if req.reason == "cancel" else "expired"
         try:
             self._repo.acquire_order_lock(order_id)
 
@@ -385,6 +580,11 @@ class PaymentService:
 
             active_attempt = self._repo.get_active_attempt_by_order_for_update(order_id)
             if active_attempt is None:
+                self._repo.record_order_closure_idempotent(
+                    order_id=order_id,
+                    status=closure_status,
+                    reason=req.reason,
+                )
                 self._session.commit()
                 return InternalCancelPaymentResponse(status="can_cancel", action="none")
 
@@ -405,31 +605,24 @@ class PaymentService:
                 session_rec.stripe_session_id if session_rec is not None else None
             )
 
+            # Изходът от загубен отговор при initiated (без stripe_session_id) не може да се докаже локално:
+            # пазим резерва както при ръчна отмяна, така и при изтичане на срока.
             if active_attempt.status == "initiated" and not stripe_session_id:
-                if req.reason == "reserve_expired":
-                    active_attempt.status = "expired"
-                    if session_rec is not None:
-                        session_rec.status = "expired"
-                    self._enqueue_outbox_event(
-                        attempt=active_attempt,
-                        session_record=session_rec,
-                        event_type="payment.expired",
-                    )
-                    self._session.commit()
-                    return InternalCancelPaymentResponse(
-                        status="already_expired",
-                        action="expired_unestablished_attempt",
-                    )
                 self._session.commit()
                 raise PaymentStateConflict(
                     current_status="initiated",
-                    message="Payment session creation is in progress. Please retry once session is established.",
+                    message="Payment session creation outcome is unknown; reserve must be preserved.",
                 )
 
             if not stripe_session_id:
                 active_attempt.status = "expired"
                 if session_rec is not None:
                     session_rec.status = "expired"
+                self._repo.record_order_closure_idempotent(
+                    order_id=order_id,
+                    status=closure_status,
+                    reason=req.reason,
+                )
                 self._session.commit()
                 return InternalCancelPaymentResponse(
                     status="can_cancel", action="no_stripe_session"
@@ -455,7 +648,7 @@ class PaymentService:
             if "already expired" in err_msg:
                 pass
             elif "complete" in err_msg or "already paid" in err_msg:
-                # Платёжът може да е успял в същия момент: сверяваме директно със Stripe
+                # Плащането може да е успяло в същия момент: сверяваме директно със Stripe
                 self._sync_after_expire_conflict(
                     order_id, attempt_id, session_db_id, stripe_session_id
                 )
@@ -483,6 +676,11 @@ class PaymentService:
                 attempt_rec.status = "expired"
             if session_rec is not None:
                 session_rec.status = "expired"
+            self._repo.record_order_closure_idempotent(
+                order_id=order_id,
+                status=closure_status,
+                reason=req.reason,
+            )
             self._session.commit()
             return InternalCancelPaymentResponse(
                 status="can_cancel",
@@ -524,23 +722,49 @@ class PaymentService:
                 f"Failed to verify Stripe session after expire conflict: {type(exc).__name__}"
             ) from exc
 
-        payment_status = getattr(stripe_session, "payment_status", None)
-        stripe_state = getattr(stripe_session, "status", None)
+        payment_status = _read_session_field(stripe_session, "payment_status", None)
+        stripe_state = _read_session_field(stripe_session, "status", None)
 
         if payment_status == "paid":
             self._repo.acquire_order_lock(order_id)
             attempt_rec = self._repo.get_attempt_by_id_for_update(attempt_id)
             session_rec = self._repo.get_stripe_session_by_id_for_update(session_db_id)
-            if attempt_rec is not None:
-                attempt_rec.status = "succeeded"
-            if session_rec is not None:
-                session_rec.status = "completed"
-            if attempt_rec is not None:
-                self._enqueue_outbox_event(
-                    attempt=attempt_rec,
-                    session_record=session_rec,
-                    event_type="payment.succeeded",
+            if attempt_rec is None or session_rec is None:
+                self._record_discrepancy(
+                    source="cancel_conflict",
+                    reason="invalid_attempt",
+                    order_id=order_id,
+                    payment_attempt_id=attempt_id,
+                    stripe_session_id=stripe_session_id,
                 )
+                self._session.commit()
+                raise PaymentStateConflict(
+                    current_status="discrepancy",
+                    message="Payment attempt not found during cancel conflict verification",
+                )
+
+            mismatch_reason = self._validate_and_record_paid_discrepancy(
+                source="cancel_conflict",
+                attempt=attempt_rec,
+                session_rec=session_rec,
+                session_obj=stripe_session,
+            )
+            if mismatch_reason is not None:
+                if attempt_rec.status == "cancelling":
+                    attempt_rec.status = "open"
+                if session_rec.status == "cancelling":
+                    session_rec.status = "open"
+                self._session.commit()
+                raise PaymentStateConflict(
+                    current_status="discrepancy",
+                    message=f"Stripe payment validation discrepancy ({mismatch_reason}); order remains reserved",
+                )
+
+            self._complete_verified_payment(
+                attempt=attempt_rec,
+                session_rec=session_rec,
+                retrieved_sid=stripe_session_id,
+            )
             self._session.commit()
             raise OrderAlreadyPaid("Payment completed before cancellation could finish")
 
@@ -580,6 +804,15 @@ class PaymentService:
 
         expected_livemode = settings.stripe_mode == "live"
         if event.get("livemode") != expected_livemode:
+            self._record_discrepancy(
+                source="webhook",
+                reason="mode_mismatch",
+                stripe_event_id=event_id,
+                details={
+                    "expected_livemode": expected_livemode,
+                    "event_livemode": event.get("livemode"),
+                },
+            )
             return self._record_ignored_stripe_event(
                 event_id=event_id,
                 event_type=event_type,
@@ -605,6 +838,16 @@ class PaymentService:
             raw_obj.to_dict() if hasattr(raw_obj, "to_dict") else dict(raw_obj)
         )
         if "livemode" in session_data and session_data["livemode"] != expected_livemode:
+            self._record_discrepancy(
+                source="webhook",
+                reason="mode_mismatch",
+                stripe_session_id=session_data.get("id"),
+                stripe_event_id=event_id,
+                details={
+                    "expected_livemode": expected_livemode,
+                    "session_livemode": session_data.get("livemode"),
+                },
+            )
             return self._record_ignored_stripe_event(
                 event_id=event_id,
                 event_type=event_type,
@@ -655,6 +898,13 @@ class PaymentService:
                 stripe_session_id=stripe_session_id,
             )
             if session_rec is None or session_rec.order_id != order_id:
+                self._record_discrepancy(
+                    source="webhook",
+                    reason="invalid_attempt",
+                    order_id=order_id,
+                    stripe_session_id=stripe_session_id,
+                    stripe_event_id=event_id,
+                )
                 return self._record_ignored_stripe_event(
                     event_id=event_id,
                     event_type=event_type,
@@ -667,6 +917,13 @@ class PaymentService:
                 session_rec.payment_attempt_id
             )
             if attempt is None:
+                self._record_discrepancy(
+                    source="webhook",
+                    reason="invalid_attempt",
+                    order_id=order_id,
+                    stripe_session_id=stripe_session_id,
+                    stripe_event_id=event_id,
+                )
                 return self._record_ignored_stripe_event(
                     event_id=event_id,
                     event_type=event_type,
@@ -675,20 +932,43 @@ class PaymentService:
                     reason="invalid_attempt",
                 )
 
-            if session_rec.stripe_session_id is not None:
-                if session_rec.stripe_session_id != stripe_session_id:
-                    return self._record_ignored_stripe_event(
-                        event_id=event_id,
-                        event_type=event_type,
-                        order_id=order_id,
-                        payment_attempt_id=attempt.id,
-                        response_status="mismatched",
-                        reason="session_id_mismatch",
-                    )
-            else:
-                session_rec.stripe_session_id = stripe_session_id
+            if (
+                session_rec.stripe_session_id is not None
+                and session_rec.stripe_session_id != stripe_session_id
+            ):
+                self._record_discrepancy(
+                    source="webhook",
+                    reason="session_id_mismatch",
+                    order_id=order_id,
+                    payment_attempt_id=attempt.id,
+                    stripe_session_id=stripe_session_id,
+                    stripe_event_id=event_id,
+                    details={
+                        "expected_stripe_session_id": session_rec.stripe_session_id
+                    },
+                )
+                return self._record_ignored_stripe_event(
+                    event_id=event_id,
+                    event_type=event_type,
+                    order_id=order_id,
+                    payment_attempt_id=attempt.id,
+                    response_status="mismatched",
+                    reason="session_id_mismatch",
+                )
 
             if session_rec.mode != settings.stripe_mode:
+                self._record_discrepancy(
+                    source="webhook",
+                    reason="attempt_mode_mismatch",
+                    order_id=order_id,
+                    payment_attempt_id=attempt.id,
+                    stripe_session_id=stripe_session_id,
+                    stripe_event_id=event_id,
+                    details={
+                        "expected_mode": settings.stripe_mode,
+                        "attempt_mode": session_rec.mode,
+                    },
+                )
                 return self._record_ignored_stripe_event(
                     event_id=event_id,
                     event_type=event_type,
@@ -705,7 +985,9 @@ class PaymentService:
                 if event_type == "checkout.session.completed":
                     payment_status = session_data.get("payment_status")
                     if payment_status != "paid":
-                        if attempt.status != "succeeded":
+                        if session_rec.stripe_session_id is None and stripe_session_id:
+                            session_rec.stripe_session_id = stripe_session_id
+                        if attempt.status in ("initiated", "open"):
                             attempt.status = "processing"
                             session_rec.status = "processing"
                             self._enqueue_outbox_event(
@@ -714,55 +996,51 @@ class PaymentService:
                                 event_type="payment.processing",
                                 stripe_event_id=event_id,
                             )
+                            return self._commit_processed_event(
+                                event_id=event_id,
+                                event_type=event_type,
+                                order_id=order_id,
+                                payment_attempt_id=attempt.id,
+                                response_status="processing",
+                            )
+                        if attempt.status == "processing":
+                            return self._commit_processed_event(
+                                event_id=event_id,
+                                event_type=event_type,
+                                order_id=order_id,
+                                payment_attempt_id=attempt.id,
+                                response_status="processing",
+                            )
                         return self._commit_processed_event(
                             event_id=event_id,
                             event_type=event_type,
                             order_id=order_id,
                             payment_attempt_id=attempt.id,
-                            response_status="processing",
+                            response_status="ignored",
                         )
 
-                amount_total = session_data.get("amount_total")
-                currency = (session_data.get("currency") or "").upper()
-                require_amount = event_type == "checkout.session.completed"
-                if (require_amount and amount_total is None) or (
-                    amount_total is not None
-                    and (
-                        amount_total != attempt.amount_minor
-                        or amount_total != session_rec.amount_minor
-                    )
-                ):
-                    return self._record_ignored_stripe_event(
-                        event_id=event_id,
-                        event_type=event_type,
-                        order_id=order_id,
-                        payment_attempt_id=attempt.id,
-                        response_status="mismatched",
-                        reason="amount_mismatch",
-                    )
-
-                if (require_amount and not currency) or (
-                    currency
-                    and (
-                        currency != attempt.currency.upper()
-                        or currency != session_rec.currency.upper()
-                    )
-                ):
-                    return self._record_ignored_stripe_event(
-                        event_id=event_id,
-                        event_type=event_type,
-                        order_id=order_id,
-                        payment_attempt_id=attempt.id,
-                        response_status="mismatched",
-                        reason="currency_mismatch",
-                    )
-
-                attempt.status = "succeeded"
-                session_rec.status = "completed"
-                self._enqueue_outbox_event(
+                mismatch_reason = self._validate_and_record_paid_discrepancy(
+                    source="webhook",
                     attempt=attempt,
-                    session_record=session_rec,
-                    event_type="payment.succeeded",
+                    session_rec=session_rec,
+                    session_obj=session_data,
+                    stripe_event_id=event_id,
+                    event_livemode=event.get("livemode"),
+                )
+                if mismatch_reason is not None:
+                    return self._record_ignored_stripe_event(
+                        event_id=event_id,
+                        event_type=event_type,
+                        order_id=order_id,
+                        payment_attempt_id=attempt.id,
+                        response_status="mismatched",
+                        reason=mismatch_reason,
+                    )
+
+                self._complete_verified_payment(
+                    attempt=attempt,
+                    session_rec=session_rec,
+                    retrieved_sid=stripe_session_id,
                     stripe_event_id=event_id,
                 )
                 return self._commit_processed_event(
@@ -773,8 +1051,11 @@ class PaymentService:
                     response_status="success",
                 )
 
+            if session_rec.stripe_session_id is None and stripe_session_id:
+                session_rec.stripe_session_id = stripe_session_id
+
             if event_type == "checkout.session.async_payment_failed":
-                if attempt.status != "succeeded":
+                if attempt.status in ("initiated", "open", "processing", "cancelling"):
                     attempt.status = "failed"
                     session_rec.status = "failed"
                     self._enqueue_outbox_event(
@@ -792,7 +1073,7 @@ class PaymentService:
                 )
 
             if event_type == "checkout.session.expired":
-                if attempt.status != "succeeded":
+                if attempt.status in ("initiated", "open", "processing", "cancelling"):
                     attempt.status = "expired"
                     session_rec.status = "expired"
                     self._enqueue_outbox_event(
@@ -900,18 +1181,9 @@ class PaymentService:
                 session_rec.stripe_session_id if session_rec is not None else None
             )
 
+            # При загубен отговор (initiated без stripe_session_id) изходът в Stripe е неизвестен:
+            # НЕ обявяваме опитa за expired и НЕ освобождаваме резерва преди потвърждение.
             if attempt.status == "initiated" and not stripe_session_id:
-                if is_time_expired:
-                    attempt.status = "expired"
-                    if session_rec is not None:
-                        session_rec.status = "expired"
-                    self._enqueue_outbox_event(
-                        attempt=attempt,
-                        session_record=session_rec,
-                        event_type="payment.expired",
-                    )
-                    self._session.commit()
-                    return "expired"
                 self._session.commit()
                 return "deferred"
 
@@ -935,8 +1207,10 @@ class PaymentService:
         except Exception:  # noqa: BLE001
             return "deferred"
 
-        stripe_payment_status = getattr(stripe_session, "payment_status", None)
-        stripe_state = getattr(stripe_session, "status", None)
+        stripe_payment_status = _read_session_field(
+            stripe_session, "payment_status", None
+        )
+        stripe_state = _read_session_field(stripe_session, "status", None)
 
         try:
             if stripe_payment_status == "paid":
@@ -945,16 +1219,32 @@ class PaymentService:
                 session_rec = self._repo.get_stripe_session_by_id_for_update(
                     session_db_id
                 )
-                if attempt_rec is not None:
-                    attempt_rec.status = "succeeded"
-                if session_rec is not None:
-                    session_rec.status = "completed"
-                if attempt_rec is not None:
-                    self._enqueue_outbox_event(
-                        attempt=attempt_rec,
-                        session_record=session_rec,
-                        event_type="payment.succeeded",
+                if attempt_rec is None or session_rec is None:
+                    self._record_discrepancy(
+                        source="reconcile",
+                        reason="invalid_attempt",
+                        order_id=order_id,
+                        payment_attempt_id=attempt_id,
+                        stripe_session_id=stripe_session_id,
                     )
+                    self._session.commit()
+                    return "deferred"
+
+                mismatch_reason = self._validate_and_record_paid_discrepancy(
+                    source="reconcile",
+                    attempt=attempt_rec,
+                    session_rec=session_rec,
+                    session_obj=stripe_session,
+                )
+                if mismatch_reason is not None:
+                    self._session.commit()
+                    return "deferred"
+
+                self._complete_verified_payment(
+                    attempt=attempt_rec,
+                    session_rec=session_rec,
+                    retrieved_sid=stripe_session_id,
+                )
                 self._session.commit()
                 return "paid"
 
@@ -1053,8 +1343,20 @@ class PaymentService:
         return stats
 
 
+def _read_session_field(obj: Any, key: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    if hasattr(obj, "to_dict") and callable(obj.to_dict):
+        as_dict = obj.to_dict()
+        if isinstance(as_dict, dict):
+            return as_dict.get(key, default)
+    return getattr(obj, key, default)
+
+
 def _parse_optional_int(raw: Any) -> int | None:
-    if raw is None:
+    if raw is None or isinstance(raw, bool):
         return None
     try:
         return int(raw)

@@ -85,6 +85,8 @@ def db_session() -> Generator[Session]:
 def clean_payments_tables() -> Generator[None]:
     def _clean() -> None:
         with TestingSessionLocal() as session:
+            session.execute(text("DELETE FROM payment_discrepancies"))
+            session.execute(text("DELETE FROM payment_order_closures"))
             session.execute(text("DELETE FROM payment_outbox_events"))
             session.execute(text("DELETE FROM stripe_processed_events"))
             session.execute(text("DELETE FROM stripe_checkout_sessions"))
