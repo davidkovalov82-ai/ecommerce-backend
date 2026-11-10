@@ -6,9 +6,15 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_NAME="commerce-k5-e2e"
 COMPOSE_FILE="${ROOT_DIR}/compose.e2e.yaml"
 
+KEYS_DIR="$(mktemp -d "${ROOT_DIR}/.tmp_keys_${PROJECT_NAME}_XXXXXX")"
+bash "${ROOT_DIR}/scripts/prepare_e2e_keys.sh" "${KEYS_DIR}"
+export USERS_E2E_JWT_PRIVATE_KEY_PATH="${KEYS_DIR}/jwt_private.pem"
+export USERS_E2E_JWT_PUBLIC_KEY_PATH="${KEYS_DIR}/jwt_public.pem"
+
 cleanup() {
   echo "==> Cleaning up isolated K5 E2E stack (${PROJECT_NAME}) without touching working compose..."
   docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" down -v --remove-orphans >/dev/null 2>&1 || true
+  rm -rf "${KEYS_DIR:-}"
 }
 trap cleanup EXIT
 

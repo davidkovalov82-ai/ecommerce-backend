@@ -90,10 +90,11 @@ def main() -> None:
     assert cart_res.status_code == 200, f"Expected 200 OK, got {cart_res.status_code}: {cart_res.text}"
     cart_json = cart_res.json()
     assert "items" in cart_json, f"'items' field missing in cart response: {cart_json}"
-    print(f"    Cart retrieved successfully (items count: {len(cart_json['items'])}).")
+    assert cart_json["items"] == [], f"Expected empty items in cart, got: {cart_json['items']}"
+    print("    Cart retrieved successfully with empty items.")
 
     print("==> Step 4: Verify databases directly via PostgreSQL")
-    # 4.1 Проверка в базата на Users: акаунтът задължително съществува
+    # 4.1 Проверка в базата на Users: акаунтът съществува и има ID от отговора на API
     with psycopg.connect(USERS_DSN) as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT id, email, status, role FROM users WHERE email = %s",
@@ -101,20 +102,28 @@ def main() -> None:
         )
         users_row = cur.fetchone()
         assert users_row is not None, f"User {buyer_email} NOT found in Users database!"
-        assert users_row[0] == new_user_id
+        assert (
+            users_row[0] == new_user_id
+        ), f"Users row ID ({users_row[0]}) does not match API ID ({new_user_id})!"
         assert users_row[1] == buyer_email
         assert users_row[2] == "active"
-        print(f"    Users DB check: User found (id={users_row[0]}, email={users_row[1]}, status={users_row[2]}).")
+        print(
+            f"    Users DB check: User found with matching API ID (id={users_row[0]}, email={users_row[1]}, status={users_row[2]})."
+        )
 
-    # 4.2 Проверка в базата на Commerce: акаунтът задължително ЛИПСВА в commerce.users
+    # 4.2 Проверка в старата база на Commerce: няма съвпадение нито по email, нито по новия ID
     with psycopg.connect(COMMERCE_DSN) as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT id FROM users WHERE email = %s",
-            (buyer_email,),
+            "SELECT id, email FROM users WHERE email = %s OR id = %s",
+            (buyer_email, new_user_id),
         )
         commerce_row = cur.fetchone()
-        assert commerce_row is None, f"Shadow row found in commerce.users for {buyer_email}: {commerce_row}!"
-        print(f"    Commerce DB check: User {buyer_email} is ABSENT from commerce.users (no shadow row).")
+        assert commerce_row is None, (
+            f"Collision found in commerce.users for email={buyer_email} or id={new_user_id}: {commerce_row}!"
+        )
+        print(
+            f"    Commerce DB check: No match by email ({buyer_email}) or by ID ({new_user_id}) in commerce.users."
+        )
 
     print("\n✅ SUCCESS: 201 -> 200 -> 200 verified with real Commerce -> Users in Docker!")
 

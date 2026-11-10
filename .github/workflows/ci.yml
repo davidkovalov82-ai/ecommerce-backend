@@ -388,3 +388,27 @@ jobs:
 
       - name: Run isolated K5 E2E suite from repository root
         run: make test-k5-e2e
+
+  users-e2e-checks:
+    name: users-e2e-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.6"
+
+      - name: Install Python
+        run: uv python install 3.13
+
+      - name: Install locked commerce dependencies for Users E2E runner
+        working-directory: services/commerce
+        run: uv sync --locked --dev --python 3.13
+
+      - name: Run isolated Users E2E suite from repository root
+        run: make test-users-e2e

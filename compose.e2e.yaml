@@ -159,6 +159,22 @@ services:
       RABBITMQ_PASSWORD: guest
     command: sh -c "python scripts/process_outbox.py --daemon --poll-interval 0.2"
 
+  commerce-migrations-e2e:
+    build:
+      context: ./services/commerce
+      dockerfile: Dockerfile
+    restart: "no"
+    depends_on:
+      db-init-e2e:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: db-e2e
+      DB_PORT: "5432"
+      DB_USER: commerce_app
+      DB_PASSWORD: commerce_app
+      DB_NAME: commerce
+    command: sh -c "alembic upgrade head"
+
   users-e2e:
     build:
       context: ./services/users
@@ -167,6 +183,8 @@ services:
     restart: unless-stopped
     depends_on:
       db-init-e2e:
+        condition: service_completed_successfully
+      commerce-migrations-e2e:
         condition: service_completed_successfully
     environment:
       DB_HOST: db-e2e
@@ -187,13 +205,13 @@ services:
     ports:
       - "127.0.0.1:58002:8002"
     volumes:
-      - ./services/users/jwt_private.pem:/app/jwt_private.pem:ro
-      - ./services/users/jwt_public.pem:/app/jwt_public.pem:ro
+      - ${USERS_E2E_JWT_PRIVATE_KEY_PATH}:/app/jwt_private.pem:ro
+      - ${USERS_E2E_JWT_PUBLIC_KEY_PATH}:/app/jwt_public.pem:ro
     networks:
       default:
         aliases:
           - users
-    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8002"
+    command: sh -c "alembic upgrade head && python scripts/migrate_from_commerce.py --apply --commerce-url postgresql://commerce_app:commerce_app@db-e2e:5432/commerce --users-url postgresql://users_app:users_app@db-e2e:5432/users && uvicorn app.main:app --host 0.0.0.0 --port 8002"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=2)"]
       interval: 2s
@@ -205,7 +223,7 @@ services:
       context: ./services/commerce
       dockerfile: Dockerfile
     depends_on:
-      db-init-e2e:
+      commerce-migrations-e2e:
         condition: service_completed_successfully
       users-e2e:
         condition: service_healthy
@@ -229,10 +247,10 @@ services:
       RABBITMQ_USER: guest
       RABBITMQ_PASSWORD: guest
     volumes:
-      - ./services/users/jwt_public.pem:/app/jwt_public.pem:ro
+      - ${USERS_E2E_JWT_PUBLIC_KEY_PATH}:/app/jwt_public.pem:ro
     ports:
       - "127.0.0.1:58000:8000"
-    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    command: sh -c "uvicorn app.main:app --host 0.0.0.0 --port 8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/openapi.json', timeout=2)"]
       interval: 2s
@@ -244,7 +262,7 @@ services:
       context: ./services/commerce
       dockerfile: Dockerfile
     depends_on:
-      db-init-e2e:
+      commerce-migrations-e2e:
         condition: service_completed_successfully
       commerce-api-e2e:
         condition: service_healthy
@@ -267,7 +285,7 @@ services:
       context: ./services/commerce
       dockerfile: Dockerfile
     depends_on:
-      db-init-e2e:
+      commerce-migrations-e2e:
         condition: service_completed_successfully
       commerce-api-e2e:
         condition: service_healthy
@@ -288,7 +306,7 @@ services:
       RABBITMQ_USER: guest
       RABBITMQ_PASSWORD: guest
     volumes:
-      - ./services/users/jwt_public.pem:/app/jwt_public.pem:ro
+      - ${USERS_E2E_JWT_PUBLIC_KEY_PATH}:/app/jwt_public.pem:ro
     command: sh -c "python scripts/consume_payment_events.py --daemon"
 
   notifications-e2e:

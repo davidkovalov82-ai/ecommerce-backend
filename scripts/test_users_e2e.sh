@@ -6,9 +6,15 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_NAME="commerce-k6-e2e"
 COMPOSE_FILE="${ROOT_DIR}/compose.e2e.yaml"
 
+KEYS_DIR="$(mktemp -d "${ROOT_DIR}/.tmp_keys_${PROJECT_NAME}_XXXXXX")"
+bash "${ROOT_DIR}/scripts/prepare_e2e_keys.sh" "${KEYS_DIR}"
+export USERS_E2E_JWT_PRIVATE_KEY_PATH="${KEYS_DIR}/jwt_private.pem"
+export USERS_E2E_JWT_PUBLIC_KEY_PATH="${KEYS_DIR}/jwt_public.pem"
+
 cleanup() {
   echo "==> Cleaning up isolated Users E2E stack (${PROJECT_NAME})..."
   docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" down -v --remove-orphans >/dev/null 2>&1 || true
+  rm -rf "${KEYS_DIR:-}"
 }
 trap cleanup EXIT
 
@@ -24,4 +30,3 @@ echo "==> [2/3] Running reproducible Commerce -> Users E2E verification..."
 )
 
 echo "==> [3/3] Users isolated E2E suite completed successfully."
-

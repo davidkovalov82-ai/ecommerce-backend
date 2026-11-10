@@ -1,16 +1,17 @@
 # Session State
 
-- **Текуща задача**: Етап K6.1 — доказване на реална връзка Commerce → Users в Docker без подмени.
+- **Текуща задача**: Етап K6.1 — възпроизводим E2E Commerce → Users от чист checkout, изолация на ключове и CI.
 - **Реализирано**:
-  - `compose.e2e.yaml` и `compose.yaml`: добавена услуга `users-e2e` със собствена БД, Alembic миграции, RSA ключове (`jwt_public.pem:ro`), `/health` проверка и зависимост на Commerce.
-  - `scripts/users_e2e_verify.py` и `scripts/test_users_e2e.sh`: сценарий 201 (`POST /users`) → 200 (`POST /auth/login`) → 200 (`GET /cart`), с директна проверка в PostgreSQL (акаунтът е в `users.users` и отсъства в `commerce.users`).
-  - `Makefile`: добавена цел `test-users-e2e`.
+  - `scripts/prepare_e2e_keys.sh`: обща подготовка на временна 2048-битова RSA-двойка (Users: двата ключа, Commerce: само публичния; ключовете на разработчика не се докосват; почистване при изход).
+  - `compose.e2e.yaml`: контейнер `commerce-migrations-e2e` за предварителна подготовка на БД; `users-e2e` мигрира предишните акаунти и синхронизира брояча преди пускане на регистрацията.
+  - `scripts/users_e2e_verify.py`: усилена проверка (Users ред с ID от API, без съвпадение по email или ID в `commerce.users`, `GET /cart` връща празен `items`).
+  - `.github/workflows/ci.yml`: добавена стъпка `users-e2e-checks` с `make test-users-e2e`.
 - **Проверено локално**:
-  - `make test-users-e2e` (201 -> 200 -> 200, DB проверка: успешно);
-  - `make test-k4-e2e` (5/5 сценария успешни); `make test-k5-e2e` (всички K5 сценарии успешни);
-  - `services/commerce`: `ruff check .`, `ruff format --check .` (All checks passed, 118 files), `pytest -q` (309 passed);
-  - `services/users`: `ruff check .`, `ruff format --check .` (All checks passed, 33 files), `pytest -q` (57 passed).
-- **Непроверено**: окончателно изчистване на историческата таблица `commerce.users` и пълен завършек на K6.1.
+  - `make test-users-e2e`: успешно на чист стенд (ID=2, без колизия, празна количка);
+  - `make test-k4-e2e`: успешно (всички 5 сценария + DLQ);
+  - `make test-k5-e2e`: успешно (всички K5 сценарии + cutover);
+  - `ruff check .` и `ruff format --check .` в `services/commerce` (118) и `services/users` (33) чисти.
+- **Непроверено**: финално архивиране на старите потребителски модели в Commerce.
 - **Работещи команди**: `make test-users-e2e`, `make test-k4-e2e`, `make test-k5-e2e`.
-- **Засегнати файлове**: `Makefile`, `compose.e2e.yaml`, `compose.yaml`, `scripts/{test_users_e2e.sh,users_e2e_verify.py}`, `services/commerce/app/config.py`, `services/users/app/main.py`, `docs/session-state.md`.
-- **Следваща стъпка**: Довършване на останалите изисквания за пълно затваряне на K6.1 (миграция на данни и деактивация на стари модели).
+- **Засегнати файлове**: `compose.e2e.yaml`, `scripts/{prepare_e2e_keys.sh,test_*_e2e.sh,users_e2e_verify.py}`, `.github/workflows/ci.yml`, `docs/session-state.md`.
+- **Следваща стъпка**: Пълно затваряне на K6.1 след преглед на CI.
