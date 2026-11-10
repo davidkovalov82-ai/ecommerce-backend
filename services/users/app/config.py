@@ -41,6 +41,15 @@ class Settings(BaseSettings):
     jwt_private_key_path: str = ""
     jwt_public_key_path: str = ""
 
+    # SMTP настройки за имейл известия
+    smtp_host: str = "localhost"
+    smtp_port: int = 1025
+    smtp_from: str = "noreply@example.com"
+
+    # Настройки за възстановяване на парола
+    password_reset_expire_minutes: int = 15
+    password_reset_base_url: str = "http://localhost:8002/auth/password-reset/confirm"
+
     @property
     def database_url(self) -> str:
         """Синхронен PostgreSQL URL с psycopg драйвер."""

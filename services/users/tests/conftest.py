@@ -42,6 +42,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config import settings
 from app.dependencies import get_db_session
 from app.main import app
+from app.models import User
 
 # Задаваме ключовете директно в инстанцията на settings за текущия pytest процес
 settings.jwt_private_key = _test_private_pem
@@ -124,6 +125,8 @@ def clean_users_table() -> Generator[None]:
 
     def _clean() -> None:
         with TestingSessionLocal() as session:
+            session.execute(text("DELETE FROM account_moderation_logs"))
+            session.execute(text("DELETE FROM password_reset_tokens"))
             session.execute(text("DELETE FROM users"))
             session.commit()
 
@@ -149,3 +152,56 @@ def client(db_session: Session) -> Generator[TestClient]:
 def test_rsa_keys() -> tuple[str, str]:
     """Връща двойката (private_pem, public_pem) за проверка на токени в тестовете."""
     return _test_private_pem, _test_public_pem
+
+
+def create_user_and_token(
+    db_session: Session,
+    email: str = "user@example.com",
+    password: str = "DefaultPassword12345!",
+    role: str = "customer",
+    status: str = "active",
+    display_name: str | None = None,
+) -> tuple[User, str]:
+    """Създава потребител в БД и издава валиден RS256 JWT токен за тестове."""
+    from pwdlib import PasswordHash
+
+    from app.tokens import create_access_token
+
+    hasher = PasswordHash.recommended()
+    user = User(
+        email=email,
+        password_hash=hasher.hash(password),
+        role=role,
+        status=status,
+        display_name=display_name,
+        token_version=0,
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    token = create_access_token(
+        user_id=user.id,
+        role=user.role,
+        email=user.email,
+        token_version=user.token_version,
+        private_key=_test_private_pem,
+        algorithm="RS256",
+        issuer="ecommerce-users",
+        audience="ecommerce",
+    )
+    return user, token
+
+
+def create_admin(
+    db_session: Session,
+    email: str = "admin@example.com",
+    password: str = "AdminPassword12345!",
+) -> tuple[User, str]:
+    """Създава потребител с роля admin и валиден RS256 токен."""
+    return create_user_and_token(
+        db_session=db_session,
+        email=email,
+        password=password,
+        role="admin",
+    )

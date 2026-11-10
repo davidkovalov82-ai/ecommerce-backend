@@ -57,6 +57,8 @@ def test_migration_upgrade_and_downgrade_on_empty_db() -> None:
         inspector = inspect(engine)
         table_names = inspector.get_table_names()
         assert "users" in table_names
+        assert "password_reset_tokens" in table_names
+        assert "account_moderation_logs" in table_names
 
         columns = {c["name"]: c for c in inspector.get_columns("users")}
         assert "id" in columns
@@ -71,6 +73,8 @@ def test_migration_upgrade_and_downgrade_on_empty_db() -> None:
         command.downgrade(alembic_cfg, "base")
         inspector_after = inspect(engine)
         assert "users" not in inspector_after.get_table_names()
+        assert "password_reset_tokens" not in inspector_after.get_table_names()
+        assert "account_moderation_logs" not in inspector_after.get_table_names()
     finally:
         engine.dispose()
         with admin_engine.connect() as conn:

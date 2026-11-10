@@ -1,16 +1,16 @@
 # Session State
 
-- **Текуща задача**: Етап K6.1 (част 1) — отделен независим микросервис `services/users` с регистрация и вход.
+- **Текуща задача**: Етап K6.1 (част 2) — пренос на 8-те операции с акаунти в `services/users` (профил, пароли, модерация).
 - **Реализирано**:
-  - `services/users`: FastAPI, синхронен SQLAlchemy 2.0, PostgreSQL, Alembic, uv, pytest, Ruff. Архитектура API -> Service -> Repository.
-  - Изолирана PostgreSQL роля и база `users` (`scripts/postgres_db_init.sh`, `compose.yaml`). Порт `8002`.
-  - Модел `User` и миграция `0001_create_users_table.py` (id, email, password_hash, role='customer', status='active', token_version=0).
-  - Регистрация (`POST /users`), вход (`POST /auth/login`), здраве (`GET /health`) и публичен ключ (`GET /auth/public-key`).
-  - Асиметричен JWT (RS256, 15m, `iss="ecommerce-users"`, `aud="ecommerce"`, `sub`, `role`, `email`, `token_version`). Частен ключ извън Git; скрипт `scripts/generate_keys.py`.
-  - Dockerfile, compose конфигурация, .env.example, CI job `users-checks` в `.github/workflows/ci.yml`.
-  - 26 интеграционни теста (PostgreSQL): миграции, регистрация (дубликати, правила, роли), вход (грешни данни, блокировки), токени, персистентност.
-- **Проверено локално**: `services/users` ruff check/format (23 файла OK) + pytest (26 passed); реална миграция към `users` DB; Docker compose config; извличане на /health и /auth/public-key.
-- **Непроверено**: пълен Docker Compose build в чист Docker daemon; превключване на Commerce към Users (отложено за следващи части на K6.1).
-- **Работещи команди**: `cd services/users && uv run --locked pytest -q`, `cd services/users && uv run --locked ruff check . && uv run --locked ruff format --check .`, `docker compose up -d users`.
-- **Засегнати файлове**: `services/users/*`, `compose.yaml`, `scripts/postgres_db_init.sh`, `.github/workflows/ci.yml`, `README.md`, `TODO.md`, `docs/session-state.md`.
-- **Следваща стъпка**: Преглед и пускане на промените от потребителя, преминаване към следващата фаза на K6.1.
+  - `GET /users/me` и `PATCH /users/me` (редакция на `display_name`, забрана за роля/статус).
+  - `POST /users/me/change-password` (проверка на текуща парола, `token_version += 1`, отзоваване на сесии).
+  - `POST /auth/password-reset/request` и `confirm` (rate limiting, защита от enumeration, еднократен reset токен).
+  - `POST /users/{id}/block`, `/unblock`, `/close` (само за admin, одит лог, self-moderation и technical account защита).
+  - Миграция `0002_password_reset_and_moderation_tables.py` (`password_reset_tokens`, `account_moderation_logs`).
+  - `CurrentUserDep` и `AdminUserDep` с верификация на RS256 токена и прочитане на актуалния потребител от БД `users`.
+  - 43 интеграционни теста в `services/users`: пълен цикъл на профил, пароли, модерация, токени и персистентност.
+- **Проверено локално**: `services/users` ruff check/format (29 файла OK) + pytest (43 passed); миграция 0002 в `users` DB.
+- **Непроверено**: пренос на съществуващи потребители от Commerce към Users; маршрутизация/Gateway към новите пътища.
+- **Работещи команди**: `cd services/users && uv run --locked pytest -q`, `uv run --locked pytest tests/test_moderation.py::test_admin_block_and_unblock_cycle_and_token_invalidation`.
+- **Засегнати файлове**: `services/users/{app/{api,config,dependencies,mailer,models,repository,schemas,service}.py,migrations/versions/0002*,tests/*}`, `TODO.md`, `docs/session-state.md`.
+- **Следваща стъпка**: Скрипт за повторяем пренос на съществуващите потребители от Commerce към Users със запазване на ID и пароли.
