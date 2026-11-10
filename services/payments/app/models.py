@@ -222,7 +222,13 @@ class PaymentOutboxEvent(Base):
             name="uq_payment_outbox_attempt_event",
         ),
         CheckConstraint(
-            "event_type IN ('payment.succeeded', 'payment.processing', 'payment.failed', 'payment.expired')",
+            "event_type IN ("
+            "'payment.succeeded', "
+            "'payment.processing', "
+            "'payment.failed', "
+            "'payment.expired', "
+            "'payment.cancelled'"
+            ")",
             name="ck_payment_outbox_event_type_valid",
         ),
         CheckConstraint(

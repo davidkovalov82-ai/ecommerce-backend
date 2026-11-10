@@ -730,6 +730,15 @@ class OrderService:
                             else "expired"
                         )
 
+            elif event.event_type == "payment.cancelled":
+                # Потвърдена отмяна на цялата поръчка от Payments (игнорира вече платени/финализирани)
+                if order.status in ("paid", "cancelled", "expired"):
+                    outcome = "ignored"
+                else:
+                    order.status = "cancelled"
+                    self._restore_order_stock(order)
+                    outcome = "cancelled"
+
             inserted = self._order_repository.record_inbox_event_idempotent(
                 event_id=event.event_id,
                 event_type=event.event_type,

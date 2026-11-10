@@ -401,3 +401,113 @@ def test_amount_mismatch_and_missing_order_are_safe(db_session: Session) -> None
     inbox = db_session.get(OrderInboxEvent, missing_ev.event_id)
     assert inbox is not None
     assert inbox.outcome == "order_not_found"
+
+
+def test_payment_cancelled_completes_cancellation_and_ignores_duplicates_or_paid(
+    db_session: Session,
+) -> None:
+    """payment.cancelled перевежда неплатена поръчка в cancelled, игнорира повторения и не пипа paid."""
+    user, _ = _create_user_and_token(db_session, email="pcancel@example.com")
+    product = _create_product(db_session, "PCancelProd", price_minor=1000, stock=10)
+    future = datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=25)
+
+    # 1. Предхождащо payment.expired до края на резерва върти към attempt_2 (повторната оплата е позволена)
+    # Но последващо payment.cancelled (дори със стария key attempt_1) финализира цялата поръчка като cancelled
+    order_open = _create_order(
+        db_session, user.id, product, quantity=2, expires_at=future
+    )  # stock: 10 -> 8
+    svc = _new_service(db_session)
+    assert (
+        svc.apply_payment_event(
+            make_payment_event(
+                event_type="payment.expired",
+                order_id=order_open.id,
+                attempt_key=f"order_{order_open.id}_attempt_1",
+                amount_minor=2000,
+            )
+        )
+        == "expired"
+    )
+    db_session.refresh(order_open)
+    db_session.refresh(product)
+    assert order_open.status == "pending_payment"
+    assert order_open.current_attempt_key == f"order_{order_open.id}_attempt_2"
+    assert product.stock == 8
+
+    cancel_ev = make_payment_event(
+        event_type="payment.cancelled",
+        order_id=order_open.id,
+        attempt_key=f"order_{order_open.id}_attempt_1",
+        amount_minor=2000,
+    )
+    assert svc.apply_payment_event(cancel_ev) == "cancelled"
+    db_session.refresh(order_open)
+    db_session.refresh(product)
+    assert order_open.status == "cancelled"
+    assert product.stock == 10
+
+    # Дубликат и ново payment.cancelled не връщат stock повторно
+    assert svc.apply_payment_event(cancel_ev) == "already_processed"
+    dup_cancel_ev = make_payment_event(
+        event_type="payment.cancelled",
+        order_id=order_open.id,
+        attempt_key=f"order_{order_open.id}_attempt_1",
+        amount_minor=2000,
+    )
+    assert svc.apply_payment_event(dup_cancel_ev) == "ignored"
+    db_session.refresh(product)
+    assert product.stock == 10
+
+    # 2. payment_processing също се финализира като cancelled при потвърдена отмена
+    order_proc = _create_order(
+        db_session,
+        user.id,
+        product,
+        quantity=1,
+        status="payment_processing",
+        expires_at=future,
+    )  # stock: 10 -> 9
+    assert (
+        svc.apply_payment_event(
+            make_payment_event(
+                event_type="payment.cancelled",
+                order_id=order_proc.id,
+                attempt_key=f"order_{order_proc.id}_attempt_1",
+                amount_minor=1000,
+            )
+        )
+        == "cancelled"
+    )
+    db_session.refresh(order_proc)
+    db_session.refresh(product)
+    assert order_proc.status == "cancelled"
+    assert product.stock == 10
+
+    # 3. Вече платена поръчка НИКОГА не се превръща в cancelled и не връща stock
+    order_paid = _create_order(
+        db_session, user.id, product, quantity=3, expires_at=future
+    )  # stock: 10 -> 7
+    assert (
+        svc.apply_payment_event(
+            make_payment_event(
+                event_type="payment.succeeded",
+                order_id=order_paid.id,
+                amount_minor=3000,
+            )
+        )
+        == "paid"
+    )
+    assert (
+        svc.apply_payment_event(
+            make_payment_event(
+                event_type="payment.cancelled",
+                order_id=order_paid.id,
+                amount_minor=3000,
+            )
+        )
+        == "ignored"
+    )
+    db_session.refresh(order_paid)
+    db_session.refresh(product)
+    assert order_paid.status == "paid"
+    assert product.stock == 7

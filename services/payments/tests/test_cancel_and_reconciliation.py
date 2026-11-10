@@ -1349,9 +1349,15 @@ def test_interrupted_cancel_recovers_before_and_after_stripe_expire_and_preserve
     )
     assert (
         db_session.query(PaymentOutboxEvent)
-        .filter_by(order_id=550, event_type="payment.expired")
+        .filter_by(order_id=550, event_type="payment.cancelled")
         .count()
         == 1
+    )
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=550, event_type="payment.expired")
+        .count()
+        == 0
     )
 
     # --- Момент 2: рестарт СЛЕД успешен expire в Stripe, но ПРЕДИ запис в БД ---
@@ -1432,6 +1438,18 @@ def test_interrupted_cancel_recovers_before_and_after_stripe_expire_and_preserve
     assert (
         db_session.query(PaymentAttempt).filter_by(order_id=551).one().status
         == "expired"
+    )
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=551, event_type="payment.cancelled")
+        .count()
+        == 1
+    )
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=551, event_type="payment.expired")
+        .count()
+        == 0
     )
 
     # Повторен cancel минава идемпотентно (can_cancel), а нов checkout остава отказан
@@ -1520,6 +1538,115 @@ def test_interrupted_cancel_recovers_before_and_after_stripe_expire_and_preserve
     assert (
         db_session.query(PaymentOutboxEvent)
         .filter_by(order_id=552, event_type="payment.expired")
+        .count()
+        == 0
+    )
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=552, event_type="payment.cancelled")
+        .count()
+        == 0
+    )
+
+    # --- Прекъсната отмяна (cancelling), при която webhook вече е маркирал attempt='expired', все пак емитва payment.cancelled ---
+    a4 = PaymentAttempt(
+        order_id=553,
+        attempt_key="order_553_attempt_1",
+        status="expired",
+        amount_minor=2500,
+        currency="EUR",
+    )
+    db_session.add(a4)
+    db_session.flush()
+    db_session.add(
+        StripeCheckoutSession(
+            payment_attempt_id=a4.id,
+            order_id=553,
+            status="expired",
+            amount_minor=2500,
+            currency="EUR",
+            stripe_session_id="cs_crash_already_exp_553",
+            idempotency_key="order_553_attempt_1",
+        )
+    )
+    db_session.add(
+        PaymentOrderClosure(order_id=553, status="cancelling", reason="cancel")
+    )
+    # --- Прекъснат expiring резерв (TTL) емитва payment.expired, а НЕ payment.cancelled ---
+    a5 = PaymentAttempt(
+        order_id=554,
+        attempt_key="order_554_attempt_1",
+        status="cancelling",
+        amount_minor=2600,
+        currency="EUR",
+    )
+    db_session.add(a5)
+    db_session.flush()
+    db_session.add(
+        StripeCheckoutSession(
+            payment_attempt_id=a5.id,
+            order_id=554,
+            status="cancelling",
+            amount_minor=2600,
+            currency="EUR",
+            stripe_session_id="cs_crash_expiring_554",
+            idempotency_key="order_554_attempt_1",
+        )
+    )
+    db_session.add(
+        PaymentOrderClosure(order_id=554, status="expiring", reason="reserve_expired")
+    )
+    db_session.commit()
+
+    stripe_state["cs_crash_already_exp_553"] = {
+        "status": "expired",
+        "payment_status": "unpaid",
+        "amount_total": 2500,
+    }
+    stripe_state["cs_crash_expiring_554"] = {
+        "status": "open",
+        "payment_status": "unpaid",
+        "amount_total": 2600,
+    }
+    with session_factory() as s_extra:
+        svc_extra = PaymentService(
+            repository=PaymentRepository(s_extra),
+            session=s_extra,
+            stripe_client=mock_recover,
+        )
+        stats_extra = svc_extra.reconcile_unresolved_payments(now=now)
+        assert stats_extra == {
+            "checked": 2,
+            "expired": 2,
+            "paid": 0,
+            "deferred": 0,
+            "skipped": 0,
+        }
+
+    db_session.expire_all()
+    assert (
+        db_session.query(PaymentOrderClosure).filter_by(order_id=553).one().status
+        == "cancelled"
+    )
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=553, event_type="payment.cancelled")
+        .count()
+        == 1
+    )
+    assert (
+        db_session.query(PaymentOrderClosure).filter_by(order_id=554).one().status
+        == "expired"
+    )
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=554, event_type="payment.expired")
+        .count()
+        == 1
+    )
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=554, event_type="payment.cancelled")
         .count()
         == 0
     )

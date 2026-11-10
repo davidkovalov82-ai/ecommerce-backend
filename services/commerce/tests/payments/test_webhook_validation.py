@@ -79,6 +79,18 @@ def test_parse_rejects_pg_int_overflow_bool_version_and_unsupported_types() -> N
     with pytest.raises(UnsupportedPaymentEventVersion):
         parse_and_validate_payment_event(json.dumps(env_ver2).encode("utf-8"))
 
+    # Поддържани типове включват payment.cancelled
+    env_cancelled = make_payment_event_envelope(
+        event_type="payment.cancelled",
+        order_id=1,
+    )
+    assert (
+        parse_and_validate_payment_event(
+            json.dumps(env_cancelled).encode("utf-8")
+        ).event_type
+        == "payment.cancelled"
+    )
+
     # Неподдържан тип
     env_bad_type = make_payment_event_envelope(
         event_type="payment.refunded",

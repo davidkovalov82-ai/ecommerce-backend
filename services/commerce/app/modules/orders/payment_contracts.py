@@ -90,6 +90,7 @@ class ValidatedPaymentEvent:
         "payment.processing",
         "payment.failed",
         "payment.expired",
+        "payment.cancelled",
     ]
     event_version: int
     occurred_at: datetime.datetime
@@ -135,6 +136,7 @@ def parse_and_validate_payment_event(raw_body: bytes) -> ValidatedPaymentEvent:
         "payment.processing",
         "payment.failed",
         "payment.expired",
+        "payment.cancelled",
     ):
         raise UnsupportedPaymentEventType("unsupported_event_type")
 

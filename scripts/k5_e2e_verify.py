@@ -940,23 +940,13 @@ def verify_cancel_and_late_payment_discrepancy(seller_token: str) -> None:
     assert not any(s.get("client_reference_id") == str(oid_close) for s in all_sessions)
     assert get_product_stock(pid_close) == 6
 
-    # Допълнителна проверка #1 (прекъсната отмяна cancelling): блокира checkout до сверка и след reconcile_payments.py връща stock веднъж
+    # Допълнителна проверка #1 (прекъсната отмяна cancelling): блокира checkout до сверка и след reconcile_payments.py автоматично завършва в cancelled
     _, buyer_int = register_and_login(
         f"k5_int_cancel_{uuid.uuid4().hex[:8]}@example.com"
     )
     add_to_cart(buyer_int, pid_close, 2)  # stock 6 -> 4
     oid_int = int(create_order(buyer_int)["id"])
-    co_int = httpx.post(
-        f"{COMMERCE_API_URL}/orders/{oid_int}/checkout-session",
-        headers={"Authorization": f"Bearer {buyer_int}"},
-        timeout=5.0,
-    )
-    assert co_int.status_code == 200
-    sid_int = co_int.json()["session_id"]
-    # Допълнителна проверка #1 (прекъсната отмяна cancelling): блокира checkout до сверка и след reconcile_payments.py връща stock веднъж
-    _, buyer_int = register_and_login(f"k5_int_cancel_{uuid.uuid4().hex[:8]}@example.com")
-    add_to_cart(buyer_int, pid_close, 2)  # stock 6 -> 4
-    oid_int = int(create_order(buyer_int)["id"])
+    assert get_product_stock(pid_close) == 4
     co_int = httpx.post(
         f"{COMMERCE_API_URL}/orders/{oid_int}/checkout-session",
         headers={"Authorization": f"Bearer {buyer_int}"},
@@ -1006,13 +996,15 @@ def verify_cancel_and_late_payment_discrepancy(seller_token: str) -> None:
     ).json()
     assert mock_int["status"] == "expired"
 
-    r_int_finish = httpx.post(
-        f"{COMMERCE_API_URL}/orders/{oid_int}/cancel",
-        headers={"Authorization": f"Bearer {buyer_int}"},
-        timeout=5.0,
+    # БЕЗ повторен POST /cancel от клиента: Payments публикува payment.cancelled -> Commerce превежда поръчката в cancelled
+    wait_until(
+        "Interrupted cancel automatically completes order as cancelled via payment.cancelled",
+        lambda: (
+            True
+            if get_order_detail(buyer_int, oid_int)["status"] == "cancelled"
+            else None
+        ),
     )
-    assert r_int_finish.status_code == 200
-    assert r_int_finish.json()["status"] == "cancelled"
     assert get_product_stock(pid_close) == 6
     assert (
         httpx.post(
@@ -1022,6 +1014,145 @@ def verify_cancel_and_late_payment_discrepancy(seller_token: str) -> None:
         ).status_code
         == 409
     )
+
+    with psycopg.connect(PAYMENTS_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT event_id, event_type, payment_attempt_id, occurred_at, payload, status
+            FROM payment_outbox_events
+            WHERE order_id = %s AND event_type = 'payment.cancelled'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (oid_int,),
+        )
+        cancel_outbox_row = cur.fetchone()
+    assert cancel_outbox_row is not None
+    orig_cancel_eid, _, cancel_attempt_id, cancel_occ, cancel_payload, _ = (
+        cancel_outbox_row
+    )
+
+    # Повторно събитие (дубликат и ново събитие) + повторна сверка не променят остатъка 6
+    dup_cancel_eid = str(uuid.uuid4())
+    rmq_conn = pika.BlockingConnection(
+        pika.ConnectionParameters(
+            host="127.0.0.1",
+            port=55672,
+            credentials=pika.PlainCredentials("guest", "guest"),
+        )
+    )
+    try:
+        ch = rmq_conn.channel()
+        ch.confirm_delivery()
+        for eid in (orig_cancel_eid, dup_cancel_eid):
+            envelope = {
+                "event_id": eid,
+                "event_type": "payment.cancelled",
+                "event_version": 1,
+                "occurred_at": cancel_occ.isoformat(),
+                "producer": "payments",
+                "data": cancel_payload,
+            }
+            ch.basic_publish(
+                exchange="payments.events",
+                routing_key="payment.cancelled",
+                body=json.dumps(envelope).encode("utf-8"),
+                properties=pika.BasicProperties(delivery_mode=2),
+                mandatory=True,
+            )
+    finally:
+        rmq_conn.close()
+
+    wait_until(
+        "Repeated payment.cancelled processed idempotently in Commerce inbox",
+        lambda: (
+            True
+            if any(
+                r["event_id"] == dup_cancel_eid and r["outcome"] == "ignored"
+                for r in get_commerce_inbox_rows(oid_int)
+            )
+            else None
+        ),
+    )
+    assert isinstance(cancel_attempt_id, int) and cancel_attempt_id > 0
+
+    rec_int_repeat = compose_cmd(
+        "exec",
+        "-T",
+        "payments-e2e",
+        "python",
+        "scripts/reconcile_payments.py",
+        capture_output=True,
+    )
+    assert "expired=0" in rec_int_repeat.stdout and "paid=0" in rec_int_repeat.stdout, (
+        f"Unexpected repeat reconciliation stats: {rec_int_repeat.stdout}"
+    )
+    assert get_order_detail(buyer_int, oid_int)["status"] == "cancelled"
+    assert get_product_stock(pid_close) == 6
+
+    # Оплачена прервана отмена: Stripe вече показва complete/paid -> сверката дава paid, остатъкът остава списан
+    _, buyer_int_paid = register_and_login(
+        f"k5_int_paid_{uuid.uuid4().hex[:8]}@example.com"
+    )
+    add_to_cart(buyer_int_paid, pid_close, 1)  # stock 6 -> 5
+    oid_int_paid = int(create_order(buyer_int_paid)["id"])
+    co_int_paid = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid_int_paid}/checkout-session",
+        headers={"Authorization": f"Bearer {buyer_int_paid}"},
+        timeout=5.0,
+    )
+    assert co_int_paid.status_code == 200
+    sid_int_paid = co_int_paid.json()["session_id"]
+
+    with psycopg.connect(PAYMENTS_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE payment_attempts SET status = 'cancelling' WHERE order_id = %s",
+            (oid_int_paid,),
+        )
+        cur.execute(
+            "UPDATE stripe_checkout_sessions SET status = 'cancelling' WHERE order_id = %s",
+            (oid_int_paid,),
+        )
+        cur.execute(
+            """
+            INSERT INTO payment_order_closures (order_id, status, reason)
+            VALUES (%s, 'cancelling', 'cancel')
+            ON CONFLICT (order_id) DO UPDATE SET status = 'cancelling', reason = 'cancel'
+            """,
+            (oid_int_paid,),
+        )
+        conn.commit()
+
+    httpx.post(
+        f"{STRIPE_MOCK_URL}/_control/set_session",
+        json={
+            "session_id": sid_int_paid,
+            "status": "complete",
+            "payment_status": "paid",
+        },
+        timeout=5.0,
+    ).raise_for_status()
+
+    rec_int_paid = compose_cmd(
+        "exec",
+        "-T",
+        "payments-e2e",
+        "python",
+        "scripts/reconcile_payments.py",
+        capture_output=True,
+    )
+    assert "paid=1" in rec_int_paid.stdout
+
+    wait_until(
+        "Paid interrupted cancel completes order as paid",
+        lambda: (
+            True
+            if get_order_detail(buyer_int_paid, oid_int_paid)["status"] == "paid"
+            else None
+        ),
+    )
+    assert get_order_detail(buyer_int_paid, oid_int_paid)["status"] == "paid"
+    assert get_product_stock(pid_close) == 5
 
 
 def verify_reconciliation_scripts(seller_token: str) -> None:

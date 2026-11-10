@@ -132,6 +132,7 @@ class RabbitMQPaymentEventConsumer:
             "payment.processing",
             "payment.failed",
             "payment.expired",
+            "payment.cancelled",
         ):
             channel.queue_bind(
                 queue=self.events_queue,
