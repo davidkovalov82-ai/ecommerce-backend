@@ -58,6 +58,7 @@ def test_payments_0002_closures_discrepancies_upgrade_and_safe_downgrade() -> No
         command.upgrade(cfg, "0001")
         command.upgrade(cfg, "0002")
         command.upgrade(cfg, "0003")
+        command.upgrade(cfg, "0004")
 
         with Session(temp_engine) as session:
             session.execute(
@@ -70,10 +71,29 @@ def test_payments_0002_closures_discrepancies_upgrade_and_safe_downgrade() -> No
                 text(
                     "INSERT INTO payment_discrepancies "
                     "(order_id, payment_attempt_id, source, reason, details) "
-                    "VALUES (10, 1, 'webhook', 'amount_mismatch', '{}'::json)"
+                    "VALUES (10, 1, 'checkout', 'idempotency_window_expired', '{}'::json)"
                 )
             )
             session.commit()
+
+        # Не може да се свали 0004 -> 0003 при наличен checkout запис
+        try:
+            command.downgrade(cfg, "0003")
+            raise AssertionError(
+                "Expected RuntimeError when checkout discrepancies exist"
+            )
+        except RuntimeError as exc:
+            assert "checkout discrepancies" in str(exc)
+
+        with Session(temp_engine) as session:
+            session.execute(
+                text(
+                    "UPDATE payment_discrepancies SET source = 'webhook' WHERE order_id = 10"
+                )
+            )
+            session.commit()
+
+        command.downgrade(cfg, "0003")
 
         # Не може да се свали 0003 -> 0002 при наличен cancelling запис
         try:

@@ -18,6 +18,7 @@ from app.main import app
 from app.models import (
     PaymentAttempt,
     PaymentDiscrepancy,
+    PaymentOrderClosure,
     PaymentOutboxEvent,
     StripeCheckoutSession,
 )
@@ -1088,3 +1089,437 @@ def test_reconcile_initiated_without_session_outside_window_records_discrepancy(
         .all()
     )
     assert len(discrepancies) == 1
+
+
+def test_old_initiated_attempt_blocks_stripe_create_on_checkout_and_reconcile_deduplicates_discrepancy(
+    db_session: Session,
+) -> None:
+    """Единна проверка на безопасния срок: старият initiated не вика Stripe create нито при checkout, нито при сверка."""
+    now = datetime.datetime.now(datetime.UTC)
+    too_old = now - datetime.timedelta(
+        seconds=settings.stripe_idempotency_window_seconds + 3600
+    )
+    attempt = PaymentAttempt(
+        order_id=543,
+        attempt_key="order_543_attempt_1",
+        status="initiated",
+        amount_minor=5100,
+        currency="EUR",
+        order_expires_at=now + datetime.timedelta(minutes=15),
+        created_at=too_old,
+    )
+    db_session.add(attempt)
+    db_session.flush()
+    db_session.add(
+        StripeCheckoutSession(
+            payment_attempt_id=attempt.id,
+            order_id=543,
+            status="initiated",
+            amount_minor=5100,
+            currency="EUR",
+            idempotency_key="order_543_attempt_1",
+            created_at=too_old,
+        )
+    )
+    db_session.commit()
+
+    mock_stripe = MagicMock(spec=StripeClient)
+    app.dependency_overrides[get_stripe_client] = lambda: mock_stripe
+    try:
+        # 1. Обикновеният checkout отказва старата initiated-попытка без Stripe повик
+        r_co = client.post(
+            "/internal/payments/checkout-sessions",
+            json={
+                "order_id": 543,
+                "attempt_key": "order_543_attempt_1",
+                "amount_minor": 5100,
+                "currency": "EUR",
+                "line_items": [{"name": "Item", "unit_amount": 5100, "quantity": 1}],
+            },
+            headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+        )
+        assert r_co.status_code == 409
+        assert r_co.json()["detail"]["code"] == "ORDER_STATUS_CONFLICT"
+        assert r_co.json()["detail"]["current_status"] == "discrepancy"
+        mock_stripe.create_checkout_session.assert_not_called()
+
+        # 2. Повторните фонови сверки също не викат Stripe create и НЕ дублират записа за разбор
+        svc = PaymentService(
+            repository=PaymentRepository(db_session),
+            session=db_session,
+            stripe_client=mock_stripe,
+        )
+        assert svc.reconcile_unresolved_payments(now=now) == {
+            "checked": 1,
+            "expired": 0,
+            "paid": 0,
+            "deferred": 1,
+            "skipped": 0,
+        }
+        assert svc.reconcile_unresolved_payments(now=now) == {
+            "checked": 1,
+            "expired": 0,
+            "paid": 0,
+            "deferred": 1,
+            "skipped": 0,
+        }
+        mock_stripe.create_checkout_session.assert_not_called()
+    finally:
+        app.dependency_overrides.pop(get_stripe_client, None)
+
+    discrepancies = (
+        db_session.query(PaymentDiscrepancy)
+        .filter_by(order_id=543, reason="idempotency_window_expired")
+        .all()
+    )
+    assert len(discrepancies) == 1
+    assert discrepancies[0].source == "checkout"
+
+
+def test_interrupted_cancel_recovers_before_and_after_stripe_expire_and_preserves_paid(
+    db_session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Прекъсната отмяна (преди Stripe expire, след Stripe expire и при спечелило плащане) се възстановява без timer unlock."""
+
+    class SimulatedProcessCrash(BaseException):
+        pass
+
+    now = datetime.datetime.now(datetime.UTC)
+
+    # --- Момент 1: рестарт след запис cancelling в БД, ПРЕДИ expire в Stripe ---
+    a1 = PaymentAttempt(
+        order_id=550,
+        attempt_key="order_550_attempt_1",
+        status="open",
+        amount_minor=4000,
+        currency="EUR",
+    )
+    db_session.add(a1)
+    db_session.flush()
+    db_session.add(
+        StripeCheckoutSession(
+            payment_attempt_id=a1.id,
+            order_id=550,
+            status="open",
+            amount_minor=4000,
+            currency="EUR",
+            stripe_session_id="cs_crash_before_550",
+            checkout_url="https://checkout.stripe.com/pay/cs_crash_before_550",
+            idempotency_key="order_550_attempt_1",
+        )
+    )
+    db_session.commit()
+
+    stripe_state: dict[str, dict[str, Any]] = {
+        "cs_crash_before_550": {
+            "id": "cs_crash_before_550",
+            "status": "open",
+            "payment_status": "unpaid",
+            "livemode": False,
+        },
+        "cs_crash_after_551": {
+            "id": "cs_crash_after_551",
+            "status": "open",
+            "payment_status": "unpaid",
+            "livemode": False,
+        },
+        "cs_crash_paid_552": {
+            "id": "cs_crash_paid_552",
+            "status": "complete",
+            "payment_status": "paid",
+            "livemode": False,
+            "amount_total": 6000,
+            "currency": "eur",
+            "client_reference_id": "552",
+            "metadata": {"order_id": "552", "attempt_key": "order_552_attempt_1"},
+        },
+    }
+
+    mock_crash_1 = MagicMock(spec=StripeClient)
+    mock_crash_1.expire_checkout_session.side_effect = SimulatedProcessCrash(
+        "kill before stripe expire"
+    )
+    app.dependency_overrides[get_stripe_client] = lambda: mock_crash_1
+    try:
+        try:
+            client.post(
+                "/internal/payments/orders/550/cancel",
+                json={"reason": "cancel"},
+                headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+            )
+            raise AssertionError("Expected SimulatedProcessCrash")
+        except SimulatedProcessCrash:
+            pass
+    finally:
+        app.dependency_overrides.pop(get_stripe_client, None)
+
+    assert stripe_state["cs_crash_before_550"]["status"] == "open"
+    closure_550 = db_session.query(PaymentOrderClosure).filter_by(order_id=550).one()
+    assert closure_550.status == "cancelling"
+
+    # Докато изходът не е установен: нов checkout е забранен (409), а таймаут на Stripe не сваля блокировката дори след +48ч
+    mock_blocked = MagicMock(spec=StripeClient)
+    mock_blocked.retrieve_checkout_session.side_effect = TimeoutError("Stripe offline")
+    app.dependency_overrides[get_stripe_client] = lambda: mock_blocked
+    try:
+        r_blocked_co = client.post(
+            "/internal/payments/checkout-sessions",
+            json={
+                "order_id": 550,
+                "attempt_key": "order_550_attempt_2",
+                "amount_minor": 4000,
+                "currency": "EUR",
+                "line_items": [{"name": "Item", "unit_amount": 4000, "quantity": 1}],
+            },
+            headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+        )
+        assert r_blocked_co.status_code == 409
+        assert r_blocked_co.json()["detail"]["current_status"] == "cancelling"
+        mock_blocked.create_checkout_session.assert_not_called()
+
+        r_reserve = client.post(
+            "/internal/payments/orders/550/cancel",
+            json={"reason": "reserve_expired"},
+            headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+        )
+        assert r_reserve.status_code == 409
+
+        with session_factory() as s_down:
+            svc_down = PaymentService(
+                repository=PaymentRepository(s_down),
+                session=s_down,
+                stripe_client=mock_blocked,
+            )
+            stats_down = svc_down.reconcile_unresolved_payments(
+                now=now + datetime.timedelta(hours=48)
+            )
+            assert stats_down["deferred"] == 1
+            assert stats_down["expired"] == 0
+    finally:
+        app.dependency_overrides.pop(get_stripe_client, None)
+
+    db_session.expire_all()
+    assert (
+        db_session.query(PaymentOrderClosure).filter_by(order_id=550).one().status
+        == "cancelling"
+    )
+
+    # След рестарт Stripe отговаря -> сверката извиква expire и финализира отмяната
+    expire_calls: list[str] = []
+    mock_recover = MagicMock(spec=StripeClient)
+    mock_recover.retrieve_checkout_session.side_effect = lambda sid: SimpleNamespace(
+        **stripe_state[sid]
+    )
+
+    def _mock_expire(sid: str) -> Any:
+        expire_calls.append(sid)
+        stripe_state[sid]["status"] = "expired"
+        return SimpleNamespace(**stripe_state[sid])
+
+    mock_recover.expire_checkout_session.side_effect = _mock_expire
+
+    with session_factory() as s_restart:
+        svc_restart = PaymentService(
+            repository=PaymentRepository(s_restart),
+            session=s_restart,
+            stripe_client=mock_recover,
+        )
+        stats_1 = svc_restart.reconcile_unresolved_payments(now=now)
+        assert stats_1 == {
+            "checked": 1,
+            "expired": 1,
+            "paid": 0,
+            "deferred": 0,
+            "skipped": 0,
+        }
+        stats_restart_repeat = svc_restart.reconcile_unresolved_payments(now=now)
+        assert stats_restart_repeat["checked"] == 0
+
+    assert expire_calls == ["cs_crash_before_550"]
+    assert stripe_state["cs_crash_before_550"]["status"] == "expired"
+    db_session.expire_all()
+    assert (
+        db_session.query(PaymentOrderClosure).filter_by(order_id=550).one().status
+        == "cancelled"
+    )
+    assert (
+        db_session.query(PaymentAttempt).filter_by(order_id=550).one().status
+        == "expired"
+    )
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=550, event_type="payment.expired")
+        .count()
+        == 1
+    )
+
+    # --- Момент 2: рестарт СЛЕД успешен expire в Stripe, но ПРЕДИ запис в БД ---
+    a2 = PaymentAttempt(
+        order_id=551,
+        attempt_key="order_551_attempt_1",
+        status="open",
+        amount_minor=4500,
+        currency="EUR",
+    )
+    db_session.add(a2)
+    db_session.flush()
+    db_session.add(
+        StripeCheckoutSession(
+            payment_attempt_id=a2.id,
+            order_id=551,
+            status="open",
+            amount_minor=4500,
+            currency="EUR",
+            stripe_session_id="cs_crash_after_551",
+            checkout_url="https://checkout.stripe.com/pay/cs_crash_after_551",
+            idempotency_key="order_551_attempt_1",
+        )
+    )
+    db_session.commit()
+
+    mock_crash_2 = MagicMock(spec=StripeClient)
+    mock_crash_2.expire_checkout_session.side_effect = _mock_expire
+    app.dependency_overrides[get_stripe_client] = lambda: mock_crash_2
+    try:
+        with patch.object(
+            PaymentRepository,
+            "finalize_order_closure",
+            side_effect=SimulatedProcessCrash("kill before Phase 3 DB write"),
+        ):
+            try:
+                client.post(
+                    "/internal/payments/orders/551/cancel",
+                    json={"reason": "cancel"},
+                    headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+                )
+                raise AssertionError("Expected SimulatedProcessCrash")
+            except SimulatedProcessCrash:
+                pass
+    finally:
+        app.dependency_overrides.pop(get_stripe_client, None)
+
+    assert stripe_state["cs_crash_after_551"]["status"] == "expired"
+    db_session.expire_all()
+    assert (
+        db_session.query(PaymentOrderClosure).filter_by(order_id=551).one().status
+        == "cancelling"
+    )
+
+    expire_calls.clear()
+    with session_factory() as s_restart_2:
+        svc_2 = PaymentService(
+            repository=PaymentRepository(s_restart_2),
+            session=s_restart_2,
+            stripe_client=mock_recover,
+        )
+        stats_2 = svc_2.reconcile_unresolved_payments(now=now)
+        assert stats_2 == {
+            "checked": 1,
+            "expired": 1,
+            "paid": 0,
+            "deferred": 0,
+            "skipped": 0,
+        }
+
+    # Stripe вече е expired -> сверката НЕ вика expire повторно и финализира отмяната
+    assert expire_calls == []
+    db_session.expire_all()
+    assert (
+        db_session.query(PaymentOrderClosure).filter_by(order_id=551).one().status
+        == "cancelled"
+    )
+    assert (
+        db_session.query(PaymentAttempt).filter_by(order_id=551).one().status
+        == "expired"
+    )
+
+    # Повторен cancel минава идемпотентно (can_cancel), а нов checkout остава отказан
+    app.dependency_overrides[get_stripe_client] = lambda: mock_recover
+    try:
+        for oid_done in (550, 551):
+            r_cancel_done = client.post(
+                f"/internal/payments/orders/{oid_done}/cancel",
+                json={"reason": "cancel"},
+                headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+            )
+            assert r_cancel_done.status_code == 200
+            assert r_cancel_done.json()["status"] == "can_cancel"
+
+            r_new_co = client.post(
+                "/internal/payments/checkout-sessions",
+                json={
+                    "order_id": oid_done,
+                    "attempt_key": f"order_{oid_done}_attempt_2",
+                    "amount_minor": 4000,
+                    "currency": "EUR",
+                    "line_items": [
+                        {"name": "Item", "unit_amount": 4000, "quantity": 1}
+                    ],
+                },
+                headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+            )
+            assert r_new_co.status_code == 409
+        mock_recover.create_checkout_session.assert_not_called()
+    finally:
+        app.dependency_overrides.pop(get_stripe_client, None)
+
+    # --- Подтверждённая оплата не превращается в отмену ---
+    a3 = PaymentAttempt(
+        order_id=552,
+        attempt_key="order_552_attempt_1",
+        status="cancelling",
+        amount_minor=6000,
+        currency="EUR",
+    )
+    db_session.add(a3)
+    db_session.flush()
+    db_session.add(
+        StripeCheckoutSession(
+            payment_attempt_id=a3.id,
+            order_id=552,
+            status="cancelling",
+            amount_minor=6000,
+            currency="EUR",
+            stripe_session_id="cs_crash_paid_552",
+            idempotency_key="order_552_attempt_1",
+        )
+    )
+    db_session.add(
+        PaymentOrderClosure(order_id=552, status="cancelling", reason="cancel")
+    )
+    db_session.commit()
+
+    with session_factory() as s_paid:
+        svc_paid = PaymentService(
+            repository=PaymentRepository(s_paid),
+            session=s_paid,
+            stripe_client=mock_recover,
+        )
+        stats_paid = svc_paid.reconcile_unresolved_payments(now=now)
+        assert stats_paid == {
+            "checked": 1,
+            "expired": 0,
+            "paid": 1,
+            "deferred": 0,
+            "skipped": 0,
+        }
+
+    db_session.expire_all()
+    assert db_session.query(PaymentOrderClosure).filter_by(order_id=552).first() is None
+    assert (
+        db_session.query(PaymentAttempt).filter_by(order_id=552).one().status
+        == "succeeded"
+    )
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=552, event_type="payment.succeeded")
+        .count()
+        == 1
+    )
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=552, event_type="payment.expired")
+        .count()
+        == 0
+    )

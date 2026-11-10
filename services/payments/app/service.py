@@ -99,7 +99,7 @@ class PaymentService:
     def _record_discrepancy(
         self,
         *,
-        source: Literal["webhook", "reconcile", "cancel_conflict"],
+        source: Literal["webhook", "reconcile", "cancel_conflict", "checkout"],
         reason: str,
         order_id: int | None = None,
         payment_attempt_id: int | None = None,
@@ -295,6 +295,45 @@ class PaymentService:
             "idempotency_key": idempotency_key,
         }
 
+    def _ensure_initiated_within_safe_window(
+        self,
+        *,
+        attempt: PaymentAttempt,
+        source: Literal["reconcile", "checkout"],
+        current_time: datetime.datetime,
+    ) -> bool:
+        """Единна проверка на безопасния срок за повтор на Stripe create_checkout_session."""
+        created_utc = _ensure_utc(attempt.created_at)
+        curr_utc = _ensure_utc(current_time)
+        if (curr_utc - created_utc) <= datetime.timedelta(
+            seconds=settings.stripe_idempotency_window_seconds
+        ):
+            return True
+
+        if not self._repo.has_discrepancy(
+            payment_attempt_id=attempt.id,
+            reason="idempotency_window_expired",
+        ):
+            self._record_discrepancy(
+                source=source,
+                reason="idempotency_window_expired",
+                order_id=attempt.order_id,
+                payment_attempt_id=attempt.id,
+                expected_amount_minor=attempt.amount_minor,
+                expected_currency=attempt.currency.upper(),
+                details={
+                    "attempt_key": attempt.attempt_key,
+                    "attempt_created_at": created_utc.isoformat(),
+                    "order_expires_at": (
+                        _ensure_utc(attempt.order_expires_at).isoformat()
+                        if attempt.order_expires_at is not None
+                        else None
+                    ),
+                    "window_seconds": settings.stripe_idempotency_window_seconds,
+                },
+            )
+        return False
+
     def _record_ignored_stripe_event(
         self,
         *,
@@ -423,6 +462,19 @@ class PaymentService:
                         )
                         self._repo.add_stripe_session(session_record)
                         self._session.flush()
+                    if (
+                        not session_record.stripe_session_id
+                        and not self._ensure_initiated_within_safe_window(
+                            attempt=attempt,
+                            source="checkout",
+                            current_time=datetime.datetime.now(datetime.UTC),
+                        )
+                    ):
+                        self._session.commit()
+                        raise PaymentStateConflict(
+                            current_status="discrepancy",
+                            message="Payment initiation exceeded safe Stripe idempotency window; manual review required",
+                        )
                 else:
                     raise PaymentStateConflict(
                         current_status=active_attempt.status,
@@ -1370,7 +1422,7 @@ class PaymentService:
             closure = self._repo.get_order_closure_for_update(order_id)
             if closure is not None and closure.status in ("cancelling", "expiring"):
                 self._session.commit()
-                return "deferred"
+                return self.reconcile_interrupted_closure(order_id, current_time)
 
             curr_utc = _ensure_utc(current_time)
             is_time_expired = (
@@ -1386,35 +1438,11 @@ class PaymentService:
             local_status = attempt.status
 
             if local_status == "initiated" and not stripe_session_id:
-                created_utc = _ensure_utc(attempt.created_at)
-                within_safe_window = (curr_utc - created_utc) <= datetime.timedelta(
-                    seconds=settings.stripe_idempotency_window_seconds
-                )
-
-                if not within_safe_window:
-                    if not self._repo.has_discrepancy(
-                        payment_attempt_id=attempt.id,
-                        source="reconcile",
-                        reason="idempotency_window_expired",
-                    ):
-                        self._record_discrepancy(
-                            source="reconcile",
-                            reason="idempotency_window_expired",
-                            order_id=order_id,
-                            payment_attempt_id=attempt.id,
-                            expected_amount_minor=attempt.amount_minor,
-                            expected_currency=attempt.currency.upper(),
-                            details={
-                                "attempt_key": attempt.attempt_key,
-                                "attempt_created_at": created_utc.isoformat(),
-                                "order_expires_at": (
-                                    _ensure_utc(attempt.order_expires_at).isoformat()
-                                    if attempt.order_expires_at is not None
-                                    else None
-                                ),
-                                "window_seconds": settings.stripe_idempotency_window_seconds,
-                            },
-                        )
+                if not self._ensure_initiated_within_safe_window(
+                    attempt=attempt,
+                    source="reconcile",
+                    current_time=curr_utc,
+                ):
                     self._session.commit()
                     return "deferred"
 
@@ -1613,20 +1641,540 @@ class PaymentService:
             self._session.rollback()
             raise
 
+    def reconcile_interrupted_closure(
+        self, order_id: int, current_time: datetime.datetime
+    ) -> str:
+        """Восстанавливает прерванную после записи cancelling/expiring отмену по Stripe без DB lock при I/O."""
+        try:
+            self._repo.acquire_order_lock(order_id)
+            closure = self._repo.get_order_closure_for_update(order_id)
+            if closure is None or closure.status not in ("cancelling", "expiring"):
+                self._session.commit()
+                return "skipped"
+
+            final_closure_status = (
+                "cancelled" if closure.status == "cancelling" else "expired"
+            )
+            closure_reason = closure.reason
+
+            if (
+                self._repo.get_succeeded_attempt_by_order_for_update(order_id)
+                is not None
+            ):
+                self._repo.clear_transient_order_closure(order_id)
+                self._session.commit()
+                return "paid"
+
+            active_attempt = self._repo.get_active_attempt_by_order_for_update(order_id)
+            target_attempt = (
+                active_attempt
+                or self._repo.get_latest_attempt_by_order_for_update(order_id)
+            )
+            if target_attempt is None:
+                self._repo.finalize_order_closure(
+                    order_id=order_id,
+                    status=final_closure_status,
+                    reason=closure_reason,
+                )
+                self._session.commit()
+                return "expired"
+
+            session_rec = self._repo.get_stripe_session_by_attempt_id_for_update(
+                target_attempt.id
+            )
+            stripe_session_id = (
+                session_rec.stripe_session_id if session_rec is not None else None
+            )
+            attempt_id = target_attempt.id
+            session_db_id = session_rec.id if session_rec is not None else None
+            target_status = target_attempt.status
+
+            if not stripe_session_id:
+                if target_status in ("cancelling", "failed", "expired", "declined"):
+                    if target_status == "cancelling":
+                        target_attempt.status = "expired"
+                        if session_rec is not None:
+                            session_rec.status = "expired"
+                        self._enqueue_outbox_event(
+                            attempt=target_attempt,
+                            session_record=session_rec,
+                            event_type="payment.expired",
+                        )
+                    self._repo.finalize_order_closure(
+                        order_id=order_id,
+                        status=final_closure_status,
+                        reason=closure_reason,
+                    )
+                    self._session.commit()
+                    return "expired"
+                self._session.commit()
+                return "deferred"
+
+            self._session.commit()
+        except Exception:
+            self._session.rollback()
+            raise
+
+        # Фаза 2: Проверка статуса сессии в Stripe без удержания блокировок БД
+        try:
+            stripe_session = self._stripe_client.retrieve_checkout_session(
+                stripe_session_id
+            )
+        except Exception:  # noqa: BLE001
+            return "deferred"
+
+        stripe_payment_status = _read_session_field(
+            stripe_session, "payment_status", None
+        )
+        stripe_state = _read_session_field(stripe_session, "status", None)
+
+        if stripe_payment_status == "paid":
+            try:
+                self._repo.acquire_order_lock(order_id)
+                attempt_rec = self._repo.get_attempt_by_id_for_update(attempt_id)
+                session_rec = (
+                    self._repo.get_stripe_session_by_id_for_update(session_db_id)
+                    if session_db_id is not None
+                    else None
+                )
+                if (
+                    self._repo.get_succeeded_attempt_by_order_for_update(order_id)
+                    is not None
+                ) or (attempt_rec is not None and attempt_rec.status == "succeeded"):
+                    self._repo.clear_transient_order_closure(order_id)
+                    self._session.commit()
+                    return "paid"
+
+                if attempt_rec is None or session_rec is None:
+                    self._record_discrepancy(
+                        source="reconcile",
+                        reason="invalid_attempt",
+                        order_id=order_id,
+                        payment_attempt_id=attempt_id,
+                        stripe_session_id=stripe_session_id,
+                    )
+                    self._session.commit()
+                    return "deferred"
+
+                mismatch_reason = self._validate_and_record_paid_discrepancy(
+                    source="reconcile",
+                    attempt=attempt_rec,
+                    session_rec=session_rec,
+                    session_obj=stripe_session,
+                )
+                if mismatch_reason is not None:
+                    if attempt_rec.status == "cancelling":
+                        attempt_rec.status = "open"
+                    if session_rec.status == "cancelling":
+                        session_rec.status = "open"
+                    self._repo.clear_transient_order_closure(order_id)
+                    self._session.commit()
+                    return "deferred"
+
+                self._complete_verified_payment(
+                    attempt=attempt_rec,
+                    session_rec=session_rec,
+                    retrieved_sid=stripe_session_id,
+                )
+                self._session.commit()
+                return "paid"
+            except Exception:
+                self._session.rollback()
+                raise
+
+        if stripe_state == "complete":
+            try:
+                self._repo.acquire_order_lock(order_id)
+                attempt_rec = self._repo.get_attempt_by_id_for_update(attempt_id)
+                session_rec = (
+                    self._repo.get_stripe_session_by_id_for_update(session_db_id)
+                    if session_db_id is not None
+                    else None
+                )
+                if (
+                    self._repo.get_succeeded_attempt_by_order_for_update(order_id)
+                    is not None
+                ) or (attempt_rec is not None and attempt_rec.status == "succeeded"):
+                    self._repo.clear_transient_order_closure(order_id)
+                    self._session.commit()
+                    return "paid"
+
+                if attempt_rec is not None and attempt_rec.status in (
+                    "failed",
+                    "expired",
+                    "declined",
+                ):
+                    self._repo.finalize_order_closure(
+                        order_id=order_id,
+                        status=final_closure_status,
+                        reason=closure_reason,
+                    )
+                    self._session.commit()
+                    return "expired"
+
+                if attempt_rec is not None and attempt_rec.status in (
+                    "initiated",
+                    "open",
+                    "cancelling",
+                    "processing",
+                ):
+                    was_proc = attempt_rec.status == "processing"
+                    attempt_rec.status = "processing"
+                    if session_rec is not None:
+                        session_rec.status = "processing"
+                    if not was_proc:
+                        self._enqueue_outbox_event(
+                            attempt=attempt_rec,
+                            session_record=session_rec,
+                            event_type="payment.processing",
+                        )
+                self._repo.clear_transient_order_closure(order_id)
+                self._session.commit()
+                return "deferred"
+            except Exception:
+                self._session.rollback()
+                raise
+
+        if stripe_state == "open":
+            try:
+                self._stripe_client.expire_checkout_session(stripe_session_id)
+            except Exception as exc:  # noqa: BLE001
+                if "already expired" not in str(exc).lower():
+                    return "deferred"
+        elif stripe_state != "expired":
+            return "deferred"
+
+        # Фаза 3: Подтверждённый expire у Stripe -> финализируем отмену в БД
+        try:
+            self._repo.acquire_order_lock(order_id)
+            if (
+                self._repo.get_succeeded_attempt_by_order_for_update(order_id)
+                is not None
+            ):
+                self._repo.clear_transient_order_closure(order_id)
+                self._session.commit()
+                return "paid"
+
+            other_active = self._repo.get_active_attempt_by_order_for_update(order_id)
+            if other_active is not None and other_active.id != attempt_id:
+                self._session.commit()
+                return "deferred"
+
+            attempt_rec = self._repo.get_attempt_by_id_for_update(attempt_id)
+            session_rec = (
+                self._repo.get_stripe_session_by_id_for_update(session_db_id)
+                if session_db_id is not None
+                else None
+            )
+            if attempt_rec is not None and attempt_rec.status in (
+                "initiated",
+                "open",
+                "cancelling",
+                "processing",
+            ):
+                attempt_rec.status = "expired"
+                if session_rec is not None:
+                    session_rec.status = "expired"
+                self._enqueue_outbox_event(
+                    attempt=attempt_rec,
+                    session_record=session_rec,
+                    event_type="payment.expired",
+                )
+            self._repo.finalize_order_closure(
+                order_id=order_id,
+                status=final_closure_status,
+                reason=closure_reason,
+            )
+            self._session.commit()
+            return "expired"
+        except Exception:
+            self._session.rollback()
+            raise
+
+    def reconcile_interrupted_closure(
+        self, order_id: int, current_time: datetime.datetime
+    ) -> str:
+        """Восстанавливает прерванную после записи cancelling/expiring отмену по Stripe без DB lock при I/O."""
+        try:
+            self._repo.acquire_order_lock(order_id)
+            closure = self._repo.get_order_closure_for_update(order_id)
+            if closure is None or closure.status not in ("cancelling", "expiring"):
+                self._session.commit()
+                return "skipped"
+
+            final_closure_status = (
+                "cancelled" if closure.status == "cancelling" else "expired"
+            )
+            closure_reason = closure.reason
+
+            if (
+                self._repo.get_succeeded_attempt_by_order_for_update(order_id)
+                is not None
+            ):
+                self._repo.clear_transient_order_closure(order_id)
+                self._session.commit()
+                return "paid"
+
+            active_attempt = self._repo.get_active_attempt_by_order_for_update(order_id)
+            target_attempt = (
+                active_attempt
+                or self._repo.get_latest_attempt_by_order_for_update(order_id)
+            )
+            if target_attempt is None:
+                self._repo.finalize_order_closure(
+                    order_id=order_id,
+                    status=final_closure_status,
+                    reason=closure_reason,
+                )
+                self._session.commit()
+                return "expired"
+
+            session_rec = self._repo.get_stripe_session_by_attempt_id_for_update(
+                target_attempt.id
+            )
+            stripe_session_id = (
+                session_rec.stripe_session_id if session_rec is not None else None
+            )
+            attempt_id = target_attempt.id
+            session_db_id = session_rec.id if session_rec is not None else None
+            target_status = target_attempt.status
+
+            if not stripe_session_id:
+                if target_status in ("cancelling", "failed", "expired", "declined"):
+                    if target_status == "cancelling":
+                        target_attempt.status = "expired"
+                        if session_rec is not None:
+                            session_rec.status = "expired"
+                        self._enqueue_outbox_event(
+                            attempt=target_attempt,
+                            session_record=session_rec,
+                            event_type="payment.expired",
+                        )
+                    self._repo.finalize_order_closure(
+                        order_id=order_id,
+                        status=final_closure_status,
+                        reason=closure_reason,
+                    )
+                    self._session.commit()
+                    return "expired"
+                self._session.commit()
+                return "deferred"
+
+            self._session.commit()
+        except Exception:
+            self._session.rollback()
+            raise
+
+        # Фаза 2: Проверка статуса сессии в Stripe без удержания блокировок БД
+        try:
+            stripe_session = self._stripe_client.retrieve_checkout_session(
+                stripe_session_id
+            )
+        except Exception:  # noqa: BLE001
+            return "deferred"
+
+        stripe_payment_status = _read_session_field(
+            stripe_session, "payment_status", None
+        )
+        stripe_state = _read_session_field(stripe_session, "status", None)
+
+        if stripe_payment_status == "paid":
+            try:
+                self._repo.acquire_order_lock(order_id)
+                attempt_rec = self._repo.get_attempt_by_id_for_update(attempt_id)
+                session_rec = (
+                    self._repo.get_stripe_session_by_id_for_update(session_db_id)
+                    if session_db_id is not None
+                    else None
+                )
+                if (
+                    self._repo.get_succeeded_attempt_by_order_for_update(order_id)
+                    is not None
+                ) or (
+                    attempt_rec is not None and attempt_rec.status == "succeeded"
+                ):
+                    self._repo.clear_transient_order_closure(order_id)
+                    self._session.commit()
+                    return "paid"
+
+                if attempt_rec is None or session_rec is None:
+                    self._record_discrepancy(
+                        source="reconcile",
+                        reason="invalid_attempt",
+                        order_id=order_id,
+                        payment_attempt_id=attempt_id,
+                        stripe_session_id=stripe_session_id,
+                    )
+                    self._session.commit()
+                    return "deferred"
+
+                mismatch_reason = self._validate_and_record_paid_discrepancy(
+                    source="reconcile",
+                    attempt=attempt_rec,
+                    session_rec=session_rec,
+                    session_obj=stripe_session,
+                )
+                if mismatch_reason is not None:
+                    if attempt_rec.status == "cancelling":
+                        attempt_rec.status = "open"
+                    if session_rec.status == "cancelling":
+                        session_rec.status = "open"
+                    self._repo.clear_transient_order_closure(order_id)
+                    self._session.commit()
+                    return "deferred"
+
+                self._complete_verified_payment(
+                    attempt=attempt_rec,
+                    session_rec=session_rec,
+                    retrieved_sid=stripe_session_id,
+                )
+                self._session.commit()
+                return "paid"
+            except Exception:
+                self._session.rollback()
+                raise
+
+        if stripe_state == "complete":
+            try:
+                self._repo.acquire_order_lock(order_id)
+                attempt_rec = self._repo.get_attempt_by_id_for_update(attempt_id)
+                session_rec = (
+                    self._repo.get_stripe_session_by_id_for_update(session_db_id)
+                    if session_db_id is not None
+                    else None
+                )
+                if (
+                    self._repo.get_succeeded_attempt_by_order_for_update(order_id)
+                    is not None
+                ) or (
+                    attempt_rec is not None and attempt_rec.status == "succeeded"
+                ):
+                    self._repo.clear_transient_order_closure(order_id)
+                    self._session.commit()
+                    return "paid"
+
+                if attempt_rec is not None and attempt_rec.status in (
+                    "failed",
+                    "expired",
+                    "declined",
+                ):
+                    self._repo.finalize_order_closure(
+                        order_id=order_id,
+                        status=final_closure_status,
+                        reason=closure_reason,
+                    )
+                    self._session.commit()
+                    return "expired"
+
+                if attempt_rec is not None and attempt_rec.status in (
+                    "initiated",
+                    "open",
+                    "cancelling",
+                    "processing",
+                ):
+                    was_proc = attempt_rec.status == "processing"
+                    attempt_rec.status = "processing"
+                    if session_rec is not None:
+                        session_rec.status = "processing"
+                    if not was_proc:
+                        self._enqueue_outbox_event(
+                            attempt=attempt_rec,
+                            session_record=session_rec,
+                            event_type="payment.processing",
+                        )
+                self._repo.clear_transient_order_closure(order_id)
+                self._session.commit()
+                return "deferred"
+            except Exception:
+                self._session.rollback()
+                raise
+
+        if stripe_state == "open":
+            try:
+                self._stripe_client.expire_checkout_session(stripe_session_id)
+            except Exception as exc:  # noqa: BLE001
+                if "already expired" not in str(exc).lower():
+                    return "deferred"
+        elif stripe_state != "expired":
+            return "deferred"
+
+        # Фаза 3: Подтверждённый expire у Stripe -> финализируем отмену в БД
+        try:
+            self._repo.acquire_order_lock(order_id)
+            if (
+                self._repo.get_succeeded_attempt_by_order_for_update(order_id)
+                is not None
+            ):
+                self._repo.clear_transient_order_closure(order_id)
+                self._session.commit()
+                return "paid"
+
+            other_active = self._repo.get_active_attempt_by_order_for_update(order_id)
+            if other_active is not None and other_active.id != attempt_id:
+                self._session.commit()
+                return "deferred"
+
+            attempt_rec = self._repo.get_attempt_by_id_for_update(attempt_id)
+            session_rec = (
+                self._repo.get_stripe_session_by_id_for_update(session_db_id)
+                if session_db_id is not None
+                else None
+            )
+            if attempt_rec is not None and attempt_rec.status in (
+                "initiated",
+                "open",
+                "cancelling",
+                "processing",
+            ):
+                attempt_rec.status = "expired"
+                if session_rec is not None:
+                    session_rec.status = "expired"
+                self._enqueue_outbox_event(
+                    attempt=attempt_rec,
+                    session_record=session_rec,
+                    event_type="payment.expired",
+                )
+            self._repo.finalize_order_closure(
+                order_id=order_id,
+                status=final_closure_status,
+                reason=closure_reason,
+            )
+            self._session.commit()
+            return "expired"
+        except Exception:
+            self._session.rollback()
+            raise
+
     def reconcile_unresolved_payments(
         self, now: datetime.datetime | None = None
     ) -> dict[str, int]:
-        """Сверява всички незавършени платежни опити в Payments."""
+        """Сверява всички незавършени платежни опити и прекъснати отмени в Payments."""
         current_time = now or datetime.datetime.now(datetime.UTC)
+        interrupted_order_ids = self._repo.list_transient_order_closure_ids()
         attempt_ids = self._repo.list_unresolved_attempt_ids()
         stats = {
-            "checked": len(attempt_ids),
+            "checked": 0,
             "expired": 0,
             "paid": 0,
             "deferred": 0,
             "skipped": 0,
         }
+        reconciled_closure_orders: set[int] = set()
+        for order_id in interrupted_order_ids:
+            reconciled_closure_orders.add(order_id)
+            stats["checked"] += 1
+            try:
+                res = self.reconcile_interrupted_closure(order_id, current_time)
+                if res in stats:
+                    stats[res] += 1
+            except Exception:  # noqa: BLE001
+                stats["deferred"] += 1
+
         for attempt_id in attempt_ids:
+            peek = self._session.get(PaymentAttempt, attempt_id)
+            if peek is not None and peek.order_id in reconciled_closure_orders:
+                continue
+            stats["checked"] += 1
             try:
                 res = self.reconcile_single_attempt(attempt_id, current_time)
                 if res in stats:

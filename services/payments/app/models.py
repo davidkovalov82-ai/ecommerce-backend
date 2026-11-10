@@ -313,7 +313,7 @@ class PaymentDiscrepancy(Base):
     __tablename__ = "payment_discrepancies"
     __table_args__ = (
         CheckConstraint(
-            "source IN ('webhook', 'reconcile', 'cancel_conflict')",
+            "source IN ('webhook', 'reconcile', 'cancel_conflict', 'checkout')",
             name="ck_payment_discrepancies_source_valid",
         ),
         Index("ix_payment_discrepancies_order_id", "order_id"),

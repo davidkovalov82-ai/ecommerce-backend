@@ -99,6 +99,12 @@ def test_stripe_config_validation_and_secret_not_leaked(db_session: Session) -> 
             stripe_cancel_url="https://example.com/c/{order_id}",
         )
 
+    assert 0 < settings.stripe_idempotency_window_seconds < 86400
+    with pytest.raises(
+        ValidationError, match="STRIPE_IDEMPOTENCY_WINDOW_SECONDS must not exceed"
+    ):
+        Settings(stripe_idempotency_window_seconds=86400)
+
     secret_val = "sk_test_super_secret_leak_check"
     mock_client = MagicMock(spec=StripeClient)
     mock_client.create_checkout_session.side_effect = RuntimeError(

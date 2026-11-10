@@ -5,6 +5,9 @@ from typing import Literal
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# По подразбиране Stripe съхранява idempotency ключовете 24 часа; пазим минимум 1 час запас.
+MAX_SAFE_STRIPE_IDEMPOTENCY_WINDOW_SECONDS = 23 * 3600
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -36,7 +39,7 @@ class Settings(BaseSettings):
     stripe_success_url: str = "http://localhost:8000/orders/{order_id}?payment=success"
     stripe_cancel_url: str = "http://localhost:8000/orders/{order_id}?payment=cancelled"
     stripe_timeout_seconds: float = 10.0
-    stripe_idempotency_window_seconds: int = 86400
+    stripe_idempotency_window_seconds: int = MAX_SAFE_STRIPE_IDEMPOTENCY_WINDOW_SECONDS
 
     # RabbitMQ брокер за изпращане на платежни резултати към Commerce
     rabbitmq_host: str = "localhost"
@@ -69,6 +72,13 @@ class Settings(BaseSettings):
             raise ValueError("STRIPE_TIMEOUT_SECONDS must be positive")
         if self.stripe_idempotency_window_seconds <= 0:
             raise ValueError("STRIPE_IDEMPOTENCY_WINDOW_SECONDS must be positive")
+        if (
+            self.stripe_idempotency_window_seconds
+            > MAX_SAFE_STRIPE_IDEMPOTENCY_WINDOW_SECONDS
+        ):
+            raise ValueError(
+                f"STRIPE_IDEMPOTENCY_WINDOW_SECONDS must not exceed {MAX_SAFE_STRIPE_IDEMPOTENCY_WINDOW_SECONDS}s (safety margin below Stripe 24h retention)"
+            )
 
         if self.stripe_mode == "live":
             if self.stripe_api_base:

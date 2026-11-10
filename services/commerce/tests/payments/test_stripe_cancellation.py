@@ -453,3 +453,101 @@ def test_cancel_order_concurrent_payment_expired_and_retry_checkout_leaves_cance
         refreshed_order = verify_session.get(Order, order.id)
         assert refreshed_product is not None and refreshed_product.stock == 10
         assert refreshed_order is not None and refreshed_order.status == "cancelled"
+
+
+def test_interrupted_cancel_retry_after_recovery_restores_stock_once_without_second_link(
+    db_session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Сценарий 1 (Commerce): прекъсната отмяна (502 -> cancelling) блокира нов checkout и след възстановяване връща stock веднъж."""
+    user, token = _create_user_and_token(
+        db_session, email="interrupted_cancel_commerce@example.com"
+    )
+    product = _create_product(
+        db_session, "InterruptedCancelProd", price_minor=2000, stock=10
+    )
+    order = _create_order(db_session, user.id, product, quantity=3)  # stock=7
+
+    state = {"phase": "crashed_before_finalize", "stripe_sessions_created": 0}
+
+    class RecoveringPaymentsClient:
+        def create_checkout_session(
+            self,
+            *,
+            order_id: int,
+            attempt_key: str,
+            amount_minor: int,
+            currency: str,
+            line_items: list[dict[str, object]],
+            order_expires_at: object,
+        ) -> CheckoutSessionResult:
+            if state["phase"] == "crashed_before_finalize":
+                raise RemotePaymentConflict(
+                    current_status="cancelling",
+                    message="Cancellation recovery pending",
+                )
+            if state["phase"] == "recovered_cancelled":
+                raise RemotePaymentConflict(
+                    current_status="cancelled",
+                    message="Order cancelled",
+                )
+            state["stripe_sessions_created"] = int(state["stripe_sessions_created"]) + 1
+            raise AssertionError("Should never create a second Stripe session")
+
+        def cancel_order_payment(
+            self,
+            *,
+            order_id: int,
+            reason: str = "cancel",
+            order_expires_at: object = None,
+        ) -> CancelPaymentResult:
+            if state["phase"] == "crashed_before_finalize":
+                raise PaymentGatewayError("Payments process crashed mid-cancel")
+            return CancelPaymentResult(status="can_cancel", action="expired_in_stripe")
+
+    app.dependency_overrides[get_payments_client] = RecoveringPaymentsClient
+    try:
+        # 1. Прекъснат cancel -> 502, stock остава резервиран (7), checkout е забранен (409)
+        r_crash = client.post(
+            f"/orders/{order.id}/cancel",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r_crash.status_code == 502
+
+        r_blocked = client.post(
+            f"/orders/{order.id}/checkout-session",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r_blocked.status_code == 409
+        with session_factory() as s:
+            assert s.get(Product, product.id).stock == 7  # type: ignore[union-attr]
+            assert s.get(Order, order.id).status == "pending_payment"  # type: ignore[union-attr]
+
+        # 2. След сверката в Payments отмяната е финализирана -> повторен cancel връща stock веднъж
+        state["phase"] = "recovered_cancelled"
+        r_recovered_cancel = client.post(
+            f"/orders/{order.id}/cancel",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r_recovered_cancel.status_code == 200
+        assert r_recovered_cancel.json()["status"] == "cancelled"
+
+        r_repeat_cancel = client.post(
+            f"/orders/{order.id}/cancel",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r_repeat_cancel.status_code == 200
+        r_after_checkout = client.post(
+            f"/orders/{order.id}/checkout-session",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r_after_checkout.status_code == 409
+    finally:
+        app.dependency_overrides.pop(get_payments_client, None)
+
+    assert state["stripe_sessions_created"] == 0
+    with session_factory() as verify_session:
+        refreshed_product = verify_session.get(Product, product.id)
+        refreshed_order = verify_session.get(Order, order.id)
+        assert refreshed_product is not None and refreshed_product.stock == 10
+        assert refreshed_order is not None and refreshed_order.status == "cancelled"

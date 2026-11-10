@@ -940,6 +940,89 @@ def verify_cancel_and_late_payment_discrepancy(seller_token: str) -> None:
     assert not any(s.get("client_reference_id") == str(oid_close) for s in all_sessions)
     assert get_product_stock(pid_close) == 6
 
+    # Допълнителна проверка #1 (прекъсната отмяна cancelling): блокира checkout до сверка и след reconcile_payments.py връща stock веднъж
+    _, buyer_int = register_and_login(
+        f"k5_int_cancel_{uuid.uuid4().hex[:8]}@example.com"
+    )
+    add_to_cart(buyer_int, pid_close, 2)  # stock 6 -> 4
+    oid_int = int(create_order(buyer_int)["id"])
+    co_int = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid_int}/checkout-session",
+        headers={"Authorization": f"Bearer {buyer_int}"},
+        timeout=5.0,
+    )
+    assert co_int.status_code == 200
+    sid_int = co_int.json()["session_id"]
+    # Допълнителна проверка #1 (прекъсната отмяна cancelling): блокира checkout до сверка и след reconcile_payments.py връща stock веднъж
+    _, buyer_int = register_and_login(f"k5_int_cancel_{uuid.uuid4().hex[:8]}@example.com")
+    add_to_cart(buyer_int, pid_close, 2)  # stock 6 -> 4
+    oid_int = int(create_order(buyer_int)["id"])
+    co_int = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid_int}/checkout-session",
+        headers={"Authorization": f"Bearer {buyer_int}"},
+        timeout=5.0,
+    )
+    assert co_int.status_code == 200
+    sid_int = co_int.json()["session_id"]
+
+    with psycopg.connect(PAYMENTS_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE payment_attempts SET status = 'cancelling' WHERE order_id = %s",
+            (oid_int,),
+        )
+        cur.execute(
+            "UPDATE stripe_checkout_sessions SET status = 'cancelling' WHERE order_id = %s",
+            (oid_int,),
+        )
+        cur.execute(
+            """
+            INSERT INTO payment_order_closures (order_id, status, reason)
+            VALUES (%s, 'cancelling', 'cancel')
+            ON CONFLICT (order_id) DO UPDATE SET status = 'cancelling', reason = 'cancel'
+            """,
+            (oid_int,),
+        )
+        conn.commit()
+
+    r_int_co_blocked = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid_int}/checkout-session",
+        headers={"Authorization": f"Bearer {buyer_int}"},
+        timeout=5.0,
+    )
+    assert r_int_co_blocked.status_code == 409
+    assert get_product_stock(pid_close) == 4
+
+    rec_int = compose_cmd(
+        "exec",
+        "-T",
+        "payments-e2e",
+        "python",
+        "scripts/reconcile_payments.py",
+        capture_output=True,
+    )
+    assert "expired=1" in rec_int.stdout
+    mock_int = httpx.get(
+        f"{STRIPE_MOCK_URL}/v1/checkout/sessions/{sid_int}", timeout=5.0
+    ).json()
+    assert mock_int["status"] == "expired"
+
+    r_int_finish = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid_int}/cancel",
+        headers={"Authorization": f"Bearer {buyer_int}"},
+        timeout=5.0,
+    )
+    assert r_int_finish.status_code == 200
+    assert r_int_finish.json()["status"] == "cancelled"
+    assert get_product_stock(pid_close) == 6
+    assert (
+        httpx.post(
+            f"{COMMERCE_API_URL}/orders/{oid_int}/checkout-session",
+            headers={"Authorization": f"Bearer {buyer_int}"},
+            timeout=5.0,
+        ).status_code
+        == 409
+    )
+
 
 def verify_reconciliation_scripts(seller_token: str) -> None:
     print(

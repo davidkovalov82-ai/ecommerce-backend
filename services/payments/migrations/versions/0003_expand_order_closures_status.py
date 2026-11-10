@@ -55,4 +55,3 @@ def downgrade() -> None:
         "payment_order_closures",
         "status IN ('cancelled', 'expired')",
     )
-

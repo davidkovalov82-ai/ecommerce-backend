@@ -235,6 +235,15 @@ class PaymentRepository:
         )
         return self._session.scalars(stmt).all()
 
+    def list_transient_order_closure_ids(self) -> Sequence[int]:
+        """Връща всички поръчки с прекъснато временно затваряне (cancelling/expiring)."""
+        stmt = (
+            select(PaymentOrderClosure.order_id)
+            .where(PaymentOrderClosure.status.in_(["cancelling", "expiring"]))
+            .order_by(PaymentOrderClosure.order_id.asc())
+        )
+        return self._session.scalars(stmt).all()
+
     def get_order_closure_for_update(self, order_id: int) -> PaymentOrderClosure | None:
         stmt = (
             select(PaymentOrderClosure)
@@ -295,16 +304,20 @@ class PaymentRepository:
         self._session.execute(stmt)
 
     def has_discrepancy(
-        self, *, payment_attempt_id: int, source: str, reason: str
+        self,
+        *,
+        payment_attempt_id: int,
+        reason: str,
+        source: str | None = None,
     ) -> bool:
         """Проверява дали вече съществува диагностично разхождение за този опит и причина."""
-        stmt = select(
-            exists().where(
-                PaymentDiscrepancy.payment_attempt_id == payment_attempt_id,
-                PaymentDiscrepancy.source == source,
-                PaymentDiscrepancy.reason == reason,
-            )
-        )
+        conditions = [
+            PaymentDiscrepancy.payment_attempt_id == payment_attempt_id,
+            PaymentDiscrepancy.reason == reason,
+        ]
+        if source is not None:
+            conditions.append(PaymentDiscrepancy.source == source)
+        stmt = select(exists().where(*conditions))
         return bool(self._session.scalar(stmt))
 
     def record_discrepancy(self, discrepancy: PaymentDiscrepancy) -> PaymentDiscrepancy:
