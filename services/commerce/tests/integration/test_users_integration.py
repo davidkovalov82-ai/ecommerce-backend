@@ -632,6 +632,8 @@ def test_new_buyer_registers_via_public_url_and_places_order_without_commerce_us
     )
     assert repeat_res.status_code == 201
     assert repeat_res.json()["id"] == order_data["id"]
+    refreshed_after_repeat = db_session.get(Product, valid_product_id)
+    assert refreshed_after_repeat is not None and refreshed_after_repeat.stock == 17
 
     # 9. Потребителите все още отсъстват от таблицата users в Commerce
     users_still_absent = db_session.execute(
