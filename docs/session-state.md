@@ -1,20 +1,18 @@
 # Session State
 
-- **Текуща задача**: Етап К3: корекции след ревью на коммит 4261404 (OpenAPI, country_code, миграционен downgrade, конкурентен ship).
+- **Текуща задача**: Етап К4: отделяне на Notifications в независим сервис (RabbitMQ + Email/SMS), запазване на исторически Outbox и изолирани E2E проверки.
 - **Реализирано**:
-  - Изчистени дублирани методи в `api.py` и `service.py`; OpenAPI генерира схемата с 0 warnings и без дублирани Operation IDs.
-  - Строга ASCII проверка на `country_code` (`[A-Za-z]{2}`) с нормализация `bg -> BG` и 422 при невалидни стойности преди запис.
-  - Миграция `e6f7a8b9c0d1`: защитен downgrade при налични `shipment` събития с ясно съобщение и запазване на данните; чист downgrade без събития.
-  - Конкурентност: `flush()` преди преизчисляване на `fulfillment_status`; потвърдено финално `shipped` и 2 outbox събития при паралелен ship.
+  - `services/commerce`: Outbox схема с `event_id`, `event_version`, `occurred_at`, `published_at` (`f7a8b9c0d1e2`: `'sent'` → `'legacy_sent'`, `'pending'` запазени), RabbitMQ `EventPublisher` с `mandatory=True` + confirms, без извеждане на контакти в логовете.
+  - `services/notifications`: самостоятелен сервис с отделна БД/роля `notifications`, Alembic миграция, RabbitMQ consumer (`commit` преди `basic_ack`, `UNIQUE(event_id, channel)`, DLQ за невалидни/непознати версии), разделни Email (SMTP/Mailpit) и SMS (Twilio адаптер в `test`/контрактен режим) цикли с лезинг.
+  - Оркестрация и CI: `compose.yaml` (db-init, rabbitmq, commerce-outbox, notifications), изолирана команда `make test-k4-e2e` (`compose.e2e.yaml`), `.github/workflows/ci.yml` и `README.md`.
 - **Проверено / Резултати**:
-  - `uv run --locked pytest -q`: 291 passed (100% успех на пълния suite).
-  - `uv run --locked ruff check .` и `uv run --locked ruff format --check .`: 0 грешки (108 файла форматирани).
-  - Изолирани тестове на миграции в PostgreSQL: отказ при събития + успех без събития + head upgrade.
-- **Непроверено**: At-least-once SMTP повторение при аварийно спиране между SMTP приемане и DB commit (документирано ограничение).
+  - `services/commerce`: `ruff check .`, `ruff format --check .` и `pytest -q` → **295 passed**.
+  - `services/notifications`: `ruff check .`, `ruff format --check .` и `pytest -q` → **21 passed**.
+  - `scripts/`: `ruff check` и `ruff format --check` → 0 грешки; `make test-k4-e2e` → всички 5 сценария + изолация + DLQ преминаха (без спиране на работния Compose).
+- **Непроверено**: Реална платена SMS доставка към външен Twilio API в продукционен `SMS_MODE=live` режим (тествано само чрез HTTP контрактен/локален mock режим).
 - **Работещи команди**:
-  - `cd services/commerce && uv run --locked ruff check . && uv run --locked ruff format --check .`
-  - `cd services/commerce && uv run --locked pytest tests/infrastructure/migrations/test_orders_migrations.py -v`
-  - `cd services/commerce && uv run --locked pytest tests/orders/test_k3*.py -v`
-  - `cd services/commerce && uv run --locked pytest -q`
-- **Засегнати файлове**: `app/modules/orders/*`, `migrations/.../e6f7a8b9c0d1_*.py`, `tests/orders/*`, `tests/infrastructure/migrations/*`.
-- **Следваща стъпка**: Потребителски преглед и ръчен commit / push на отстранените забележки.
+  - `docker compose --env-file services/commerce/.env up --build -d`
+  - `make test-k4-e2e`
+  - `cd services/commerce && uv run --locked pytest -q` и `cd services/notifications && uv run --locked pytest -q`
+- **Засегнати файлове**: `services/commerce/*`, `services/notifications/*`, `compose.yaml`, `compose.e2e.yaml`, `Makefile`, `scripts/*`, `.github/workflows/ci.yml`, `README.md`.
+- **Следваща стъпка**: Потребителски преглед и ръчен commit / push от клон `feat/notifications-service`.

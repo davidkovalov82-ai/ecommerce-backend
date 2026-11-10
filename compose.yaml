@@ -19,6 +19,56 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  db-init:
+    image: postgres:17-alpine
+    container_name: commerce-db-init
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: commerce
+      POSTGRES_PASSWORD: commerce
+      POSTGRES_DB: commerce
+    restart: "no"
+    command:
+      - sh
+      - -c
+      - |
+        PGPASSWORD="$$POSTGRES_PASSWORD" psql -h db -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'notifications') THEN CREATE ROLE notifications LOGIN PASSWORD 'notifications'; END IF; END \$\$;"
+        PGPASSWORD="$$POSTGRES_PASSWORD" psql -h db -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_database WHERE datname = 'notifications'" | grep -q 1 || PGPASSWORD="$$POSTGRES_PASSWORD" psql -h db -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "CREATE DATABASE notifications OWNER notifications;"
+        PGPASSWORD="$$POSTGRES_PASSWORD" psql -h db -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "REVOKE CONNECT ON DATABASE commerce FROM PUBLIC; GRANT CONNECT ON DATABASE commerce TO commerce;"
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    container_name: commerce-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: commerce-mailpit
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   api:
     build:
       context: ./services/commerce
@@ -41,17 +91,66 @@ services:
       SMTP_HOST: ${SMTP_HOST:-mailpit}
       SMTP_PORT: ${SMTP_PORT:-1025}
       SMTP_FROM: ${SMTP_FROM:-noreply@example.com}
+      RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
+      RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
     ports:
       - "8000:8000"
     command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
 
-  mailpit:
-    image: axllent/mailpit:latest
-    container_name: commerce-mailpit
+  commerce-outbox:
+    build:
+      context: ./services/commerce
+      dockerfile: Dockerfile
+    container_name: commerce-outbox
     restart: unless-stopped
-    ports:
-      - "1025:1025"
-      - "8025:8025"
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_started
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: commerce
+      DB_PASSWORD: commerce
+      DB_NAME: commerce
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set and non-empty}
+      RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
+      RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+    command: sh -c "python scripts/process_outbox.py --daemon --poll-interval 1.0"
+
+  notifications:
+    build:
+      context: ./services/notifications
+      dockerfile: Dockerfile
+    container_name: notifications-worker
+    restart: unless-stopped
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: notifications
+      DB_PASSWORD: notifications
+      DB_NAME: notifications
+      RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
+      RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_FROM: ${SMTP_FROM:-noreply@example.com}
+      SMS_MODE: ${SMS_MODE:-test}
+      SMS_API_BASE_URL: ${SMS_API_BASE_URL:-}
+    command: sh -c "alembic upgrade head && python -m app.main"
 
 volumes:
   postgres_data:
+  rabbitmq_data:

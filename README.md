@@ -9,7 +9,11 @@
 
 ## Архитектура на проекта
 
-Системата е структурирана като модулен монолит (modular monolith), разделен на независими функционални модули в `services/commerce/app/modules/`:
+Проектът се състои от два независими сервиса в `services/`:
+- **`services/commerce`** – основният домейн бекенд (модулен монолит с модули `accounts`, `catalog`, `cart`, `orders`) и фоновият `commerce-outbox` издател към RabbitMQ.
+- **`services/notifications`** – независим консуматор на събития и worker за доставка по отделни канали (**Email** през SMTP/Mailpit и **SMS** през адаптер на провайдър), със собствена PostgreSQL база и роля (`notifications`), собствени Alembic миграции и независим процес на стартиране.
+
+В `services/commerce/app/modules/` са обособени следните домейни:
 
 - **`catalog` (Продуктов каталог)**:
   - Управление и визуализация на активни продукти с пагинация (`limit`, `offset`).
@@ -188,77 +192,93 @@ uv run python scripts/seed_products.py
 uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### 7. Обработка на имейл известия за платени поръчки (Transactional Outbox Worker)
+### 7. Известия чрез RabbitMQ и независимия сервис `services/notifications` (К4)
 
-При всяко преминаване на поръчка в статус `paid` (през Stripe Checkout webhook, асинхронно банково потвърждение или сверка) в същата транзакция се записва събитие в outbox таблицата. За да обработите чакащите събития и да изпратите имейли:
+При преминаване на поръчка в статус `paid` (през Stripe webhook или сверка) или при изпращане на пратка от продавач (`POST /seller/shipments/{id}/ship`), Commerce записва събитие (`order.paid` / `shipment.shipped` със стабилен `event_id` и `event_version=1`) в `order_outbox_events` **в същата PostgreSQL транзакция**, без да чака RabbitMQ, SMTP или SMS.
 
-```bash
-# Локално:
-cd services/commerce && uv run python scripts/process_outbox.py
+Отделният процес `commerce-outbox` (`services/commerce/scripts/process_outbox.py`) чете чакащите редове и публикува в RabbitMQ exchange `commerce.events` с `delivery_mode=2`, `mandatory=True` и publisher confirms. Независимият сервис `services/notifications` приема събитията от опашката `notifications.events` (с DLQ `notifications.events.dlq` при невалиден формат или непозната версия), записва входящото събитие и заданията за Email/SMS в своята собствена БД (`notifications`) в една транзакция и **изпраща `basic_ack` към RabbitMQ едва след успешен `commit`**.
 
-# С изричен лимит за брой събития (по подразбиране 50):
-uv run python scripts/process_outbox.py --limit 100
-
-# В работещ Docker контейнер (от корена на хранилището):
-docker compose --env-file services/commerce/.env exec api python scripts/process_outbox.py
+```mermaid
+flowchart LR
+    API["Commerce API (Stripe Webhook / Ship)"] -->|"1 DB Tx"| OUTBOX["order_outbox_events (pending)"]
+    OUTBOX --> PUB["commerce-outbox (publish + confirm)"]
+    PUB -->|"commerce.events (durable)"| RMQ["RabbitMQ notifications.events"]
+    RMQ -->|"bad JSON / unknown version"| DLQ["notifications.events.dlq"]
+    RMQ -->|"deliver"| CONS["Notifications Consumer"]
+    CONS -->|"DB Tx (inbox + email/sms) -> commit -> basic_ack"| NDB["notifications DB"]
+    NDB --> EMAIL["Email Worker -> Mailpit SMTP"]
+    NDB --> SMS["SMS Worker -> Twilio Adapter (test/contract)"]
 ```
 
-Изпратените съобщения могат да се прегледат веднага в локалната пощенска кутия:
+Стартиране на пълното демо (от корена на хранилището):
+```bash
+test -f services/commerce/.env || cp services/commerce/.env.example services/commerce/.env
+docker compose --env-file services/commerce/.env up --build -d
+```
+
+- **Commerce API / Swagger UI**: [http://localhost:8000/docs](http://localhost:8000/docs)
 - **Mailpit Web UI**: [http://localhost:8025](http://localhost:8025)
+- **RabbitMQ Management UI**: [http://localhost:15672](http://localhost:15672) (`guest` / `guest`)
 
 > [!NOTE]
-> **Ограничение на модела (At-least-once доставка)**: Webhook handler-ът не извиква SMTP и не държи DB заключване по време на мрежови заявки. Worker-ът чете събитията, затваря сесията преди изпращане по SMTP и в отделна кратка транзакция маркира събитието като `sent`. Ако SMTP сървърът (Mailpit) приеме писмото, но процесът спре преди запис в БД, събитието остава със статус `pending` (или `failed`) и при следващо изпълнение ще бъде изпратено отново.
+> **SMS адаптер**: Използва се `TwilioSmsProvider` (`services/notifications/app/sms_sender.py`), който в конфигурацията по подразбиране (`SMS_MODE=test`) работи без реални платени заявки към външен провайдър.
+>
+> **At-least-once гаранция**: Ако SMTP приеме писмото миг преди падане на worker-а, lease-ът на задачата (`processing`) изтича и друг worker ще я повтори след `DELIVERY_LEASE_SECONDS`, поради което строго еднократна доставка до крайната пощенска кутия не се обещава.
+
+#### Ръчно публикуване на Outbox и пускане на Notifications локално
+
+```bash
+# Публикуване на чакащите събития от Commerce към RabbitMQ:
+cd services/commerce && uv run python scripts/process_outbox.py --limit 50
+# или непрекъснат режим:
+cd services/commerce && uv run python scripts/process_outbox.py --daemon
+
+# Стартиране на независимия Notifications worker:
+cd services/notifications && uv run alembic upgrade head && uv run python -m app.main
+```
+
+#### Безопасен ред за преминаване от стария Commerce SMTP Outbox към К4
+1. Спрете стария Commerce SMTP outbox процес и изчакайте активната партида да приключи (за да няма паралелно изпращане).
+2. Приложете Alembic миграциите в `services/commerce` (`uv run alembic upgrade head`): историческите `'sent'` записи се преобразуват в `'legacy_sent'` (никога не се изпращат повторно), а `'pending'` остават чакащи.
+3. Инициализирайте ролята/БД `notifications`, приложете миграциите в `services/notifications` и стартирайте `rabbitmq` и `notifications`.
+4. Обновете Commerce API и стартирайте новия `commerce-outbox` издател към RabbitMQ (той обработва само `'pending'`).
 
 ---
 
 ## Тестване и проверка на кода
 
-Проектът разполага с пълен набор от автоматизирани тестове, използващи отделна изолирана тестова база (`commerce_test`):
+Проектът разполага с автоматизирани тестове в двата независими сервиса (`commerce_test` и `notifications_test`), както и с изолиран интеграционен E2E пакет:
 
-### Структура на тестовете (`services/commerce/tests/`)
+### Изпълнение на тестовете по сервиси
 
-- **`accounts/`** – регистрация, вход, профил (`/users/me`), повишаване на права (CLI).
-- **`catalog/`** – детайли, пагинация, създаване, обновяване, валидация на цени и наличности, seed.
-- **`cart/`** – преглед на количката, добавяне/редакция/изтриване, паралелни операции, DB ограничения.
-- **`orders/`** – оформяне (checkout), идемпотентност (UUID ключове), транзакции и rollback, конкурентност, отказ (cancellation), Transactional Outbox известия (`order.paid`), DB ограничения.
-- **`payments/`** – Stripe Checkout сесии, валидация на webhook (подпис, sandbox/live mode), жизнен цикъл на плащанията (completed, async, expired), отказ през Stripe, reconciliation услуга, конфигурация и скриване на секрети.
-- **`infrastructure/`** – свързаност и lifecycle на сесиите (`test_database.py`), домейнови тестове на Alembic миграциите (`migrations/`).
-- **`contracts/`** – валидация на OpenAPI схемата (`test_openapi.py`).
-
-### Изпълнение на тестовете
-
-Всички тестове:
 ```bash
+# 1. Commerce (lint, format, миграции и тестове):
 cd services/commerce
-uv run pytest
+uv run --locked ruff check .
+uv run --locked ruff format --check .
+uv run --locked pytest -q
+
+# 2. Notifications (lint, format, тестове за контракти, DLQ, commit-преди-ack, канали, SMS контракт):
+cd services/notifications
+uv run --locked ruff check .
+uv run --locked ruff format --check .
+uv run --locked pytest -q
 ```
 
-Изпълнение по отделни модули:
-```bash
-uv run pytest tests/accounts/
-uv run pytest tests/catalog/
-uv run pytest tests/cart/
-uv run pytest tests/orders/
-uv run pytest tests/payments/
-uv run pytest tests/infrastructure/
-uv run pytest tests/contracts/
-```
+### Изолирана E2E проверка с една команда от корена (`make test-k4-e2e`)
 
-### Автоматизиран тест на сценария за известия и retry (`make test-notifications-retry`)
-
-От **корена на хранилището** можете да стартирате цялостния тест за известия и retry цикъл (при недостъпен SMTP сървър и последващо възстановяване). Командата автоматично вдига тестови контейнери за PostgreSQL и Mailpit през Docker Compose, изчаква тяхната готовност и изпълнява теста в изолирана база данни (`commerce_test`):
+Командата стартира отделен Docker Compose проект (`commerce-k4-e2e` по `compose.e2e.yaml` на изолирани портове `55432`, `55672`, `58000`, `58025`, `58080`), **без да спира работния Compose стек и без да трие неговите данни/volumes**:
 
 ```bash
-# От корена на проекта:
-make test-notifications-retry
+make test-k4-e2e
 ```
 
-При грешка командата:
-1. Завършва с ненулев код за грешка (`exit code != 0`).
-2. Показва на коя конкретна стъпка е възникнал сривът:
-   - **Стъпка 1**: Неуспешно стартиране на Docker контейнерите (`db`, `mailpit`).
-   - **Стъпка 2**: Изтичане на времето за изчакване на готовност на PostgreSQL (порт 5432) или Mailpit (портове 1025 и 8025).
-   - **Стъпка 3**: Неуспешен assert в теста (поръчка в статус `paid`, събитие `pending` с записан `last_error` при срив, преход към `sent` при възстановен Mailpit, проверка на реално полученото съобщение през Mailpit REST API и липса на дубликати).
+Проверява автоматично с крайни таймаути:
+1. Notifications спрян → плащане през Stripe webhook минава → след пускане писмото и SMS пристигат без второ плащане или webhook.
+2. RabbitMQ спрян → поръчката става `paid`, събитието остава `pending` в Outbox → след възстановяване уведомлението пристига със същия `event_id`.
+3. Прекъсване на връзката в Notifications след DB `commit` и **преди** RabbitMQ `basic_ack` → реалният RabbitMQ доставя повторно (`redelivered`) → в БД остава по 1 задача на канал `(event_id, channel)`.
+4. Mailpit SMTP недостъпен → SMS се обработва независимо → след възстановяване се повтаря само имейлът.
+5. Двама продавачи изпращат две пратки на една поръчка → две отделни събития и два имейла, всеки само със стоките на съответната пратка, плюс проверка за DLQ при непозната версия и пропуск на SMS без телефон.
 
 ### Проверка за форматиране и статичен анализ (Ruff)
 
@@ -927,10 +947,11 @@ STRIPE_WEBHOOK_SECRET=whsec_...
   - Плащането и отказът заключват един и същи ред на поръчката с `SELECT ... FOR UPDATE` в PostgreSQL преди решение за промяна.
   - При отказ засегнатите продукти се заключват във възходящ ред по ID, а запазените количества се връщат точно в `stock` (включително за продукт, деактивиран след checkout). Количката не се възстановява.
   - На ниво PostgreSQL уникалността се гарантира с `(order_id, idempotency_key)` и частичен уникален индекс за най-много един успешен опит на поръчка (`WHERE status = 'succeeded'`).
-- **Transactional Outbox за известия**:
-  - При преход към `paid` събитието `order.paid` се записва в същата PostgreSQL транзакция в таблицата `order_outbox_events` с уникално ограничение `(order_id, event_type)`.
-  - Webhook заявките не извършват SMTP мрежови повиквания и не държат отворени DB транзакции.
-  - Изпращането се извършва асинхронно от worker (`scripts/process_outbox.py`), който чете чакащите събития, освобождава връзката към БД преди изпращането през SMTP и обновява статуса в отделна транзакция.
+- **Transactional Outbox и независим Notifications сервис**:
+  - При преход към `paid` (`order.paid`) и при изпращане на пратка (`shipment.shipped`) събитието със стабилен `event_id` и `event_version=1` се записва в `order_outbox_events` в същата PostgreSQL транзакция.
+  - Webhook и shipment заявките никога не чакат RabbitMQ, SMTP или SMS провайдъра.
+  - Отделният `commerce-outbox` процес (`services/commerce/scripts/process_outbox.py`) публикува в RabbitMQ с `delivery_mode=2`, `mandatory=True` и publisher confirms и отбелязва `'published'` едва след потвърждение от брокера и проверен маршрут.
+  - Независимият `services/notifications` сервис записва събитието и каналните задачи (`email`, `sms`) в собствена база (`notifications`) преди да изпрати `basic_ack` към RabbitMQ, а доставката се извършва от разделни работни цикли с лезинг и индивидуални опити/закъснения на канал.
 - **Кратковременни токени**: Access токенът е валиден 15 минути. В тази стъпка нарочно **не са** включени refresh tokens или списък за оттегляне (token revocation / denylist), за да се запази архитектурата проста и без излишен овърхед.
 - **Stateless проверка с актуалност от БД**: Токенът се проверява криптографски с HMAC-SHA256 (`HS256`). Потребителският запис се зарежда директно от базата данни при всяка защитена заявка, което гарантира, че незабавно се отчита всяка промяна на ролята дори със съществуващ токен.
 - **Изисквания за продукционна среда**:

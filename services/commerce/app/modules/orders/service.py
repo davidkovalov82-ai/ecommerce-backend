@@ -385,9 +385,10 @@ class OrderService:
             else:
                 order.fulfillment_status = "partially_shipped"
 
-            # Намиране на имейла на купувача за известието
+            # Намиране на контактите на купувача за известието (избягваме логиране на PII)
             customer = self._user_repository.get_by_id(order.user_id)
             customer_email = customer.email if customer else ""
+            customer_phone = (order.shipping_phone or "").strip() or None
 
             # Позиции само за този продавач
             seller_items = [
@@ -401,11 +402,15 @@ class OrderService:
 
             # Запис на Outbox събитие в същата транзакция
             outbox_event = OrderOutboxEvent(
+                event_id=str(uuid.uuid4()),
+                event_version=1,
+                occurred_at=now,
                 order_id=order.id,
                 shipment_id=shipment.id,
                 event_type="shipment.shipped",
                 payload={
                     "customer_email": customer_email,
+                    "customer_phone": customer_phone,
                     "order_id": order.id,
                     "shipment_id": shipment.id,
                     "seller_id": seller_id,
@@ -462,15 +467,21 @@ class OrderService:
 
         user = self._user_repository.get_by_id(order.user_id)
         customer_email = user.email if user else ""
+        customer_phone = (order.shipping_phone or "").strip() or None
+        now = datetime.datetime.now(datetime.UTC)
 
         payload = {
             "order_id": order.id,
             "customer_email": customer_email,
+            "customer_phone": customer_phone,
             "total_minor": order.total_minor,
             "currency": order.currency,
             "created_at": order.created_at.isoformat() if order.created_at else None,
         }
         event = OrderOutboxEvent(
+            event_id=str(uuid.uuid4()),
+            event_version=1,
+            occurred_at=now,
             order_id=order.id,
             event_type="order.paid",
             payload=payload,

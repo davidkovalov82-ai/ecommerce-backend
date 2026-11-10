@@ -1,4 +1,5 @@
 import datetime
+import uuid
 from typing import Any
 
 from sqlalchemy import (
@@ -473,6 +474,7 @@ class OrderOutboxEvent(Base):
 
     __tablename__ = "order_outbox_events"
     __table_args__ = (
+        UniqueConstraint("event_id", name="uq_order_outbox_event_id"),
         Index(
             "uq_order_outbox_order_event",
             "order_id",
@@ -488,7 +490,7 @@ class OrderOutboxEvent(Base):
             postgresql_where=text("shipment_id IS NOT NULL"),
         ),
         CheckConstraint(
-            "status IN ('pending', 'sent', 'failed')",
+            "status IN ('pending', 'legacy_sent', 'published', 'failed')",
             name="ck_order_outbox_status_valid",
         ),
         Index("ix_order_outbox_status_created", "status", "created_at"),
@@ -500,6 +502,18 @@ class OrderOutboxEvent(Base):
         BigInteger,
         primary_key=True,
         autoincrement=True,
+    )
+    event_id: Mapped[str] = mapped_column(
+        String(36),
+        nullable=False,
+        default=lambda: str(uuid.uuid4()),
+        server_default=text("gen_random_uuid()::text"),
+    )
+    event_version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default=text("1"),
     )
     order_id: Mapped[int] = mapped_column(
         BigInteger,
@@ -534,11 +548,21 @@ class OrderOutboxEvent(Base):
         String(1000),
         nullable=True,
     )
+    occurred_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.datetime.now(datetime.UTC),
+        server_default=func.now(),
+    )
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         default=lambda: datetime.datetime.now(datetime.UTC),
         server_default=func.now(),
+    )
+    published_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )
     processed_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True),

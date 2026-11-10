@@ -33,6 +33,18 @@ class Settings(BaseSettings):
     smtp_from: str = "noreply@example.com"
     mailpit_web_url: str = "http://localhost:8025"
 
+    rabbitmq_host: str = "localhost"
+    rabbitmq_port: int = 5672
+    rabbitmq_user: str = "guest"
+    rabbitmq_password: str = "guest"
+    rabbitmq_vhost: str = "/"
+    rabbitmq_exchange: str = "commerce.events"
+    rabbitmq_notifications_queue: str = "notifications.events"
+    rabbitmq_dlx_exchange: str = "notifications.dlx"
+    rabbitmq_dlq_queue: str = "notifications.events.dlq"
+    rabbitmq_dlq_routing_key: str = "notifications.events.dead"
+    rabbitmq_socket_timeout_seconds: float = 5.0
+
     password_reset_base_url: str = "http://localhost:8000/auth/password-reset/confirm"
     password_reset_expire_minutes: int = 15
 
