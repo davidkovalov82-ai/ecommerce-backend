@@ -91,15 +91,48 @@ class UserRepository:
         return log_entry
 
     def sync_sequences(self) -> None:
-        """Синхронизира PostgreSQL sequence броячите след пренос на исторически данни."""
+        """Синхронизира PostgreSQL sequence броячите, без да ги намалява, ако вече изпреварват max(id)."""
         for table in (
             "users",
             "account_moderation_logs",
             "password_reset_tokens",
         ):
-            self._session.execute(
-                text(
-                    f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), "
-                    f"coalesce(max(id), 1), max(id) IS NOT NULL) FROM {table};"
-                )
+            seq = self._session.scalar(
+                text(f"SELECT pg_get_serial_sequence('{table}', 'id')")
             )
+            if not seq:
+                continue
+
+            max_id = self._session.scalar(text(f"SELECT MAX(id) FROM {table}"))
+            if max_id is None:
+                continue
+
+            seq_row = (
+                self._session.execute(text(f"SELECT last_value, is_called FROM {seq}"))
+                .mappings()
+                .one()
+            )
+            curr_val = int(seq_row["last_value"])
+            is_called = bool(seq_row["is_called"])
+
+            if max_id > curr_val or (max_id == curr_val and not is_called):
+                self._session.execute(
+                    text(f"SELECT setval('{seq}', :new_val, true)"),
+                    {"new_val": max_id},
+                )
+
+            max_id = self._session.scalar(text(f"SELECT MAX(id) FROM {table}"))
+            if max_id is None:
+                continue
+
+            seq_row = self._session.execute(
+                text(f"SELECT last_value, is_called FROM {seq}")
+            ).mappings().one()
+            curr_val = int(seq_row["last_value"])
+            is_called = bool(seq_row["is_called"])
+
+            if max_id > curr_val or (max_id == curr_val and not is_called):
+                self._session.execute(
+                    text(f"SELECT setval('{seq}', :new_val, true)"),
+                    {"new_val": max_id},
+                )

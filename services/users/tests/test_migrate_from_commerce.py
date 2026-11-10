@@ -15,6 +15,8 @@ from app.config import settings
 from app.models import AccountModerationLog, PasswordResetToken, User
 from scripts.migrate_from_commerce import (
     AccountMigrationConflictError,
+    AccountMigrationError,
+    main,
     migrate_commerce_accounts,
 )
 from tests.conftest import TEST_DATABASE_URL
@@ -388,5 +390,395 @@ def test_repeatable_migration_and_conflict_handling_and_sequence_sync(
         # Новият ID трябва да е по-голям от максималния пренесен ID (303)
         assert new_user["id"] > 303
         assert new_user["email"] == "brand_new_customer@example.com"
+    finally:
+        users_engine.dispose()
+
+
+def test_cli_conflicting_mode_options_rejected_before_db_connect(
+    db_session: Session,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """1. Противоречивите параметри на режима (--dry-run --apply) се отхвърлят преди връзка към БД и не пишат."""
+    # Подаваме фиктивен невалиден URL: ако се опита да се свърже, ще гръмне с OperationalError, а не SystemExit(2)
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "--commerce-url",
+                "postgresql://nonexistent:5432/bad_db",
+                "--users-url",
+                TEST_DATABASE_URL,
+                "--dry-run",
+                "--apply",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "Conflicting mode options" in err
+
+    # Проверяваме, че в базата нищо не е записано
+    assert db_session.scalar(select(User)) is None
+
+
+def test_same_source_and_target_databases_rejected(
+    source_commerce_engine: Any,
+    db_session: Session,
+) -> None:
+    """2. До преноса се проверява, че източникът и целта са различни БД."""
+    users_engine = create_engine(TEST_DATABASE_URL)
+    try:
+        # Подаваме целевата база и като източник, и като цел
+        with pytest.raises(AccountMigrationError) as exc_info:
+            migrate_commerce_accounts(users_engine, users_engine, dry_run=False)
+        assert "different databases" in str(exc_info.value).lower()
+        assert db_session.scalar(select(User)) is None
+    finally:
+        users_engine.dispose()
+
+
+def test_missing_required_tables_in_source_rejected(
+    db_session: Session,
+) -> None:
+    """2. При липсваща задължителна таблица в източника се хвърля грешка и целта остава без изменения."""
+    missing_db_name = "commerce_missing_table_source_test"
+    admin_engine = create_engine(
+        settings.admin_database_url, isolation_level="AUTOCOMMIT"
+    )
+    with admin_engine.connect() as conn:
+        conn.execute(text(f'DROP DATABASE IF EXISTS "{missing_db_name}" WITH (FORCE)'))
+        conn.execute(text(f'CREATE DATABASE "{missing_db_name}"'))
+
+    missing_url = (
+        f"postgresql+psycopg://{settings.db_admin_user}:{settings.db_admin_password}"
+        f"@{settings.db_host}:{settings.db_port}/{missing_db_name}"
+    )
+    missing_engine = create_engine(missing_url)
+    users_engine = create_engine(TEST_DATABASE_URL)
+
+    try:
+        # Създаваме само users и account_moderation_logs, без password_reset_tokens
+        with missing_engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE users (
+                        id SERIAL PRIMARY KEY,
+                        email VARCHAR(255) NOT NULL UNIQUE,
+                        password_hash VARCHAR(255) NOT NULL,
+                        role VARCHAR(32) NOT NULL DEFAULT 'customer',
+                        status VARCHAR(32) NOT NULL DEFAULT 'active',
+                        display_name VARCHAR(80) NULL,
+                        token_version INT NOT NULL DEFAULT 0
+                    );
+                    CREATE TABLE account_moderation_logs (
+                        id SERIAL PRIMARY KEY,
+                        user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        admin_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        action VARCHAR(32) NOT NULL,
+                        reason TEXT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    );
+                    """
+                )
+            )
+
+        with pytest.raises(AccountMigrationError) as exc_info:
+            migrate_commerce_accounts(missing_engine, users_engine, dry_run=False)
+
+        err_msg = str(exc_info.value)
+        assert "missing required table" in err_msg.lower()
+        assert "password_reset_tokens" in err_msg
+
+        # Целта остава чиста
+        assert db_session.scalar(select(User)) is None
+    finally:
+        missing_engine.dispose()
+        users_engine.dispose()
+        with admin_engine.connect() as conn:
+            conn.execute(
+                text(f'DROP DATABASE IF EXISTS "{missing_db_name}" WITH (FORCE)')
+            )
+        admin_engine.dispose()
+
+
+def test_sequence_sync_does_not_decrease_when_ahead_of_max_id(
+    source_commerce_engine: Any,
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    """3. Не се намаляват броячите на ID, ако вече изпреварват max(id). Повторен apply не ги променя."""
+    users_engine = create_engine(TEST_DATABASE_URL)
+    try:
+        # Предварително вдигаме sequence на users до 1000 (по-голямо от max(id)=303 в източника)
+        with users_engine.begin() as conn:
+            conn.execute(
+                text("SELECT setval(pg_get_serial_sequence('users', 'id'), 1000, true)")
+            )
+
+        # Изпълняваме първи пренос (max id = 303)
+        stats = migrate_commerce_accounts(
+            source_commerce_engine, users_engine, dry_run=False
+        )
+        assert stats.users_inserted == 3
+
+        # Проверяваме, че броячът НЕ е намален на 303, а е останал 1000
+        with users_engine.connect() as conn:
+            seq_val = conn.scalar(text("SELECT last_value FROM users_id_seq"))
+            assert seq_val == 1000
+
+        # Повторен apply: броячът остава 1000
+        stats_repeat = migrate_commerce_accounts(
+            source_commerce_engine, users_engine, dry_run=False
+        )
+        assert stats_repeat.users_inserted == 0
+
+        with users_engine.connect() as conn:
+            seq_val = conn.scalar(text("SELECT last_value FROM users_id_seq"))
+            assert seq_val == 1000
+
+        # Регистрираме нов потребител през API -> трябва да получи ID = 1001
+        resp = client.post(
+            "/users",
+            json={
+                "email": "user_after_high_seq@example.com",
+                "password": "PasswordAfterHighSeq123!",
+            },
+        )
+        assert resp.status_code == 201
+        assert resp.json()["id"] == 1001
+    finally:
+        users_engine.dispose()
+
+
+def test_error_messages_do_not_leak_emails_hashes_or_connection_strings(
+    source_commerce_engine: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """4. При конфликти в stderr се извежда понятна причина без email, хешове, SQL параметри и connection strings."""
+    users_engine = create_engine(TEST_DATABASE_URL)
+    try:
+        # 1. Първи пренос
+        migrate_commerce_accounts(source_commerce_engine, users_engine, dry_run=False)
+
+        # 2. В изходната база променяме данните на Alice (role='admin')
+        with source_commerce_engine.begin() as conn:
+            conn.execute(text("UPDATE users SET role = 'admin' WHERE id = 101"))
+
+        # 3. Извикваме main с apply
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    "--commerce-url",
+                    SOURCE_DB_URL,
+                    "--users-url",
+                    TEST_DATABASE_URL,
+                    "--apply",
+                ]
+            )
+        assert exc_info.value.code == 1
+
+        err = capsys.readouterr().err
+        # Проверяваме че има ясна причина
+        assert "ГРЕШКА ПРИ ПРЕНОСА" in err
+        assert "id=101" in err
+        assert "diverge" in err.lower() or "conflict" in err.lower()
+
+        # Проверяваме отсъствието на чувствителни данни
+        assert "@" not in err, f"stderr contains email: {err}"
+        assert ALICE_PASSWORD not in err
+        assert "argon2" not in err.lower()
+        assert "postgresql://" not in err
+        assert settings.db_password not in err
+    finally:
+        users_engine.dispose()
+
+
+def test_cli_conflicting_mode_options_rejected_before_db_connect(
+    db_session: Session,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """1. Противоречивите параметри на режима (--dry-run --apply) се отхвърлят преди връзка към БД и не пишат."""
+    # Подаваме фиктивен невалиден URL: ако се опита да се свърже, ще гръмне с OperationalError, а не SystemExit(2)
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "--commerce-url",
+                "postgresql://nonexistent:5432/bad_db",
+                "--users-url",
+                TEST_DATABASE_URL,
+                "--dry-run",
+                "--apply",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "Conflicting mode options" in err
+
+    # Проверяваме, че в базата нищо не е записано
+    assert db_session.scalar(select(User)) is None
+
+
+def test_same_source_and_target_databases_rejected(
+    source_commerce_engine: Any,
+    db_session: Session,
+) -> None:
+    """2. До преноса се проверява, че източникът и целта са различни БД."""
+    users_engine = create_engine(TEST_DATABASE_URL)
+    try:
+        # Подаваме целевата база и като източник, и като цел
+        with pytest.raises(AccountMigrationError) as exc_info:
+            migrate_commerce_accounts(users_engine, users_engine, dry_run=False)
+        assert "different databases" in str(exc_info.value).lower()
+        assert db_session.scalar(select(User)) is None
+    finally:
+        users_engine.dispose()
+
+
+def test_missing_required_tables_in_source_rejected(
+    db_session: Session,
+) -> None:
+    """2. При липсваща задължителна таблица в източника се хвърля грешка и целта остава без изменения."""
+    missing_db_name = "commerce_missing_table_source_test"
+    admin_engine = create_engine(
+        settings.admin_database_url, isolation_level="AUTOCOMMIT"
+    )
+    with admin_engine.connect() as conn:
+        conn.execute(text(f'DROP DATABASE IF EXISTS "{missing_db_name}" WITH (FORCE)'))
+        conn.execute(text(f'CREATE DATABASE "{missing_db_name}"'))
+
+    missing_url = (
+        f"postgresql+psycopg://{settings.db_admin_user}:{settings.db_admin_password}"
+        f"@{settings.db_host}:{settings.db_port}/{missing_db_name}"
+    )
+    missing_engine = create_engine(missing_url)
+    users_engine = create_engine(TEST_DATABASE_URL)
+
+    try:
+        # Създаваме само users и account_moderation_logs, без password_reset_tokens
+        with missing_engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE users (
+                        id SERIAL PRIMARY KEY,
+                        email VARCHAR(255) NOT NULL UNIQUE,
+                        password_hash VARCHAR(255) NOT NULL,
+                        role VARCHAR(32) NOT NULL DEFAULT 'customer',
+                        status VARCHAR(32) NOT NULL DEFAULT 'active',
+                        display_name VARCHAR(80) NULL,
+                        token_version INT NOT NULL DEFAULT 0
+                    );
+                    CREATE TABLE account_moderation_logs (
+                        id SERIAL PRIMARY KEY,
+                        user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        admin_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        action VARCHAR(32) NOT NULL,
+                        reason TEXT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    );
+                    """
+                )
+            )
+
+        with pytest.raises(AccountMigrationError) as exc_info:
+            migrate_commerce_accounts(missing_engine, users_engine, dry_run=False)
+
+        err_msg = str(exc_info.value)
+        assert "missing required table" in err_msg.lower()
+        assert "password_reset_tokens" in err_msg
+
+        # Целта остава чиста
+        assert db_session.scalar(select(User)) is None
+    finally:
+        missing_engine.dispose()
+        users_engine.dispose()
+        with admin_engine.connect() as conn:
+            conn.execute(text(f'DROP DATABASE IF EXISTS "{missing_db_name}" WITH (FORCE)'))
+        admin_engine.dispose()
+
+
+def test_sequence_sync_does_not_decrease_when_ahead_of_max_id(
+    source_commerce_engine: Any,
+    client: TestClient,
+    db_session: Session,
+) -> None:
+    """3. Не се намаляват броячите на ID, ако вече изпреварват max(id). Повторен apply не ги променя."""
+    users_engine = create_engine(TEST_DATABASE_URL)
+    try:
+        # Предварително вдигаме sequence на users до 1000 (по-голямо от max(id)=303 в източника)
+        with users_engine.begin() as conn:
+            conn.execute(
+                text("SELECT setval(pg_get_serial_sequence('users', 'id'), 1000, true)")
+            )
+
+        # Изпълняваме първи пренос (max id = 303)
+        stats = migrate_commerce_accounts(source_commerce_engine, users_engine, dry_run=False)
+        assert stats.users_inserted == 3
+
+        # Проверяваме, че броячът НЕ е намален на 303, а е останал 1000
+        with users_engine.connect() as conn:
+            seq_val = conn.scalar(text("SELECT last_value FROM users_id_seq"))
+            assert seq_val == 1000
+
+        # Повторен apply: броячът остава 1000
+        stats_repeat = migrate_commerce_accounts(source_commerce_engine, users_engine, dry_run=False)
+        assert stats_repeat.users_inserted == 0
+
+        with users_engine.connect() as conn:
+            seq_val = conn.scalar(text("SELECT last_value FROM users_id_seq"))
+            assert seq_val == 1000
+
+        # Регистрираме нов потребител през API -> трябва да получи ID = 1001
+        resp = client.post(
+            "/users",
+            json={
+                "email": "user_after_high_seq@example.com",
+                "password": "PasswordAfterHighSeq123!",
+            },
+        )
+        assert resp.status_code == 201
+        assert resp.json()["id"] == 1001
+    finally:
+        users_engine.dispose()
+
+
+def test_error_messages_do_not_leak_emails_hashes_or_connection_strings(
+    source_commerce_engine: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """4. При конфликти в stderr се извежда понятна причина без email, хешове, SQL параметри и connection strings."""
+    users_engine = create_engine(TEST_DATABASE_URL)
+    try:
+        # 1. Първи пренос
+        migrate_commerce_accounts(source_commerce_engine, users_engine, dry_run=False)
+
+        # 2. В изходната база променяме данните на Alice (role='admin')
+        with source_commerce_engine.begin() as conn:
+            conn.execute(text("UPDATE users SET role = 'admin' WHERE id = 101"))
+
+        # 3. Извикваме main с apply
+        with pytest.raises(SystemExit) as exc_info:
+            main(
+                [
+                    "--commerce-url",
+                    SOURCE_DB_URL,
+                    "--users-url",
+                    TEST_DATABASE_URL,
+                    "--apply",
+                ]
+            )
+        assert exc_info.value.code == 1
+
+        err = capsys.readouterr().err
+        # Проверяваме че има ясна причина
+        assert "ГРЕШКА ПРИ ПРЕНОСА" in err
+        assert "id=101" in err
+        assert "diverge" in err.lower() or "conflict" in err.lower()
+
+        # Проверяваме отсъствието на чувствителни данни
+        assert "@" not in err, f"stderr contains email: {err}"
+        assert ALICE_PASSWORD not in err
+        assert "argon2" not in err.lower()
+        assert "postgresql://" not in err
+        assert settings.db_password not in err
     finally:
         users_engine.dispose()

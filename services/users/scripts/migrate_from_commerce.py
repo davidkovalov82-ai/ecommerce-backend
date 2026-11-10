@@ -18,6 +18,8 @@ from app.config import settings
 from app.models import AccountModerationLog, PasswordResetToken, User
 from app.repository import UserRepository
 
+REQUIRED_SOURCE_TABLES = ("users", "account_moderation_logs", "password_reset_tokens")
+
 
 class AccountMigrationError(Exception):
     """Базова грешка при пренос на акаунти."""
@@ -50,16 +52,51 @@ class MigrationStats:
     @property
     def total_skipped(self) -> int:
         return (
-            self.users_skipped
-            + self.moderation_logs_skipped
-            + self.reset_tokens_skipped
+            self.users_skipped + self.moderation_logs_skipped + self.reset_tokens_skipped
         )
 
 
+def _validate_distinct_databases(commerce_engine: Engine, users_engine: Engine) -> None:
+    """Проверява, че изходната и целевата база данни са различни."""
+    with commerce_engine.connect() as c_conn, users_engine.connect() as u_conn:
+        c_db = c_conn.scalar(text("SELECT current_database()"))
+        u_db = u_conn.scalar(text("SELECT current_database()"))
+        c_host = c_conn.scalar(text("SELECT inet_server_addr()"))
+        u_host = u_conn.scalar(text("SELECT inet_server_addr()"))
+        c_port = c_conn.scalar(text("SELECT inet_server_port()"))
+        u_port = u_conn.scalar(text("SELECT inet_server_port()"))
+
+        if c_db == u_db and c_host == u_host and c_port == u_port:
+            raise AccountMigrationError(
+                "Source and target databases must be different databases"
+            )
+
+
+def _validate_distinct_databases(commerce_engine: Engine, users_engine: Engine) -> None:
+    """Проверява, че изходната и целевата база данни са различни."""
+    with commerce_engine.connect() as c_conn, users_engine.connect() as u_conn:
+        c_db = c_conn.scalar(text("SELECT current_database()"))
+        u_db = u_conn.scalar(text("SELECT current_database()"))
+        c_host = c_conn.scalar(text("SELECT inet_server_addr()"))
+        u_host = u_conn.scalar(text("SELECT inet_server_addr()"))
+        c_port = c_conn.scalar(text("SELECT inet_server_port()"))
+        u_port = u_conn.scalar(text("SELECT inet_server_port()"))
+
+        if c_db == u_db and c_host == u_host and c_port == u_port:
+            raise AccountMigrationError("Source and target databases must be different databases")
+
+
 def _fetch_source_records(commerce_engine: Engine) -> dict[str, list[dict[str, Any]]]:
-    """Извлича данни от изходната Commerce база данни в режим само за четене."""
+    """Проверява наличието на задължителните таблици и извлича данни от изходната Commerce БД."""
     with commerce_engine.connect() as conn:
         inspector = inspect(conn)
+        existing_tables = set(inspector.get_table_names())
+
+        missing = [t for t in REQUIRED_SOURCE_TABLES if t not in existing_tables]
+        if missing:
+            raise AccountMigrationError(
+                f"Source database is missing required table(s): {', '.join(missing)}"
+            )
 
         users_rows: list[dict[str, Any]] = [
             dict(r)
@@ -76,39 +113,35 @@ def _fetch_source_records(commerce_engine: Engine) -> dict[str, list[dict[str, A
             .all()
         ]
 
-        logs_rows: list[dict[str, Any]] = []
-        if inspector.has_table("account_moderation_logs"):
-            logs_rows = [
-                dict(r)
-                for r in conn.execute(
-                    text(
-                        """
-                        SELECT id, user_id, admin_id, action, reason, created_at
-                        FROM account_moderation_logs
-                        ORDER BY id ASC
-                        """
-                    )
+        logs_rows: list[dict[str, Any]] = [
+            dict(r)
+            for r in conn.execute(
+                text(
+                    """
+                    SELECT id, user_id, admin_id, action, reason, created_at
+                    FROM account_moderation_logs
+                    ORDER BY id ASC
+                    """
                 )
-                .mappings()
-                .all()
-            ]
+            )
+            .mappings()
+            .all()
+        ]
 
-        tokens_rows: list[dict[str, Any]] = []
-        if inspector.has_table("password_reset_tokens"):
-            tokens_rows = [
-                dict(r)
-                for r in conn.execute(
-                    text(
-                        """
-                        SELECT id, user_id, token_hash, expires_at, used_at, created_at
-                        FROM password_reset_tokens
-                        ORDER BY id ASC
-                        """
-                    )
+        tokens_rows: list[dict[str, Any]] = [
+            dict(r)
+            for r in conn.execute(
+                text(
+                    """
+                    SELECT id, user_id, token_hash, expires_at, used_at, created_at
+                    FROM password_reset_tokens
+                    ORDER BY id ASC
+                    """
                 )
-                .mappings()
-                .all()
-            ]
+            )
+            .mappings()
+            .all()
+        ]
 
     return {
         "users": users_rows,
@@ -124,12 +157,16 @@ def migrate_commerce_accounts(
 ) -> MigrationStats:
     """Пренася потребители, модераторски одит логове и токени за ресет от Commerce към Users.
 
+    - Проверява, че източникът и целта са различни бази данни.
+    - Проверява за наличието на всички задължителни таблици в източника.
     - При dry_run=True: проверява за конфликти и преброява записи без промени по целевата БД.
     - При dry_run=False: изпълнява всички записи в една транзакция с rollback при грешка/конфликт.
     - При повторно изпълнение на идентични данни: пропуска съществуващите записи (идемпотентност).
-    - При несъответствие на ID/email или съдържание: спира с AccountMigrationConflictError.
-    - Синхронизира sequence броячите в PostgreSQL след запис.
+    - При несъответствие на ID/email или съдържание: спира с AccountMigrationConflictError без частичен запис.
+    - Не намалява sequence броячите на ID.
+    - В съобщенията за грешка никога не извежда email адреси, паролни хешове, токени или connection strings.
     """
+    _validate_distinct_databases(commerce_engine, users_engine)
     source_data = _fetch_source_records(commerce_engine)
     source_users = source_data["users"]
     source_logs = source_data["moderation_logs"]
@@ -153,8 +190,7 @@ def migrate_commerce_accounts(
                 if existing_by_id is not None and existing_by_email is not None:
                     if existing_by_id.id != existing_by_email.id:
                         raise AccountMigrationConflictError(
-                            f"Ambiguous user conflict: id={u_id} and email='{u_email}' "
-                            f"match different users in target database (target id={existing_by_email.id})"
+                            f"User conflict for id={u_id}: ID and email belong to different users in target database"
                         )
                     # Един и същ запис - проверяваме дали всички полета съвпадат точно
                     target_user = existing_by_id
@@ -170,18 +206,15 @@ def migrate_commerce_accounts(
                         users_skipped += 1
                     else:
                         raise AccountMigrationConflictError(
-                            f"User conflict for id={u_id}, email='{u_email}': "
-                            "existing target user data diverges from source without being identical"
+                            f"User conflict for id={u_id}: user attributes in target database diverge from source"
                         )
                 elif existing_by_id is not None and existing_by_email is None:
                     raise AccountMigrationConflictError(
-                        f"User ID conflict: target database already has user id={u_id} with "
-                        f"email '{existing_by_id.email}', expected '{u_email}'"
+                        f"User conflict for id={u_id}: target database already has user with this ID but different attributes"
                     )
                 elif existing_by_id is None and existing_by_email is not None:
                     raise AccountMigrationConflictError(
-                        f"User email conflict: target database already has email '{u_email}' with "
-                        f"id={existing_by_email.id}, expected id={u_id}"
+                        f"User conflict for id={u_id}: email is already registered under a different ID in target database"
                     )
                 else:
                     users_to_insert.append(
@@ -216,7 +249,7 @@ def migrate_commerce_accounts(
                         logs_skipped += 1
                     else:
                         raise AccountMigrationConflictError(
-                            f"Account moderation log conflict for id={m_id}: existing record diverges from source"
+                            f"Account moderation log conflict for id={m_id}: existing record attributes diverge from source"
                         )
                 else:
                     logs_to_insert.append(m)
@@ -239,8 +272,7 @@ def migrate_commerce_accounts(
                 if existing_by_id is not None and existing_by_hash is not None:
                     if existing_by_id.id != existing_by_hash.id:
                         raise AccountMigrationConflictError(
-                            f"Password reset token conflict: id={t_id} and token_hash "
-                            "match different records in target database"
+                            f"Password reset token conflict for id={t_id}: ID and token hash match different records"
                         )
                     matches = (
                         existing_by_id.user_id == t["user_id"]
@@ -252,11 +284,11 @@ def migrate_commerce_accounts(
                         tokens_skipped += 1
                     else:
                         raise AccountMigrationConflictError(
-                            f"Password reset token conflict for id={t_id}: existing record diverges from source"
+                            f"Password reset token conflict for id={t_id}: existing record attributes diverge from source"
                         )
                 elif existing_by_id is not None or existing_by_hash is not None:
                     raise AccountMigrationConflictError(
-                        f"Password reset token conflict for id={t_id}: id or token_hash already exists with divergent attributes"
+                        f"Password reset token conflict for id={t_id}: ID or token hash already exists with divergent attributes"
                     )
                 else:
                     tokens_to_insert.append(t)
@@ -297,7 +329,8 @@ def migrate_commerce_accounts(
             raise
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """Конструира парсера за CLI аргументи на миграцията."""
     parser = argparse.ArgumentParser(
         description="Пренос на акаунти, модерация и токени от Commerce към Users при K6.1."
     )
@@ -327,14 +360,46 @@ def main() -> None:
         action="store_true",
         help="Само симулация без промени по базата данни (еквивалентно на --mode dry-run).",
     )
+    return parser
 
-    args = parser.parse_args()
 
-    # Определяме режима: apply има предимство, само ако изрично е посочено
-    if args.apply or args.mode == "apply":
-        is_dry_run = False
-    else:
-        is_dry_run = True
+def parse_migration_args(
+    parser: argparse.ArgumentParser, argv: list[str] | None = None
+) -> tuple[argparse.Namespace, bool]:
+    """Парсира аргументите и валидира режима ПРЕДИ каквото и да е свързване към БД."""
+    args = parser.parse_args(argv)
+
+    has_dry_run = args.dry_run or (args.mode == "dry-run")
+    has_apply = args.apply or (args.mode == "apply")
+
+    if has_dry_run and has_apply:
+        parser.error(
+            "Conflicting mode options: specify either --dry-run or --apply, not both."
+        )
+
+    # По подразбиране е dry-run
+    is_dry_run = not has_apply
+    return args, is_dry_run
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args, is_dry_run = parse_migration_args(parser, argv)
+
+    has_dry_run = args.dry_run or (args.mode == "dry-run")
+    has_apply = args.apply or (args.mode == "apply")
+
+    if has_dry_run and has_apply:
+        parser.error("Conflicting mode options: specify either --dry-run or --apply, not both.")
+
+    # По подразбиране е dry-run
+    is_dry_run = not has_apply
+    return args, is_dry_run
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = build_parser()
+    args, is_dry_run = parse_migration_args(parser, argv)
 
     c_engine = create_engine(args.commerce_url, pool_pre_ping=True)
     u_engine = create_engine(args.users_url, pool_pre_ping=True)
@@ -351,8 +416,19 @@ def main() -> None:
             f"  - Одит логове: {stats.moderation_logs_inserted} {action_verb}, {stats.moderation_logs_skipped} пропуснати\n"
             f"  - Reset токени: {stats.reset_tokens_inserted} {action_verb}, {stats.reset_tokens_skipped} пропуснати"
         )
-    except AccountMigrationConflictError as exc:
-        print(f"ГРЕШКА ПРИ ПРЕНОСА (отменен без запис): {exc}", file=sys.stderr)
+    except AccountMigrationError as exc:
+        print(f"ГРЕШКА ПРИ ПРЕНОСА: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:  # noqa: BLE001
+        # Без показване на SQL параметри, пароли или connection strings
+        print(
+            f"ГРЕШКА ПРИ ПРЕНОСА: неочаквана грешка ({type(exc).__name__})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except Exception as exc:  # noqa: BLE001
+        # Без показване на SQL параметри, пароли или connection strings
+        print(f"ГРЕШКА ПРИ ПРЕНОСА: неочаквана грешка ({type(exc).__name__})", file=sys.stderr)
         sys.exit(1)
     finally:
         c_engine.dispose()
