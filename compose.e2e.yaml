@@ -23,21 +23,20 @@ services:
       db-e2e:
         condition: service_healthy
     environment:
+      DB_HOST: db-e2e
       POSTGRES_USER: pgadmin
       POSTGRES_PASSWORD: pgadmin_e2e_password
+      POSTGRES_DB: postgres
+      COMMERCE_APP_USER: commerce_app
+      COMMERCE_APP_PASSWORD: commerce_app
+      COMMERCE_DB_NAME: commerce
+      NOTIF_APP_USER: notifications_app
+      NOTIF_APP_PASSWORD: notifications_app
+      NOTIF_DB_NAME: notifications
     restart: "no"
-    command:
-      - sh
-      - -c
-      - |
-        export PGPASSWORD="$$POSTGRES_PASSWORD"
-        psql -h db-e2e -U "$$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_roles WHERE rolname = 'commerce_app'" | grep -q 1 || psql -h db-e2e -U "$$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE commerce_app WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD 'commerce_app';"
-        psql -h db-e2e -U "$$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_roles WHERE rolname = 'notifications_app'" | grep -q 1 || psql -h db-e2e -U "$$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE notifications_app WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD 'notifications_app';"
-        psql -h db-e2e -U "$$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_database WHERE datname = 'commerce'" | grep -q 1 || psql -h db-e2e -U "$$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE commerce OWNER commerce_app;"
-        psql -h db-e2e -U "$$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_database WHERE datname = 'notifications'" | grep -q 1 || psql -h db-e2e -U "$$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE notifications OWNER notifications_app;"
-        psql -h db-e2e -U "$$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 -c "REVOKE ALL ON DATABASE commerce FROM PUBLIC; GRANT CONNECT, TEMP ON DATABASE commerce TO commerce_app; REVOKE ALL ON DATABASE notifications FROM PUBLIC; GRANT CONNECT, TEMP ON DATABASE notifications TO notifications_app;"
-        psql -h db-e2e -U "$$POSTGRES_USER" -d commerce -v ON_ERROR_STOP=1 -c "ALTER SCHEMA public OWNER TO commerce_app;"
-        psql -h db-e2e -U "$$POSTGRES_USER" -d notifications -v ON_ERROR_STOP=1 -c "ALTER SCHEMA public OWNER TO notifications_app;"
+    volumes:
+      - ./scripts/postgres_db_init.sh:/usr/local/bin/postgres_db_init.sh:ro
+    command: ["sh", "/usr/local/bin/postgres_db_init.sh"]
 
   rabbitmq-e2e:
     image: rabbitmq:4-management-alpine

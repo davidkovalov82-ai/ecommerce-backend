@@ -84,7 +84,32 @@ def test_parse_valid_order_paid_and_shipment_shipped() -> None:
     ("raw_bytes", "exc_cls"),
     [
         (b"not-json{", InvalidEventContract),
+        (b"\xff\xfe", InvalidEventContract),
         (b"[]", InvalidEventContract),
+        (b'{"a": ' + b"[" * 1500 + b"1" + b"]" * 1500 + b"}", InvalidEventContract),
+        (b'{"event_version": NaN, "data": {}}', InvalidEventContract),
+        (
+            (
+                '{"event_id": "'
+                + str(uuid.uuid4())
+                + '", "event_type": "order.paid", "event_version": 1, '
+                '"occurred_at": "2026-11-10T00:00:00+00:00", '
+                '"data": {"order_id": '
+                + ("9" * 5000)
+                + ', "customer_email": "buyer@example.com", "total_minor": 100, "currency": "EUR"}}'
+            ).encode("utf-8"),
+            InvalidEventContract,
+        ),
+        (
+            (
+                '{"event_id": "'
+                + str(uuid.uuid4())
+                + '", "event_type": "order.paid", "event_version": '
+                + ("9" * 5000)
+                + ', "data": {"order_id": 1}}'
+            ).encode("utf-8"),
+            InvalidEventContract,
+        ),
         (
             json.dumps(_valid_order_paid_envelope(version=2)).encode("utf-8"),
             UnsupportedEventVersion,
@@ -303,6 +328,87 @@ def test_invalid_message_never_logs_raw_header_fields_or_contact_markers(
     assert marker_type_contact not in logs
     assert "raw-" not in logs
     assert "invalid_event_version_type" in logs
+
+
+def test_consumer_dead_letters_5000_digit_json_then_processes_next_valid_without_leaks(
+    session_factory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Число от 5000 цифри (ValueError) отива в DLQ без теч в логовете; следващото валидно съобщение минава в същия consumer."""
+    caplog.set_level(logging.DEBUG)
+    poison_marker = "huge-5k-contact@example.com"
+    huge_int_literal = "9" * 5000
+    huge_json_body = (
+        '{"event_id": "raw-5k-'
+        + poison_marker
+        + '", "event_type": "raw-type-+359888999000", '
+        '"event_version": 1, '
+        '"occurred_at": "2026-11-10T00:00:00+00:00", '
+        '"data": {"order_id": '
+        + huge_int_literal
+        + ', "customer_email": "'
+        + poison_marker
+        + '", "total_minor": 100, "currency": "EUR"}}'
+    ).encode("utf-8")
+
+    valid_env = _valid_order_paid_envelope()
+    valid_body = json.dumps(valid_env).encode("utf-8")
+
+    consumer = RabbitMQEventConsumer(session_factory=session_factory)
+    channel = MagicMock()
+
+    # 1. Лошото 5000-цифрено JSON съобщение се отхвърля с requeue=False (DLQ)
+    consumer._handle_message(
+        channel,
+        SimpleNamespace(delivery_tag=101, redelivered=False),
+        None,
+        huge_json_body,
+    )
+    channel.basic_nack.assert_called_once_with(delivery_tag=101, requeue=False)
+    channel.basic_ack.assert_not_called()
+
+    # 2. Следващото валидно съобщение се обработва успешно от същия consumer
+    consumer._handle_message(
+        channel,
+        SimpleNamespace(delivery_tag=102, redelivered=False),
+        None,
+        valid_body,
+    )
+    channel.basic_ack.assert_called_once_with(delivery_tag=102)
+
+    with session_factory() as s:
+        events = s.query(InboxEvent).all()
+        assert len(events) == 1
+        assert events[0].event_id == valid_env["event_id"]
+
+    logs = caplog.text
+    assert "reason=invalid_json" in logs
+    assert poison_marker not in logs
+    assert "raw-" not in logs
+    assert "+359888999000" not in logs
+    assert "9" * 64 not in logs
+
+
+def test_consumer_does_not_swallow_unexpected_internal_errors() -> None:
+    """Неочаквани вътрешни грешки извън БД прекъсванията не се поглъщат тихо от consumer."""
+    buggy_session = MagicMock()
+    buggy_session.__enter__.return_value = buggy_session
+    buggy_session.__exit__.return_value = False
+    buggy_session.execute.side_effect = RuntimeError("unexpected programming bug")
+
+    consumer = RabbitMQEventConsumer(session_factory=lambda: buggy_session)
+    channel = MagicMock()
+
+    with pytest.raises(RuntimeError, match="unexpected programming bug"):
+        consumer._handle_message(
+            channel,
+            SimpleNamespace(delivery_tag=202, redelivered=False),
+            None,
+            json.dumps(_valid_order_paid_envelope()).encode("utf-8"),
+        )
+
+    channel.basic_ack.assert_not_called()
+    channel.basic_nack.assert_not_called()
 
 
 def test_consumer_nacks_with_requeue_on_temporary_postgres_error_and_dlq_on_data_error() -> (

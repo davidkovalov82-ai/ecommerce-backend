@@ -1,9 +1,10 @@
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 from alembic import command
-from alembic.config import Config
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -11,25 +12,13 @@ from app.config import settings
 ALEMBIC_INI_PATH = str(Path(__file__).resolve().parents[3] / "alembic.ini")
 
 
-def test_orders_migration_upgrade_with_existing_data() -> None:
+def test_orders_migration_upgrade_with_existing_data(
+    temp_migration_db: Callable[..., Any],
+) -> None:
     """Проверка за обновяване от предишната ревизия с налични данни и безопасно връщане назад."""
-    temp_db_name = "commerce_temp_orders_mig_test"
-    admin_engine = create_engine(settings.database_url, isolation_level="AUTOCOMMIT")
-
-    with admin_engine.connect() as conn:
-        conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
-        conn.execute(text(f"CREATE DATABASE {temp_db_name}"))
-
-    temp_db_url = (
-        f"postgresql+psycopg://{settings.db_user}:{settings.db_password}"
-        f"@{settings.db_host}:{settings.db_port}/{temp_db_name}"
-    )
-
-    temp_engine = create_engine(temp_db_url)
-    try:
-        alembic_cfg = Config(ALEMBIC_INI_PATH)
-        alembic_cfg.set_main_option("sqlalchemy.url", temp_db_url)
-
+    with temp_migration_db(
+        "commerce_temp_orders_mig_test", alembic_ini_path=ALEMBIC_INI_PATH
+    ) as (alembic_cfg, temp_engine):
         # 1. Миграция до cart_items (9c17d651dd68)
         command.upgrade(alembic_cfg, "9c17d651dd68")
 
@@ -81,32 +70,15 @@ def test_orders_migration_upgrade_with_existing_data() -> None:
                 )
             ).scalar()
             assert res_cart_after == 2
-    finally:
-        temp_engine.dispose()
-        with admin_engine.connect() as conn:
-            conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
-        admin_engine.dispose()
 
 
-def test_outbox_migration_upgrade_and_downgrade() -> None:
+def test_outbox_migration_upgrade_and_downgrade(
+    temp_migration_db: Callable[..., Any],
+) -> None:
     """Тества миграция bd4c339e0dfa: създаване на order_outbox_events и безопасно връщане назад."""
-    temp_db_name = "commerce_temp_outbox_mig_test"
-    admin_engine = create_engine(settings.database_url, isolation_level="AUTOCOMMIT")
-
-    with admin_engine.connect() as conn:
-        conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
-        conn.execute(text(f"CREATE DATABASE {temp_db_name}"))
-
-    temp_db_url = (
-        f"postgresql+psycopg://{settings.db_user}:{settings.db_password}"
-        f"@{settings.db_host}:{settings.db_port}/{temp_db_name}"
-    )
-
-    temp_engine = create_engine(temp_db_url)
-    try:
-        alembic_cfg = Config(ALEMBIC_INI_PATH)
-        alembic_cfg.set_main_option("sqlalchemy.url", temp_db_url)
-
+    with temp_migration_db(
+        "commerce_temp_outbox_mig_test", alembic_ini_path=ALEMBIC_INI_PATH
+    ) as (alembic_cfg, temp_engine):
         # 1. Миграция до b4f8c2e1a9d0
         command.upgrade(alembic_cfg, "b4f8c2e1a9d0")
 
@@ -167,32 +139,15 @@ def test_outbox_migration_upgrade_and_downgrade() -> None:
                 text("SELECT id FROM orders WHERE id = 800")
             ).scalar()
             assert order_rem == 800
-    finally:
-        temp_engine.dispose()
-        with admin_engine.connect() as conn:
-            conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
-        admin_engine.dispose()
 
 
-def test_shipments_and_shipping_address_migration_downgrade_policy() -> None:
+def test_shipments_and_shipping_address_migration_downgrade_policy(
+    temp_migration_db: Callable[..., Any],
+) -> None:
     """Проверка на политиката за отказ на downgrade при наличие на shipment събития и успешно връщане при липсата им."""
-    temp_db_name = "commerce_temp_shipment_mig_test"
-    admin_engine = create_engine(settings.database_url, isolation_level="AUTOCOMMIT")
-
-    with admin_engine.connect() as conn:
-        conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
-        conn.execute(text(f"CREATE DATABASE {temp_db_name}"))
-
-    temp_db_url = (
-        f"postgresql+psycopg://{settings.db_user}:{settings.db_password}"
-        f"@{settings.db_host}:{settings.db_port}/{temp_db_name}"
-    )
-
-    temp_engine = create_engine(temp_db_url)
-    try:
-        alembic_cfg = Config(ALEMBIC_INI_PATH)
-        alembic_cfg.set_main_option("sqlalchemy.url", temp_db_url)
-
+    with temp_migration_db(
+        "commerce_temp_shipment_mig_test", alembic_ini_path=ALEMBIC_INI_PATH
+    ) as (alembic_cfg, temp_engine):
         # 1. Миграция до head (e6f7a8b9c0d1)
         command.upgrade(alembic_cfg, "e6f7a8b9c0d1")
 
@@ -314,14 +269,11 @@ def test_shipments_and_shipping_address_migration_downgrade_policy() -> None:
                 )
             ).scalar()
             assert sh_recreated is True
-    finally:
-        temp_engine.dispose()
-        with admin_engine.connect() as conn:
-            conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
-        admin_engine.dispose()
 
 
-def test_k4_outbox_migration_preserves_legacy_sent_and_pending_events() -> None:
+def test_k4_outbox_migration_preserves_legacy_sent_and_pending_events(
+    temp_migration_db: Callable[..., Any],
+) -> None:
     """К4 миграция f7a8b9c0d1e2: историческите 'sent' -> 'legacy_sent' без повторно пращане, 'pending' се запазват."""
     from unittest.mock import MagicMock
 
@@ -330,35 +282,16 @@ def test_k4_outbox_migration_preserves_legacy_sent_and_pending_events() -> None:
     from app.modules.orders.outbox_processor import OutboxProcessor
     from app.modules.orders.publisher import EventPublisher
 
-    temp_db_name = "commerce_temp_k4_outbox_mig_test"
-    admin_engine = create_engine(
-        settings.admin_database_url, isolation_level="AUTOCOMMIT"
-    )
-
-    with admin_engine.connect() as conn:
-        conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
-        conn.execute(text(f"CREATE DATABASE {temp_db_name}"))
-
-    admin_user = settings.db_admin_user or settings.db_user
-    admin_password = (
-        settings.db_admin_password
-        if settings.db_admin_password is not None
-        else settings.db_password
-    )
-    temp_db_url = (
-        f"postgresql+psycopg://{admin_user}:{admin_password}"
-        f"@{settings.db_host}:{settings.db_port}/{temp_db_name}"
-    )
-
-    temp_engine = create_engine(temp_db_url)
-    try:
-        alembic_cfg = Config(ALEMBIC_INI_PATH)
-        alembic_cfg.set_main_option("sqlalchemy.url", temp_db_url)
-
-        # 1. Старт в състояние преди К4 (e6f7a8b9c0d1)
+    with temp_migration_db(
+        "commerce_temp_k4_outbox_mig_test", alembic_ini_path=ALEMBIC_INI_PATH
+    ) as (alembic_cfg, temp_engine):
+        # 1. Старт в състояние преди К4 (e6f7a8b9c0d1) през непривилегированата DB_USER
         command.upgrade(alembic_cfg, "e6f7a8b9c0d1")
 
         with Session(temp_engine) as session:
+            assert session.execute(text("SELECT current_user")).scalar() == (
+                settings.db_user
+            )
             session.execute(
                 text(
                     "INSERT INTO users (id, email, password_hash, role) VALUES "
@@ -479,40 +412,16 @@ def test_k4_outbox_migration_preserves_legacy_sent_and_pending_events() -> None:
                 103: "published",
                 104: "published",
             }
-    finally:
-        temp_engine.dispose()
-        with admin_engine.connect() as conn:
-            conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
-        admin_engine.dispose()
 
 
-def test_k4_outbox_migration_allows_safe_downgrade_without_published_events() -> None:
+def test_k4_outbox_migration_allows_safe_downgrade_without_published_events(
+    temp_migration_db: Callable[..., Any],
+) -> None:
     """Когато няма 'published' събития, downgrade връща 'legacy_sent' -> 'sent' и пази 'pending'."""
-    temp_db_name = "commerce_temp_k4_outbox_downgrade_ok_test"
-    admin_engine = create_engine(
-        settings.admin_database_url, isolation_level="AUTOCOMMIT"
-    )
-
-    with admin_engine.connect() as conn:
-        conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
-        conn.execute(text(f"CREATE DATABASE {temp_db_name}"))
-
-    admin_user = settings.db_admin_user or settings.db_user
-    admin_password = (
-        settings.db_admin_password
-        if settings.db_admin_password is not None
-        else settings.db_password
-    )
-    temp_db_url = (
-        f"postgresql+psycopg://{admin_user}:{admin_password}"
-        f"@{settings.db_host}:{settings.db_port}/{temp_db_name}"
-    )
-
-    temp_engine = create_engine(temp_db_url)
-    try:
-        alembic_cfg = Config(ALEMBIC_INI_PATH)
-        alembic_cfg.set_main_option("sqlalchemy.url", temp_db_url)
-
+    with temp_migration_db(
+        "commerce_temp_k4_outbox_downgrade_ok_test",
+        alembic_ini_path=ALEMBIC_INI_PATH,
+    ) as (alembic_cfg, temp_engine):
         # 1. Наливане на данни в К4 схема без 'published' записи (само 'legacy_sent' и 'pending')
         command.upgrade(alembic_cfg, "head")
         with Session(temp_engine) as session:
@@ -575,8 +484,3 @@ def test_k4_outbox_migration_allows_safe_downgrade_without_published_events() ->
                 ).all()
             )
             assert statuses == {201: "legacy_sent", 202: "pending"}
-    finally:
-        temp_engine.dispose()
-        with admin_engine.connect() as conn:
-            conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
-        admin_engine.dispose()

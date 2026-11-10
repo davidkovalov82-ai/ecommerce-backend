@@ -146,15 +146,25 @@ class ValidatedEvent:
     customer_phone: str | None
 
 
+def _reject_json_constant(_token: str) -> Any:
+    """Отхвърля нестандартни JSON константи (NaN, Infinity, -Infinity)."""
+    raise ValueError("invalid_json_constant")
+
+
 def parse_and_validate_event(raw_body: bytes) -> ValidatedEvent:
     """Разчита суровите байтове на AMQP съобщението и валидира контракта строго.
 
-    При невалиден JSON, препълване извън БД типовете, непозната версия или тип
-    хвърля EventContractError без изтичане на сурови входни стойности или контакти.
+    При невалиден JSON (вкл. ValueError за прекалено дълго цяло число / NaN или дълбока рекурсия),
+    препълване извън БД типовете, непозната версия или тип хвърля EventContractError без
+    изтичане на сурови входни стойности или контакти.
     """
     try:
-        raw_obj = json.loads(raw_body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raw_obj = json.loads(
+            raw_body.decode("utf-8"),
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        # ValueError обхваща и json.JSONDecodeError, и лимита за брой цифри (sys.get_int_max_str_digits)
         raise InvalidEventContract("invalid_json") from exc
 
     if not isinstance(raw_obj, dict):

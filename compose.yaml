@@ -27,25 +27,20 @@ services:
       db:
         condition: service_healthy
     environment:
+      DB_HOST: db
       POSTGRES_USER: ${POSTGRES_ADMIN_USER:-commerce}
       POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-commerce}
       POSTGRES_DB: commerce
       COMMERCE_APP_USER: ${COMMERCE_DB_USER:-commerce_app}
       COMMERCE_APP_PASSWORD: ${COMMERCE_DB_PASSWORD:-commerce_app}
+      COMMERCE_DB_NAME: commerce
       NOTIF_APP_USER: ${NOTIFICATIONS_DB_USER:-notifications}
       NOTIF_APP_PASSWORD: ${NOTIFICATIONS_DB_PASSWORD:-notifications}
+      NOTIF_DB_NAME: notifications
     restart: "no"
-    command:
-      - sh
-      - -c
-      - |
-        export PGPASSWORD="$$POSTGRES_PASSWORD"
-        psql -h db -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_roles WHERE rolname = '$$COMMERCE_APP_USER'" | grep -q 1 || psql -h db -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "CREATE ROLE \"$$COMMERCE_APP_USER\" WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '$$COMMERCE_APP_PASSWORD';"
-        psql -h db -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_roles WHERE rolname = '$$NOTIF_APP_USER'" | grep -q 1 || psql -h db -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "CREATE ROLE \"$$NOTIF_APP_USER\" WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '$$NOTIF_APP_PASSWORD';"
-        psql -h db -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 -tAc "SELECT 1 FROM pg_database WHERE datname = 'notifications'" | grep -q 1 || psql -h db -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "CREATE DATABASE notifications OWNER \"$$NOTIF_APP_USER\";"
-        psql -h db -U "$$POSTGRES_USER" -d commerce -v ON_ERROR_STOP=1 -Atc "SELECT format('ALTER DATABASE commerce OWNER TO %I;', '$$COMMERCE_APP_USER') WHERE (SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'commerce') <> '$$COMMERCE_APP_USER'; SELECT format('ALTER SCHEMA public OWNER TO %I;', '$$COMMERCE_APP_USER') WHERE (SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = 'public') <> '$$COMMERCE_APP_USER'; SELECT format('ALTER TABLE public.%I OWNER TO %I;', tablename, '$$COMMERCE_APP_USER') FROM pg_tables WHERE schemaname = 'public' AND tableowner <> '$$COMMERCE_APP_USER'; SELECT format('ALTER SEQUENCE public.%I OWNER TO %I;', sequencename, '$$COMMERCE_APP_USER') FROM pg_sequences WHERE schemaname = 'public' AND sequenceowner <> '$$COMMERCE_APP_USER';" | psql -h db -U "$$POSTGRES_USER" -d commerce -v ON_ERROR_STOP=1
-        psql -h db -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -v ON_ERROR_STOP=1 -c "REVOKE ALL ON DATABASE commerce FROM PUBLIC; GRANT CONNECT, TEMP ON DATABASE commerce TO \"$$COMMERCE_APP_USER\"; REVOKE ALL ON DATABASE notifications FROM PUBLIC; GRANT CONNECT, TEMP ON DATABASE notifications TO \"$$NOTIF_APP_USER\";"
-        psql -h db -U "$$POSTGRES_USER" -d notifications -v ON_ERROR_STOP=1 -c "ALTER SCHEMA public OWNER TO \"$$NOTIF_APP_USER\";"
+    volumes:
+      - ./scripts/postgres_db_init.sh:/usr/local/bin/postgres_db_init.sh:ro
+    command: ["sh", "/usr/local/bin/postgres_db_init.sh"]
 
   rabbitmq:
     image: rabbitmq:4-management-alpine

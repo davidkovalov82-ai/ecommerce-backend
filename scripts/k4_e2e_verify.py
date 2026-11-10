@@ -737,10 +737,57 @@ def verify_scenario_5() -> None:
     assert len({r["event_id"] for r in outbox_rows}) == 3
 
 
+def _get_service_container_state(service_name: str) -> dict[str, Any]:
+    cid_res = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-p",
+            COMPOSE_PROJECT,
+            "-f",
+            COMPOSE_FILE,
+            "ps",
+            "-q",
+            service_name,
+        ],
+        cwd=ROOT_DIR,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    cid = cid_res.stdout.strip()
+    assert cid, f"Container id not found for {service_name}"
+    insp_res = subprocess.run(
+        ["docker", "inspect", cid],
+        cwd=ROOT_DIR,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    info = json.loads(insp_res.stdout)[0]
+    return {
+        "id": info["Id"],
+        "pid": int(info["State"]["Pid"]),
+        "restart_count": int(info.get("RestartCount", 0)),
+    }
+
+
+def _peek_dlq_payloads(queue_name: str = "notifications.events.dlq") -> list[str]:
+    resp = httpx.post(
+        f"http://127.0.0.1:55673/api/queues/%2F/{queue_name}/get",
+        auth=("guest", "guest"),
+        json={"count": 50, "ackmode": "ack_requeue_true", "encoding": "auto"},
+        timeout=3.0,
+    )
+    resp.raise_for_status()
+    return [str(item.get("payload", "")) for item in resp.json()]
+
+
 def verify_dlq_and_legacy_no_phone() -> None:
     print(
-        "-> [Bonus] Unknown event_version -> DLQ, and legacy event without phone -> Email sent + SMS skipped"
+        "-> [Bonus] Unknown event_version / 5000-digit int -> DLQ, same consumer processes next valid message without leaks"
     )
+    consumer_state_before = _get_service_container_state("notifications-e2e")
     params = pika.ConnectionParameters(
         host="127.0.0.1",
         port=55672,
@@ -751,6 +798,9 @@ def verify_dlq_and_legacy_no_phone() -> None:
     conn = pika.BlockingConnection(params)
     legacy_event_id = str(uuid.uuid4())
     legacy_email = f"legacy_nophone_{uuid.uuid4().hex[:8]}@example.com"
+    marker_contact = "e2e-poison-marker@example.com"
+    marker_5k = "e2e-5k-marker@example.com"
+    huge_digits = "9" * 5000
     try:
         ch = conn.channel()
         ch.confirm_delivery()
@@ -820,7 +870,6 @@ def verify_dlq_and_legacy_no_phone() -> None:
         )
 
         # Обект с тестова контактна метка вместо event_version -> DLQ и без теч в логовете
-        marker_contact = "e2e-poison-marker@example.com"
         poison_obj_msg = json.dumps(
             {
                 "event_id": f"raw-{marker_contact}",
@@ -839,7 +888,32 @@ def verify_dlq_and_legacy_no_phone() -> None:
             mandatory=True,
         )
 
-        # Старо събитие без полето customer_phone
+        # Недоверен JSON с 5000-цифрено число (ValueError в json.loads) -> DLQ без краш на consumer
+        poison_5k_msg = (
+            '{"event_id": "raw-5k-'
+            + marker_5k
+            + '", "event_type": "raw-5k-type-'
+            + marker_5k
+            + '", "event_version": 1, '
+            '"occurred_at": "'
+            + datetime.datetime.now(datetime.UTC).isoformat()
+            + '", "producer": "commerce", "data": {"order_id": '
+            + huge_digits
+            + ', "customer_email": "'
+            + marker_5k
+            + '", "total_minor": 100, "currency": "EUR"}}'
+        ).encode("utf-8")
+        ch.basic_publish(
+            exchange="commerce.events",
+            routing_key="order.paid",
+            body=poison_5k_msg,
+            properties=pika.BasicProperties(
+                delivery_mode=2, content_type="application/json"
+            ),
+            mandatory=True,
+        )
+
+        # Старо събитие без полето customer_phone веднага след лошите -> същият consumer го обработва
         legacy_msg = json.dumps(
             {
                 "event_id": legacy_event_id,
@@ -868,10 +942,17 @@ def verify_dlq_and_legacy_no_phone() -> None:
         conn.close()
 
     wait_until(
-        "Invalid / overflow / unknown-version events dead-lettered into notifications.events.dlq",
+        "Invalid / 5000-digit / overflow / unknown-version events dead-lettered into notifications.events.dlq",
         lambda: (
-            True if get_rabbitmq_queue_count("notifications.events.dlq") >= 3 else None
+            True if get_rabbitmq_queue_count("notifications.events.dlq") >= 4 else None
         ),
+    )
+    dlq_payloads = _peek_dlq_payloads()
+    assert any(marker_5k in body and ("9" * 100) in body for body in dlq_payloads), (
+        "Expected 5000-digit poison payload in notifications.events.dlq"
+    )
+    assert any(marker_contact in body for body in dlq_payloads), (
+        "Expected poison object payload in notifications.events.dlq"
     )
     logs_res = subprocess.run(
         [
@@ -890,11 +971,21 @@ def verify_dlq_and_legacy_no_phone() -> None:
         text=True,
         check=True,
     )
-    assert "e2e-poison-marker@example.com" not in logs_res.stdout
+    assert marker_contact not in logs_res.stdout
+    assert marker_5k not in logs_res.stdout
     assert "raw-" not in logs_res.stdout
+    assert "9" * 64 not in logs_res.stdout
     wait_until(
         "Legacy event email delivered",
         lambda: m if len(m := get_mailpit_messages(legacy_email)) == 1 else None,
+    )
+    consumer_state_after = _get_service_container_state("notifications-e2e")
+    assert consumer_state_after["id"] == consumer_state_before["id"]
+    assert consumer_state_after["pid"] == consumer_state_before["pid"]
+    assert (
+        consumer_state_after["restart_count"]
+        == consumer_state_before["restart_count"]
+        == 0
     )
 
     engine = create_engine(NOTIFICATIONS_SQLALCHEMY_URL, pool_pre_ping=True)

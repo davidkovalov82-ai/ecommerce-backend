@@ -9,7 +9,16 @@ from typing import Any
 
 import pika
 import pika.exceptions
-from sqlalchemy.exc import DataError
+import psycopg
+from sqlalchemy.exc import (
+    DataError,
+    DisconnectionError,
+    InterfaceError,
+    OperationalError,
+)
+from sqlalchemy.exc import (
+    TimeoutError as SQLAlchemyTimeoutError,
+)
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -20,6 +29,16 @@ logger = logging.getLogger(__name__)
 
 _EMAIL_PATTERN = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
 _PHONE_PATTERN = re.compile(r"\+?\d[\d\s\-()]{5,}\d")
+_TRANSIENT_DB_ERRORS = (
+    OperationalError,
+    InterfaceError,
+    DisconnectionError,
+    SQLAlchemyTimeoutError,
+    psycopg.OperationalError,
+    psycopg.InterfaceError,
+    OSError,
+    TimeoutError,
+)
 
 BeforeAckHook = Callable[[ValidatedEvent, Any, Any], None]
 
@@ -170,7 +189,7 @@ class RabbitMQEventConsumer:
             )
             channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
             return
-        except Exception as exc:  # noqa: BLE001
+        except _TRANSIENT_DB_ERRORS as exc:
             logger.warning(
                 "Temporary DB failure while ingesting event_id=%s event_type=%s order_id=%s shipment_id=%s error=%s",
                 event.event_id,

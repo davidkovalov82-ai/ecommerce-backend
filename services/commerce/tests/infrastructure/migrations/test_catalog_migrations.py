@@ -1,44 +1,31 @@
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from alembic import command
-from alembic.config import Config
-from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
-from app.config import settings
 from app.modules.catalog.models import Product
 
 ALEMBIC_INI_PATH = str(Path(__file__).resolve().parents[3] / "alembic.ini")
 
 
-def test_migration_head_syncs_sequence_for_automatic_ids() -> None:
+def test_migration_head_syncs_sequence_for_automatic_ids(
+    temp_migration_db: Callable[..., Any],
+) -> None:
     """Проверка върху отделна временна тестова БД:
 
     1. alembic upgrade head върху чиста база
     2. Създаване на нов продукт без ръчно подадено ID
     3. Не разчита на seed скрипта или на fixture, която коригира sequence
     """
-    temp_db_name = "commerce_temp_seq_test"
-    admin_engine = create_engine(settings.database_url, isolation_level="AUTOCOMMIT")
-
-    # 1. Създаване на чиста временна база данни
-    with admin_engine.connect() as conn:
-        conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
-        conn.execute(text(f"CREATE DATABASE {temp_db_name}"))
-
-    temp_db_url = (
-        f"postgresql+psycopg://{settings.db_user}:{settings.db_password}"
-        f"@{settings.db_host}:{settings.db_port}/{temp_db_name}"
-    )
-
-    temp_engine = create_engine(temp_db_url)
-    try:
-        # 2. Изпълнение на всички миграции до head
-        alembic_cfg = Config(ALEMBIC_INI_PATH)
-        alembic_cfg.set_main_option("sqlalchemy.url", temp_db_url)
+    with temp_migration_db(
+        "commerce_temp_seq_test", alembic_ini_path=ALEMBIC_INI_PATH
+    ) as (alembic_cfg, temp_engine):
+        # 1. Изпълнение на всички миграции до head през непривилегированата DB_USER
         command.upgrade(alembic_cfg, "head")
 
-        # 3. Вмъкване на нов продукт без ръчно ID
+        # 2. Вмъкване на нов продукт без ръчно ID
         with Session(temp_engine) as session:
             # Първоначалният Notebook с id=1 трябва да е вмъкнат от миграцията
             initial_product = session.get(Product, 1)
@@ -59,8 +46,3 @@ def test_migration_head_syncs_sequence_for_automatic_ids() -> None:
 
             # Проверяваме, че id е генерирано автоматично като 2, без конфликт
             assert new_product.id == 2
-    finally:
-        temp_engine.dispose()
-        with admin_engine.connect() as conn:
-            conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
-        admin_engine.dispose()
