@@ -2,7 +2,7 @@
 
 import datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.orm import Session
 
 from app.models import AccountModerationLog, PasswordResetToken, User
@@ -89,3 +89,17 @@ class UserRepository:
         self._session.add(log_entry)
         self._session.flush()
         return log_entry
+
+    def sync_sequences(self) -> None:
+        """Синхронизира PostgreSQL sequence броячите след пренос на исторически данни."""
+        for table in (
+            "users",
+            "account_moderation_logs",
+            "password_reset_tokens",
+        ):
+            self._session.execute(
+                text(
+                    f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), "
+                    f"coalesce(max(id), 1), max(id) IS NOT NULL) FROM {table};"
+                )
+            )

@@ -64,6 +64,21 @@
 - По подразбиране в Docker Compose: `SMTP_HOST=mailpit`, `SMTP_PORT=1025`, `SMTP_FROM=noreply@example.com`.
 - Локално за разработка/тестове се свързва към Mailpit на `localhost:1025`, а получените писма могат да се преглеждат в Web UI на `http://localhost:8025`.
 
+## Пренос на акаунти от Commerce (K6.1)
+Скриптът `scripts/migrate_from_commerce.py` реализира безопасен и идемпотентен пренос на потребители, одит логове за модерация и токени за ресет от Commerce към Users.
+- **Dry-run симулация** (по подразбиране, без промени по целевата база):
+  ```bash
+  uv run --locked python scripts/migrate_from_commerce.py --commerce-url "$COMMERCE_DATABASE_URL" --dry-run
+  ```
+- **Прилагане на преноса** (транзакционен запис със синхронизация на PostgreSQL sequences):
+  ```bash
+  uv run --locked python scripts/migrate_from_commerce.py --commerce-url "$COMMERCE_DATABASE_URL" --apply
+  ```
+- **Интеграционен тест на преноса** (на изолирани PostgreSQL бази):
+  ```bash
+  uv run --locked pytest tests/test_migrate_from_commerce.py
+  ```
+
 ## Стартиране с Docker Compose
 ```bash
 docker compose up -d users
