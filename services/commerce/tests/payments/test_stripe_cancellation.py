@@ -553,19 +553,15 @@ def test_interrupted_cancel_retry_after_recovery_restores_stock_once_without_sec
         assert refreshed_order is not None and refreshed_order.status == "cancelled"
 
 
-def test_terminal_closure_conflict_prevents_overwriting_saved_outcome(
+def test_lost_response_cancellation_saves_cancelled_outcome_and_restores_stock(
     db_session: Session,
     session_factory: sessionmaker[Session],
 ) -> None:
-    """Конфликтен отговор от Payments (409 expired/cancelled) и загубен HTTP отговор до checkout пазят истинския статус."""
-    user, token = _create_user_and_token(db_session, email="closure_truth@example.com")
-    product = _create_product(
-        db_session, "ClosureTruthProd", price_minor=1500, stock=10
-    )
+    """Загубен HTTP отговор при отмяна до checkout: събитието payment.cancelled затваря поръчката и връща стоката."""
+    user, token = _create_user_and_token(db_session, email="closure_lost@example.com")
+    product = _create_product(db_session, "ClosureLostProd", price_minor=1500, stock=10)
     future = datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=25)
-    past = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=5)
 
-    # 1. Загубен HTTP отговор при отмяна до checkout: без втори POST /cancel събитието payment.cancelled (без attempt) затваря поръчката
     order_lost = _create_order(
         db_session, user.id, product, quantity=2, expires_at=future
     )  # stock: 10 -> 8
@@ -611,7 +607,20 @@ def test_terminal_closure_conflict_prevents_overwriting_saved_outcome(
         assert s_chk.get(Order, order_lost.id).status == "cancelled"  # type: ignore[union-attr]
         assert s_chk.get(Product, product.id).stock == 10  # type: ignore[union-attr]
 
-    # 2. Payments вече е финализирал expired -> ръчен cancel получава 409 и не записва cancelled, а payment.expired го завършва в expired
+
+def test_terminal_closure_conflict_expired_prevents_manual_cancel_and_restores_stock(
+    db_session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Payments вече е финализирал expired -> ръчен cancel получава 409 и payment.expired завършва поръчката с връщане на наличност."""
+    user, token = _create_user_and_token(
+        db_session, email="closure_expired@example.com"
+    )
+    product = _create_product(
+        db_session, "ClosureExpiredProd", price_minor=1500, stock=10
+    )
+    past = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=5)
+
     order_exp = _create_order(
         db_session, user.id, product, quantity=3, expires_at=past
     )  # stock: 10 -> 7
@@ -653,7 +662,20 @@ def test_terminal_closure_conflict_prevents_overwriting_saved_outcome(
         assert s_chk2.get(Order, order_exp.id).status == "expired"  # type: ignore[union-attr]
         assert s_chk2.get(Product, product.id).stock == 10  # type: ignore[union-attr]
 
-    # 3. Обратен случай: Payments вече е финализирал cancelled -> reconcile_orders (reserve_expired) получава 409 и не записва expired
+
+def test_terminal_closure_conflict_cancelled_defers_reconciliation_and_preserves_stock(
+    db_session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Payments вече е финализирал cancelled -> reconcile_orders получава 409, отлага поръчката и запазва наличността."""
+    user, _token = _create_user_and_token(
+        db_session, email="closure_cancelled@example.com"
+    )
+    product = _create_product(
+        db_session, "ClosureCancelledProd", price_minor=1500, stock=10
+    )
+    past = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=5)
+
     order_can = _create_order(
         db_session, user.id, product, quantity=2, expires_at=past
     )  # stock: 10 -> 8
