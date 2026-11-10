@@ -657,7 +657,9 @@ class OrderService:
 
             if event.event_type == "payment.succeeded":
                 if (
-                    event.amount_minor != order.total_minor
+                    event.amount_minor is None
+                    or event.currency is None
+                    or event.amount_minor != order.total_minor
                     or event.currency.upper() != order.currency.upper()
                 ):
                     outcome = "mismatched"

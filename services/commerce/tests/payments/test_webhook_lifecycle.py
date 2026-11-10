@@ -511,3 +511,25 @@ def test_payment_cancelled_completes_cancellation_and_ignores_duplicates_or_paid
     db_session.refresh(product)
     assert order_paid.status == "paid"
     assert product.stock == 7
+
+    # 4. Отмяна до първи checkout (без payment_attempt_id) и загубен HTTP отговор до края на резерва
+    order_no_attempt = _create_order(
+        db_session, user.id, product, quantity=2, expires_at=future
+    )  # stock: 7 -> 5
+    ev_no_attempt = make_payment_event(
+        event_type="payment.cancelled",
+        order_id=order_no_attempt.id,
+        payment_attempt_id=None,
+        attempt_key=None,
+        stripe_session_id=None,
+    )
+    assert svc.apply_payment_event(ev_no_attempt) == "cancelled"
+    assert svc.apply_payment_event(ev_no_attempt) == "already_processed"
+    db_session.refresh(order_no_attempt)
+    db_session.refresh(product)
+    assert order_no_attempt.status == "cancelled"
+    assert product.stock == 7
+    inbox_row = db_session.get(OrderInboxEvent, ev_no_attempt.event_id)
+    assert inbox_row is not None
+    assert inbox_row.payment_attempt_id is None
+    assert inbox_row.outcome == "cancelled"

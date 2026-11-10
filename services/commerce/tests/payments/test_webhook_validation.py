@@ -1,3 +1,4 @@
+import datetime
 import json
 import logging
 import sys
@@ -79,7 +80,7 @@ def test_parse_rejects_pg_int_overflow_bool_version_and_unsupported_types() -> N
     with pytest.raises(UnsupportedPaymentEventVersion):
         parse_and_validate_payment_event(json.dumps(env_ver2).encode("utf-8"))
 
-    # Поддържани типове включват payment.cancelled
+    # Поддържани типове включват payment.cancelled (със и без payment_attempt_id)
     env_cancelled = make_payment_event_envelope(
         event_type="payment.cancelled",
         order_id=1,
@@ -90,6 +91,37 @@ def test_parse_rejects_pg_int_overflow_bool_version_and_unsupported_types() -> N
         ).event_type
         == "payment.cancelled"
     )
+    env_cancelled_no_attempt = {
+        "event_id": str(uuid.uuid4()),
+        "event_type": "payment.cancelled",
+        "event_version": 1,
+        "occurred_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        "producer": "payments",
+        "data": {
+            "order_id": 2,
+            "payment_attempt_id": None,
+            "attempt_key": None,
+            "closure_reason": "cancel",
+        },
+    }
+    parsed_no_attempt = parse_and_validate_payment_event(
+        json.dumps(env_cancelled_no_attempt).encode("utf-8")
+    )
+    assert parsed_no_attempt.event_type == "payment.cancelled"
+    assert parsed_no_attempt.order_id == 2
+    assert parsed_no_attempt.payment_attempt_id is None
+
+    # payment.succeeded с payment_attempt_id=None е невалидно -> DLQ
+    env_bad_succ = {
+        "event_id": str(uuid.uuid4()),
+        "event_type": "payment.succeeded",
+        "event_version": 1,
+        "occurred_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        "producer": "payments",
+        "data": {"order_id": 2, "payment_attempt_id": None},
+    }
+    with pytest.raises(InvalidPaymentContract):
+        parse_and_validate_payment_event(json.dumps(env_bad_succ).encode("utf-8"))
 
     # Неподдържан тип
     env_bad_type = make_payment_event_envelope(

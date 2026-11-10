@@ -12,6 +12,7 @@ from app.config import settings
 from app.models import (
     PaymentAttempt,
     PaymentDiscrepancy,
+    PaymentOrderClosure,
     StripeCheckoutSession,
     StripeProcessedEvent,
 )
@@ -91,6 +92,32 @@ class PaymentService:
             event_id=str(uuid.uuid4()),
             payment_attempt_id=attempt.id,
             order_id=attempt.order_id,
+            event_type=event_type,
+            payload=payload,
+            occurred_at=now,
+        )
+
+    def _enqueue_order_closure_outbox_event(
+        self,
+        *,
+        order_id: int,
+        event_type: str,
+        reason: str,
+        occurred_at: datetime.datetime | None = None,
+    ) -> None:
+        now = occurred_at or datetime.datetime.now(datetime.UTC)
+        payload = {
+            "order_id": order_id,
+            "payment_attempt_id": None,
+            "attempt_key": None,
+            "stripe_session_id": None,
+            "stripe_event_id": None,
+            "closure_reason": reason,
+        }
+        self._repo.record_outbox_event_idempotent(
+            event_id=str(uuid.uuid4()),
+            payment_attempt_id=None,
+            order_id=order_id,
             event_type=event_type,
             payload=payload,
             occurred_at=now,
@@ -650,23 +677,17 @@ class PaymentService:
                 raise OrderAlreadyPaid("Cannot cancel paid order")
 
             existing_closure = self._repo.get_order_closure_for_update(order_id)
-            if existing_closure is not None and existing_closure.status in (
-                "cancelling",
-                "expiring",
-            ):
-                conflict_status = existing_closure.status
-                self._session.commit()
-                raise PaymentStateConflict(
-                    current_status=conflict_status,
-                    message=f"Order cancellation is already in status '{conflict_status}'",
+            if existing_closure is not None:
+                return self._handle_existing_order_closure(
+                    order_id=order_id,
+                    existing_closure=existing_closure,
+                    requested_closure_status=closure_status,
                 )
 
             active_attempt = self._repo.get_active_attempt_by_order_for_update(order_id)
             if active_attempt is None:
-                latest_attempt = (
-                    self._repo.get_latest_attempt_by_order_for_update(order_id)
-                    if closure_status == "cancelled"
-                    else None
+                latest_attempt = self._repo.get_latest_attempt_by_order_for_update(
+                    order_id
                 )
                 latest_session = (
                     self._repo.get_stripe_session_by_attempt_id_for_update(
@@ -682,7 +703,10 @@ class PaymentService:
                     attempt=latest_attempt,
                     session_rec=latest_session,
                     mark_attempt_expired=False,
-                    emit_expired_event=False,
+                    emit_expired_event=(
+                        latest_attempt is not None
+                        and latest_attempt.status == "expired"
+                    ),
                 )
                 self._session.commit()
                 return InternalCancelPaymentResponse(status="can_cancel", action="none")
@@ -721,7 +745,7 @@ class PaymentService:
                     attempt=active_attempt,
                     session_rec=session_rec,
                     mark_attempt_expired=True,
-                    emit_expired_event=False,
+                    emit_expired_event=True,
                 )
                 self._session.commit()
                 return InternalCancelPaymentResponse(
@@ -798,6 +822,17 @@ class PaymentService:
                     message=f"Cannot finalize cancellation while attempt is in status '{other_status}'",
                 )
 
+            closure_now = self._repo.get_order_closure_for_update(order_id)
+            if closure_now is not None and closure_now.status in (
+                "cancelled",
+                "expired",
+            ):
+                return self._handle_existing_order_closure(
+                    order_id=order_id,
+                    existing_closure=closure_now,
+                    requested_closure_status=closure_status,
+                )
+
             self._finalize_order_closure_with_outbox(
                 order_id=order_id,
                 final_closure_status=closure_status,
@@ -805,7 +840,7 @@ class PaymentService:
                 attempt=attempt_rec,
                 session_rec=session_rec,
                 mark_attempt_expired=True,
-                emit_expired_event=False,
+                emit_expired_event=True,
             )
             self._session.commit()
             return InternalCancelPaymentResponse(
@@ -815,6 +850,68 @@ class PaymentService:
         except Exception:
             self._session.rollback()
             raise
+
+    def _handle_existing_order_closure(
+        self,
+        *,
+        order_id: int,
+        existing_closure: PaymentOrderClosure,
+        requested_closure_status: str,
+    ) -> InternalCancelPaymentResponse:
+        """Зачита съществуващото затваряне като източник на истина без противоречащи промени или събития."""
+        if existing_closure.status in ("cancelling", "expiring"):
+            conflict_status = existing_closure.status
+            self._session.commit()
+            raise PaymentStateConflict(
+                current_status=conflict_status,
+                message=f"Order cancellation is already in status '{conflict_status}'",
+            )
+
+        if existing_closure.status != requested_closure_status:
+            conflict_status = existing_closure.status
+            self._session.commit()
+            raise PaymentStateConflict(
+                current_status=conflict_status,
+                message=(
+                    f"Order payment closure is already finalized with status "
+                    f"'{conflict_status}'"
+                ),
+            )
+
+        latest_attempt = self._repo.get_latest_attempt_by_order_for_update(order_id)
+        latest_session = (
+            self._repo.get_stripe_session_by_attempt_id_for_update(latest_attempt.id)
+            if latest_attempt is not None
+            else None
+        )
+        if existing_closure.status == "cancelled":
+            if latest_attempt is not None:
+                self._enqueue_outbox_event(
+                    attempt=latest_attempt,
+                    session_record=latest_session,
+                    event_type="payment.cancelled",
+                )
+            else:
+                self._enqueue_order_closure_outbox_event(
+                    order_id=order_id,
+                    event_type="payment.cancelled",
+                    reason=existing_closure.reason,
+                )
+            self._session.commit()
+            return InternalCancelPaymentResponse(
+                status="can_cancel", action="already_cancelled"
+            )
+
+        if latest_attempt is not None and latest_attempt.status == "expired":
+            self._enqueue_outbox_event(
+                attempt=latest_attempt,
+                session_record=latest_session,
+                event_type="payment.expired",
+            )
+        self._session.commit()
+        return InternalCancelPaymentResponse(
+            status="already_expired", action="already_expired"
+        )
 
     def _finalize_order_closure_with_outbox(
         self,
@@ -857,6 +954,12 @@ class PaymentService:
                     session_record=session_rec,
                     event_type="payment.expired",
                 )
+        elif final_closure_status == "cancelled":
+            self._enqueue_order_closure_outbox_event(
+                order_id=order_id,
+                event_type="payment.cancelled",
+                reason=reason,
+            )
         self._repo.finalize_order_closure(
             order_id=order_id,
             status=final_closure_status,
@@ -1726,10 +1829,14 @@ class PaymentService:
                 or self._repo.get_latest_attempt_by_order_for_update(order_id)
             )
             if target_attempt is None:
-                self._repo.finalize_order_closure(
+                self._finalize_order_closure_with_outbox(
                     order_id=order_id,
-                    status=final_closure_status,
+                    final_closure_status=final_closure_status,
                     reason=closure_reason,
+                    attempt=None,
+                    session_rec=None,
+                    mark_attempt_expired=False,
+                    emit_expired_event=False,
                 )
                 self._session.commit()
                 return "expired"

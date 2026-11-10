@@ -66,6 +66,19 @@ class PaymentEventData(BaseModel):
     mode: Literal["test", "live"] = "test"
 
 
+class OrderClosureEventData(BaseModel):
+    """Данни за поръчково закритие без обвързана платежна попытка (напр. отмяна преди checkout)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    order_id: Annotated[int, StrictInt()] = Field(gt=0, le=PG_BIGINT_MAX)
+    payment_attempt_id: None = None
+    attempt_key: str | None = Field(default=None, min_length=1, max_length=100)
+    stripe_session_id: str | None = Field(default=None, max_length=255)
+    stripe_event_id: str | None = Field(default=None, max_length=255)
+    closure_reason: str | None = Field(default=None, max_length=50)
+
+
 class PaymentEventEnvelope(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -95,13 +108,13 @@ class ValidatedPaymentEvent:
     event_version: int
     occurred_at: datetime.datetime
     order_id: int
-    payment_attempt_id: int
-    attempt_key: str
+    payment_attempt_id: int | None
+    attempt_key: str | None
     stripe_session_id: str | None
     stripe_event_id: str | None
-    amount_minor: int
-    currency: str
-    mode: Literal["test", "live"]
+    amount_minor: int | None
+    currency: str | None
+    mode: Literal["test", "live"] | None
     payload: dict[str, Any]
 
 
@@ -139,6 +152,42 @@ def parse_and_validate_payment_event(raw_body: bytes) -> ValidatedPaymentEvent:
         "payment.cancelled",
     ):
         raise UnsupportedPaymentEventType("unsupported_event_type")
+
+    is_attemptless_cancellation = (
+        envelope.event_type == "payment.cancelled"
+        and envelope.data.get("payment_attempt_id") is None
+    )
+    if is_attemptless_cancellation:
+        try:
+            closure_data = OrderClosureEventData.model_validate(envelope.data)
+        except ValidationError as exc:
+            raise InvalidPaymentContract(
+                f"invalid_payment_payload:{_safe_error_field(exc)}"
+            ) from exc
+
+        normalized_closure_payload = {
+            "order_id": closure_data.order_id,
+            "payment_attempt_id": None,
+            "attempt_key": closure_data.attempt_key,
+            "stripe_session_id": closure_data.stripe_session_id,
+            "stripe_event_id": closure_data.stripe_event_id,
+            "closure_reason": closure_data.closure_reason,
+        }
+        return ValidatedPaymentEvent(
+            event_id=envelope.event_id,
+            event_type="payment.cancelled",
+            event_version=envelope.event_version,
+            occurred_at=envelope.occurred_at,
+            order_id=closure_data.order_id,
+            payment_attempt_id=None,
+            attempt_key=closure_data.attempt_key,
+            stripe_session_id=closure_data.stripe_session_id,
+            stripe_event_id=closure_data.stripe_event_id,
+            amount_minor=None,
+            currency=None,
+            mode=None,
+            payload=normalized_closure_payload,
+        )
 
     try:
         data = PaymentEventData.model_validate(envelope.data)

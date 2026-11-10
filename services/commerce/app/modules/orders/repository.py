@@ -256,7 +256,7 @@ class OrderRepository:
         event_id: str,
         event_type: str,
         event_version: int,
-        payment_attempt_id: int,
+        payment_attempt_id: int | None,
         order_id: int,
         outcome: str,
         payload: dict[str, Any],

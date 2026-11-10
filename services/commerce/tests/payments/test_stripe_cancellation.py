@@ -551,3 +551,128 @@ def test_interrupted_cancel_retry_after_recovery_restores_stock_once_without_sec
         refreshed_order = verify_session.get(Order, order.id)
         assert refreshed_product is not None and refreshed_product.stock == 10
         assert refreshed_order is not None and refreshed_order.status == "cancelled"
+
+
+def test_terminal_closure_conflict_prevents_overwriting_saved_outcome(
+    db_session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Конфликтен отговор от Payments (409 expired/cancelled) и загубен HTTP отговор до checkout пазят истинския статус."""
+    user, token = _create_user_and_token(db_session, email="closure_truth@example.com")
+    product = _create_product(
+        db_session, "ClosureTruthProd", price_minor=1500, stock=10
+    )
+    future = datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=25)
+    past = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=5)
+
+    # 1. Загубен HTTP отговор при отмяна до checkout: без втори POST /cancel събитието payment.cancelled (без attempt) затваря поръчката
+    order_lost = _create_order(
+        db_session, user.id, product, quantity=2, expires_at=future
+    )  # stock: 10 -> 8
+    mock_lost = MagicMock(spec=PaymentsClient)
+    mock_lost.cancel_order_payment.side_effect = PaymentGatewayError(
+        "HTTP response dropped after Payments commit"
+    )
+    app.dependency_overrides[get_payments_client] = lambda: mock_lost
+    try:
+        r_lost = client.post(
+            f"/orders/{order_lost.id}/cancel",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r_lost.status_code == 502
+    finally:
+        app.dependency_overrides.pop(get_payments_client, None)
+
+    with session_factory() as s_lost:
+        o_lost = s_lost.get(Order, order_lost.id)
+        p_lost = s_lost.get(Product, product.id)
+        assert o_lost is not None and o_lost.status == "pending_payment"
+        assert p_lost is not None and p_lost.stock == 8
+        svc_lost = OrderService(
+            order_repository=OrderRepository(s_lost),
+            cart_repository=CartRepository(s_lost),
+            product_repository=ProductRepository(s_lost),
+            user_repository=UserRepository(s_lost),
+            session=s_lost,
+        )
+        assert (
+            svc_lost.apply_payment_event(
+                make_payment_event(
+                    event_type="payment.cancelled",
+                    order_id=order_lost.id,
+                    payment_attempt_id=None,
+                    attempt_key=None,
+                    stripe_session_id=None,
+                )
+            )
+            == "cancelled"
+        )
+    with session_factory() as s_chk:
+        assert s_chk.get(Order, order_lost.id).status == "cancelled"  # type: ignore[union-attr]
+        assert s_chk.get(Product, product.id).stock == 10  # type: ignore[union-attr]
+
+    # 2. Payments вече е финализирал expired -> ръчен cancel получава 409 и не записва cancelled, а payment.expired го завършва в expired
+    order_exp = _create_order(
+        db_session, user.id, product, quantity=3, expires_at=past
+    )  # stock: 10 -> 7
+    mock_exp = MagicMock(spec=PaymentsClient)
+    mock_exp.cancel_order_payment.side_effect = RemotePaymentConflict(
+        current_status="expired",
+        message="Order payment closure is already finalized with status 'expired'",
+    )
+    app.dependency_overrides[get_payments_client] = lambda: mock_exp
+    try:
+        r_exp_cancel = client.post(
+            f"/orders/{order_exp.id}/cancel",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r_exp_cancel.status_code == 409
+        assert r_exp_cancel.json()["detail"]["code"] == "ORDER_STATUS_CONFLICT"
+    finally:
+        app.dependency_overrides.pop(get_payments_client, None)
+
+    with session_factory() as s_exp:
+        svc_exp = OrderService(
+            order_repository=OrderRepository(s_exp),
+            cart_repository=CartRepository(s_exp),
+            product_repository=ProductRepository(s_exp),
+            user_repository=UserRepository(s_exp),
+            session=s_exp,
+        )
+        assert (
+            svc_exp.apply_payment_event(
+                make_payment_event(
+                    event_type="payment.expired",
+                    order_id=order_exp.id,
+                    amount_minor=4500,
+                )
+            )
+            == "expired"
+        )
+    with session_factory() as s_chk2:
+        assert s_chk2.get(Order, order_exp.id).status == "expired"  # type: ignore[union-attr]
+        assert s_chk2.get(Product, product.id).stock == 10  # type: ignore[union-attr]
+
+    # 3. Обратен случай: Payments вече е финализирал cancelled -> reconcile_orders (reserve_expired) получава 409 и не записва expired
+    order_can = _create_order(
+        db_session, user.id, product, quantity=2, expires_at=past
+    )  # stock: 10 -> 8
+    mock_can = MagicMock(spec=PaymentsClient)
+    mock_can.cancel_order_payment.side_effect = RemotePaymentConflict(
+        current_status="cancelled",
+        message="Order payment closure is already finalized with status 'cancelled'",
+    )
+    with session_factory() as s_rec:
+        svc_rec = OrderService(
+            order_repository=OrderRepository(s_rec),
+            cart_repository=CartRepository(s_rec),
+            product_repository=ProductRepository(s_rec),
+            user_repository=UserRepository(s_rec),
+            session=s_rec,
+            payments_client=mock_can,
+        )
+        stats = svc_rec.reconcile_expired_orders()
+        assert stats["deferred"] >= 1
+    with session_factory() as s_chk3:
+        assert s_chk3.get(Order, order_can.id).status == "pending_payment"  # type: ignore[union-attr]
+        assert s_chk3.get(Product, product.id).stock == 8  # type: ignore[union-attr]

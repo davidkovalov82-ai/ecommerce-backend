@@ -36,7 +36,7 @@ class OutboxProcessor:
                 int,
                 datetime.datetime,
                 int,
-                int,
+                int | None,
                 dict[str, Any],
             ]
         ] = []

@@ -22,6 +22,8 @@ from app.models import (
     PaymentOutboxEvent,
     StripeCheckoutSession,
 )
+from app.outbox_processor import OutboxProcessor
+from app.publisher import EventPublisher
 from app.repository import PaymentRepository
 from app.service import PaymentService
 from app.stripe_client import StripeClient
@@ -1650,3 +1652,164 @@ def test_interrupted_cancel_recovers_before_and_after_stripe_expire_and_preserve
         .count()
         == 0
     )
+
+
+def test_manual_cancel_before_checkout_without_attempt_and_terminal_closure_source_of_truth(
+    db_session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Ръчна отмяна до първи checkout записва outbox без фиктивна попытка; запазен expired отхвърля противоречащ cancel."""
+    # 1. До първи checkout: 0 attempts, 0 stripe sessions -> запазената отмяна пише closure='cancelled' + payment.cancelled без payment_attempt_id
+    r_no_attempt = client.post(
+        "/internal/payments/orders/560/cancel",
+        json={"reason": "cancel"},
+        headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+    )
+    assert r_no_attempt.status_code == 200
+    assert r_no_attempt.json()["status"] == "can_cancel"
+
+    assert db_session.query(PaymentAttempt).filter_by(order_id=560).count() == 0
+    assert db_session.query(StripeCheckoutSession).filter_by(order_id=560).count() == 0
+    assert (
+        db_session.query(PaymentOrderClosure).filter_by(order_id=560).one().status
+        == "cancelled"
+    )
+    outbox_560 = (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=560, event_type="payment.cancelled")
+        .one()
+    )
+    assert outbox_560.payment_attempt_id is None
+    assert outbox_560.status == "pending"
+
+    # Повторен същ cancel е идемпотентен и не дублира outbox
+    r_no_attempt_repeat = client.post(
+        "/internal/payments/orders/560/cancel",
+        json={"reason": "cancel"},
+        headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+    )
+    assert r_no_attempt_repeat.status_code == 200
+    assert db_session.query(PaymentOutboxEvent).filter_by(order_id=560).count() == 1
+
+    # Противоречащ reserve_expired след запазено cancelled се отказва (409) без payment.expired
+    r_conflict_expire = client.post(
+        "/internal/payments/orders/560/cancel",
+        json={"reason": "reserve_expired"},
+        headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+    )
+    assert r_conflict_expire.status_code == 409
+    assert r_conflict_expire.json()["detail"]["code"] == "ORDER_STATUS_CONFLICT"
+    assert r_conflict_expire.json()["detail"]["current_status"] == "cancelled"
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=560, event_type="payment.expired")
+        .count()
+        == 0
+    )
+
+    # OutboxProcessor публикува събитието без payment_attempt_id
+    published: list[tuple[str, dict[str, Any]]] = []
+    mock_pub = MagicMock(spec=EventPublisher)
+    mock_pub.publish_event.side_effect = lambda *, routing_key, envelope: (
+        published.append((routing_key, envelope))
+    )
+    proc = OutboxProcessor(session_factory=session_factory, publisher=mock_pub)
+    stats = proc.process_pending_events()
+    assert stats["published"] == 1
+    assert any(
+        rk == "payment.cancelled"
+        and env["data"]["order_id"] == 560
+        and env["data"]["payment_attempt_id"] is None
+        for rk, env in published
+    )
+
+    # 2. Вече финализиран expired с минала попытка: ръчен cancel връща 409, не пуска payment.cancelled, остава expired
+    past_attempt = PaymentAttempt(
+        order_id=561,
+        attempt_key="order_561_attempt_1",
+        status="open",
+        amount_minor=3000,
+        currency="EUR",
+    )
+    db_session.add(past_attempt)
+    db_session.flush()
+    db_session.add(
+        StripeCheckoutSession(
+            payment_attempt_id=past_attempt.id,
+            order_id=561,
+            status="open",
+            amount_minor=3000,
+            currency="EUR",
+            stripe_session_id="cs_exp_truth_561",
+            idempotency_key="order_561_attempt_1",
+        )
+    )
+    db_session.commit()
+
+    mock_stripe_exp = MagicMock(spec=StripeClient)
+    app.dependency_overrides[get_stripe_client] = lambda: mock_stripe_exp
+    try:
+        r_save_expired = client.post(
+            "/internal/payments/orders/561/cancel",
+            json={"reason": "reserve_expired"},
+            headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+        )
+        assert r_save_expired.status_code == 200
+
+        r_cancel_after_exp = client.post(
+            "/internal/payments/orders/561/cancel",
+            json={"reason": "cancel"},
+            headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+        )
+        assert r_cancel_after_exp.status_code == 409
+        assert r_cancel_after_exp.json()["detail"]["code"] == "ORDER_STATUS_CONFLICT"
+        assert r_cancel_after_exp.json()["detail"]["current_status"] == "expired"
+    finally:
+        app.dependency_overrides.pop(get_stripe_client, None)
+
+    db_session.expire_all()
+    assert (
+        db_session.query(PaymentOrderClosure).filter_by(order_id=561).one().status
+        == "expired"
+    )
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=561, event_type="payment.cancelled")
+        .count()
+        == 0
+    )
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=561, event_type="payment.expired")
+        .count()
+        == 1
+    )
+
+    # 3. Прекъснато cancelling закритие без попытка също емитва payment.cancelled без payment_attempt_id при сверка
+    db_session.add(
+        PaymentOrderClosure(order_id=562, status="cancelling", reason="cancel")
+    )
+    db_session.commit()
+    with session_factory() as s_rec_no_att:
+        svc_rec = PaymentService(
+            repository=PaymentRepository(s_rec_no_att),
+            session=s_rec_no_att,
+            stripe_client=MagicMock(spec=StripeClient),
+        )
+        res_rec = svc_rec.reconcile_unresolved_payments(
+            now=datetime.datetime.now(datetime.UTC)
+        )
+        assert res_rec["expired"] == 1
+
+    db_session.expire_all()
+    assert (
+        db_session.query(PaymentOrderClosure).filter_by(order_id=562).one().status
+        == "cancelled"
+    )
+    outbox_562 = (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=562, event_type="payment.cancelled")
+        .one()
+    )
+    assert outbox_562.payment_attempt_id is None
+    assert db_session.query(PaymentAttempt).filter_by(order_id=562).count() == 0

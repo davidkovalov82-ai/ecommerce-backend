@@ -221,6 +221,13 @@ class PaymentOutboxEvent(Base):
             "event_type",
             name="uq_payment_outbox_attempt_event",
         ),
+        Index(
+            "ux_payment_outbox_order_event_no_attempt",
+            "order_id",
+            "event_type",
+            unique=True,
+            postgresql_where=text("payment_attempt_id IS NULL"),
+        ),
         CheckConstraint(
             "event_type IN ("
             "'payment.succeeded', "
@@ -252,7 +259,7 @@ class PaymentOutboxEvent(Base):
         default=1,
         server_default=text("1"),
     )
-    payment_attempt_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    payment_attempt_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     order_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     event_type: Mapped[str] = mapped_column(String(100), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)

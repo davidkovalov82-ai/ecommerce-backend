@@ -1154,6 +1154,149 @@ def verify_cancel_and_late_payment_discrepancy(seller_token: str) -> None:
     assert get_order_detail(buyer_int_paid, oid_int_paid)["status"] == "paid"
     assert get_product_stock(pid_close) == 5
 
+    # Допълнителна проверка #3: отмяна ДО първи checkout при загубен HTTP отговор от Payments
+    # Payments пази closure='cancelled' + payment.cancelled без фиктивна попытка/Stripe сесия -> Commerce става cancelled преди expires_at
+    _, buyer_no_co = register_and_login(
+        f"k5_no_attempt_can_{uuid.uuid4().hex[:8]}@example.com"
+    )
+    add_to_cart(buyer_no_co, pid_close, 1)  # stock 5 -> 4
+    oid_no_co = int(create_order(buyer_no_co)["id"])
+    assert get_product_stock(pid_close) == 4
+
+    r_pay_no_co = httpx.post(
+        f"{PAYMENTS_API_URL}/internal/payments/orders/{oid_no_co}/cancel",
+        json={"reason": "cancel"},
+        headers={"X-Internal-Token": INTERNAL_TOKEN},
+        timeout=5.0,
+    )
+    assert r_pay_no_co.status_code == 200
+    assert r_pay_no_co.json()["status"] == "can_cancel"
+
+    with psycopg.connect(PAYMENTS_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM payment_attempts WHERE order_id = %s",
+            (oid_no_co,),
+        )
+        assert cur.fetchone()[0] == 0  # type: ignore[index]
+        cur.execute(
+            "SELECT COUNT(*) FROM stripe_checkout_sessions WHERE order_id = %s",
+            (oid_no_co,),
+        )
+        assert cur.fetchone()[0] == 0  # type: ignore[index]
+        cur.execute(
+            "SELECT status FROM payment_order_closures WHERE order_id = %s",
+            (oid_no_co,),
+        )
+        assert cur.fetchone()[0] == "cancelled"  # type: ignore[index]
+
+    # Без втори POST /cancel и с expires_at все още в бъдещето -> Commerce получава payment.cancelled и връща stock веднъж
+    wait_until(
+        "Attemptless cancellation with lost HTTP response reaches cancelled before reserve expiry",
+        lambda: (
+            True
+            if get_order_detail(buyer_no_co, oid_no_co)["status"] == "cancelled"
+            else None
+        ),
+    )
+    assert get_product_stock(pid_close) == 5
+    with psycopg.connect(COMMERCE_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT payment_attempt_id, outcome FROM order_inbox_events WHERE order_id = %s AND event_type = 'payment.cancelled'",
+            (oid_no_co,),
+        )
+        inbox_no_co = cur.fetchone()
+        assert inbox_no_co == (None, "cancelled")
+
+    # Конфликтен reserve_expired след запазено cancelled се отказва (409) без payment.expired и остава cancelled
+    r_conflict_exp = httpx.post(
+        f"{PAYMENTS_API_URL}/internal/payments/orders/{oid_no_co}/cancel",
+        json={"reason": "reserve_expired"},
+        headers={"X-Internal-Token": INTERNAL_TOKEN},
+        timeout=5.0,
+    )
+    assert r_conflict_exp.status_code == 409
+    assert r_conflict_exp.json()["detail"]["current_status"] == "cancelled"
+    assert get_order_detail(buyer_no_co, oid_no_co)["status"] == "cancelled"
+    assert get_product_stock(pid_close) == 5
+
+    # Допълнителна проверка #4: Payments вече е запазил expired за поръчка с минала попытка -> идва ръчен cancel
+    # Няма фалшиво payment.cancelled и крайният статус в двата сервиса е expired
+    _, buyer_exp_can = register_and_login(
+        f"k5_exp_then_cancel_{uuid.uuid4().hex[:8]}@example.com"
+    )
+    add_to_cart(buyer_exp_can, pid_close, 1)  # stock 5 -> 4
+    oid_exp_can = int(create_order(buyer_exp_can)["id"])
+    co_exp_can = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid_exp_can}/checkout-session",
+        headers={"Authorization": f"Bearer {buyer_exp_can}"},
+        timeout=5.0,
+    )
+    assert co_exp_can.status_code == 200
+    expired_past_ts = (
+        datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=25)
+    ).isoformat()
+    with psycopg.connect(COMMERCE_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE orders SET expires_at = %s WHERE id = %s",
+            (expired_past_ts, oid_exp_can),
+        )
+        conn.commit()
+    with psycopg.connect(PAYMENTS_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE payment_attempts SET order_expires_at = %s WHERE order_id = %s",
+            (expired_past_ts, oid_exp_can),
+        )
+        conn.commit()
+
+    compose_cmd("stop", "payments-outbox-e2e")
+    try:
+        r_save_exp = httpx.post(
+            f"{PAYMENTS_API_URL}/internal/payments/orders/{oid_exp_can}/cancel",
+            json={"reason": "reserve_expired", "order_expires_at": expired_past_ts},
+            headers={"X-Internal-Token": INTERNAL_TOKEN},
+            timeout=5.0,
+        )
+        assert r_save_exp.status_code == 200
+
+        # Сега идва ръчен cancel от клиента, докато Commerce още не е обработил expired -> получава 409
+        r_manual_after_exp = httpx.post(
+            f"{COMMERCE_API_URL}/orders/{oid_exp_can}/cancel",
+            headers={"Authorization": f"Bearer {buyer_exp_can}"},
+            timeout=5.0,
+        )
+        assert r_manual_after_exp.status_code == 409
+        assert r_manual_after_exp.json()["detail"]["code"] == "ORDER_STATUS_CONFLICT"
+
+        outbox_exp_can = get_payment_outbox_rows(oid_exp_can)
+        assert not any(
+            row["event_type"] == "payment.cancelled" for row in outbox_exp_can
+        )
+        assert any(row["event_type"] == "payment.expired" for row in outbox_exp_can)
+    finally:
+        compose_cmd("start", "payments-outbox-e2e")
+
+    wait_until(
+        "Order converges to expired in Commerce after manual cancel was rejected against saved expired closure",
+        lambda: (
+            True
+            if get_order_detail(buyer_exp_can, oid_exp_can)["status"] == "expired"
+            else None
+        ),
+    )
+    assert get_order_detail(buyer_exp_can, oid_exp_can)["status"] == "expired"
+    assert get_product_stock(pid_close) == 5
+    with psycopg.connect(PAYMENTS_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT status FROM payment_order_closures WHERE order_id = %s",
+            (oid_exp_can,),
+        )
+        assert cur.fetchone()[0] == "expired"  # type: ignore[index]
+        cur.execute(
+            "SELECT COUNT(*) FROM payment_outbox_events WHERE order_id = %s AND event_type = 'payment.cancelled'",
+            (oid_exp_can,),
+        )
+        assert cur.fetchone()[0] == 0  # type: ignore[index]
+
 
 def verify_reconciliation_scripts(seller_token: str) -> None:
     print(

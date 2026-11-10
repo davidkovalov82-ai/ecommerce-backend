@@ -178,29 +178,35 @@ class PaymentRepository:
         self,
         *,
         event_id: str,
-        payment_attempt_id: int,
+        payment_attempt_id: int | None,
         order_id: int,
         event_type: str,
         payload: dict[str, Any],
         occurred_at: datetime.datetime,
     ) -> int | None:
-        """Записва outbox събитие за опита идемпотентно (макс. 1 събитие на тип и опит)."""
-        stmt = (
-            pg_insert(PaymentOutboxEvent)
-            .values(
-                event_id=event_id,
-                event_version=1,
-                payment_attempt_id=payment_attempt_id,
-                order_id=order_id,
-                event_type=event_type,
-                payload=payload,
-                status="pending",
-                occurred_at=occurred_at,
-            )
-            .on_conflict_do_nothing(index_elements=["payment_attempt_id", "event_type"])
-            .returning(PaymentOutboxEvent.id)
+        """Записва outbox събитие за опита или поръчковото закритие идемпотентно."""
+        stmt = pg_insert(PaymentOutboxEvent).values(
+            event_id=event_id,
+            event_version=1,
+            payment_attempt_id=payment_attempt_id,
+            order_id=order_id,
+            event_type=event_type,
+            payload=payload,
+            status="pending",
+            occurred_at=occurred_at,
         )
-        return self._session.execute(stmt).scalar_one_or_none()
+        if payment_attempt_id is not None:
+            stmt = stmt.on_conflict_do_nothing(
+                index_elements=["payment_attempt_id", "event_type"]
+            )
+        else:
+            stmt = stmt.on_conflict_do_nothing(
+                index_elements=["order_id", "event_type"],
+                index_where=text("payment_attempt_id IS NULL"),
+            )
+        return self._session.execute(
+            stmt.returning(PaymentOutboxEvent.id)
+        ).scalar_one_or_none()
 
     def list_pending_outbox_events(
         self, limit: int = 50

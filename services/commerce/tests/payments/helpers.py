@@ -93,10 +93,10 @@ def make_payment_event(
     *,
     event_type: str,
     order_id: int,
-    payment_attempt_id: int = 101,
+    payment_attempt_id: int | None = 101,
     attempt_key: str | None = None,
-    amount_minor: int = 2500,
-    currency: str = "EUR",
+    amount_minor: int | None = 2500,
+    currency: str | None = "EUR",
     stripe_session_id: str | None = "cs_test_1",
     stripe_event_id: str | None = None,
     event_id: str | None = None,
@@ -104,10 +104,44 @@ def make_payment_event(
 ) -> ValidatedPaymentEvent:
     """Конструира валидирано платежно събитие от Payments към Commerce."""
     resolved_event_id = event_id or str(uuid.uuid4())
-    resolved_attempt_key = attempt_key or f"order_{order_id}_attempt_1"
-    resolved_stripe_event_id = stripe_event_id or f"evt_{uuid.uuid4().hex[:12]}"
+    resolved_attempt_key = (
+        None
+        if payment_attempt_id is None and attempt_key is None
+        else (attempt_key or f"order_{order_id}_attempt_1")
+    )
+    resolved_stripe_event_id = (
+        stripe_event_id
+        if payment_attempt_id is None
+        else (stripe_event_id or f"evt_{uuid.uuid4().hex[:12]}")
+    )
     resolved_occurred_at = occurred_at or datetime.datetime.now(datetime.UTC)
-    payload: dict[str, Any] = {
+    if payment_attempt_id is None:
+        payload: dict[str, Any] = {
+            "order_id": order_id,
+            "payment_attempt_id": None,
+            "attempt_key": resolved_attempt_key,
+            "stripe_session_id": stripe_session_id,
+            "stripe_event_id": resolved_stripe_event_id,
+            "closure_reason": "cancel",
+        }
+        return ValidatedPaymentEvent(
+            event_id=resolved_event_id,
+            event_type=event_type,  # type: ignore[arg-type]
+            event_version=1,
+            occurred_at=resolved_occurred_at,
+            order_id=order_id,
+            payment_attempt_id=None,
+            attempt_key=resolved_attempt_key,
+            stripe_session_id=stripe_session_id,
+            stripe_event_id=resolved_stripe_event_id,
+            amount_minor=None,
+            currency=None,
+            mode=None,
+            payload=payload,
+        )
+
+    assert amount_minor is not None and currency is not None
+    payload = {
         "order_id": order_id,
         "payment_attempt_id": payment_attempt_id,
         "attempt_key": resolved_attempt_key,

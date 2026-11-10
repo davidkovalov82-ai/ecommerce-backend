@@ -368,8 +368,38 @@ def test_extract_payments_service_migration(
             )
             session.commit()
 
-        # 2. Upgrade до g1b2c3d4e5f6 (K5 head)
+        # 2. Upgrade до g1b2c3d4e5f6 -> h2c3d4e5f6a7 (K5 head)
         command.upgrade(alembic_cfg, "g1b2c3d4e5f6")
+        command.upgrade(alembic_cfg, "h2c3d4e5f6a7")
+
+        with Session(temp_engine) as session:
+            session.execute(
+                text(
+                    "INSERT INTO order_inbox_events "
+                    "(event_id, event_type, event_version, payment_attempt_id, order_id, outcome, payload, occurred_at) "
+                    "VALUES ('00000000-0000-4000-8000-000000000901', 'payment.cancelled', 1, NULL, 800, 'cancelled', '{}'::json, now())"
+                )
+            )
+            session.commit()
+
+        try:
+            command.downgrade(alembic_cfg, "g1b2c3d4e5f6")
+            assert False, (
+                "Очакваше се RuntimeError при inbox събитие без payment_attempt_id"
+            )
+        except RuntimeError as exc:
+            assert "payment_attempt_id" in str(exc)
+
+        with Session(temp_engine) as session:
+            session.execute(
+                text(
+                    "DELETE FROM order_inbox_events "
+                    "WHERE event_id = '00000000-0000-4000-8000-000000000901'"
+                )
+            )
+            session.commit()
+
+        command.downgrade(alembic_cfg, "g1b2c3d4e5f6")
 
         with Session(temp_engine) as session:
             rows = (

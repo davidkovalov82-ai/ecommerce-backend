@@ -61,4 +61,3 @@ def downgrade() -> None:
         "payment_outbox_events",
         "event_type IN ('payment.succeeded', 'payment.processing', 'payment.failed', 'payment.expired')",
     )
-

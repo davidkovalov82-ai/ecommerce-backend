@@ -60,6 +60,37 @@ def test_payments_0002_closures_discrepancies_upgrade_and_safe_downgrade() -> No
         command.upgrade(cfg, "0003")
         command.upgrade(cfg, "0004")
         command.upgrade(cfg, "0005")
+        command.upgrade(cfg, "0006")
+
+        with Session(temp_engine) as session:
+            session.execute(
+                text(
+                    "INSERT INTO payment_outbox_events "
+                    "(payment_attempt_id, order_id, event_type, payload) "
+                    "VALUES (NULL, 10, 'payment.cancelled', '{}'::json)"
+                )
+            )
+            session.commit()
+
+        # Не може да се свали 0006 -> 0005 при наличен outbox запис без payment_attempt_id
+        try:
+            command.downgrade(cfg, "0005")
+            raise AssertionError(
+                "Expected RuntimeError when outbox events without payment_attempt_id exist"
+            )
+        except RuntimeError as exc:
+            assert "payment_attempt_id" in str(exc)
+
+        with Session(temp_engine) as session:
+            session.execute(
+                text(
+                    "DELETE FROM payment_outbox_events "
+                    "WHERE order_id = 10 AND payment_attempt_id IS NULL"
+                )
+            )
+            session.commit()
+
+        command.downgrade(cfg, "0005")
 
         with Session(temp_engine) as session:
             session.execute(

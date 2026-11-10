@@ -611,7 +611,7 @@ class OrderInboxEvent(Base):
     event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     event_type: Mapped[str] = mapped_column(String(100), nullable=False)
     event_version: Mapped[int] = mapped_column(Integer, nullable=False)
-    payment_attempt_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    payment_attempt_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     order_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     outcome: Mapped[str] = mapped_column(String(50), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
