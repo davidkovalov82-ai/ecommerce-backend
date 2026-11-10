@@ -26,3 +26,9 @@ app = FastAPI(
 app.include_router(router)
 app.include_router(auth_router)
 app.include_router(internal_router)
+
+
+@app.get("/health", tags=["system"])
+def health() -> dict[str, str]:
+    """Проверка за готовност на услугата Users."""
+    return {"status": "ok"}

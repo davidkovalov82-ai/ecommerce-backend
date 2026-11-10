@@ -88,6 +88,8 @@ services:
     depends_on:
       db-init:
         condition: service_completed_successfully
+      users:
+        condition: service_healthy
     environment:
       DB_HOST: db
       DB_PORT: "5432"
@@ -95,6 +97,9 @@ services:
       DB_PASSWORD: ${COMMERCE_DB_PASSWORD:-commerce_app}
       DB_NAME: commerce
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set and non-empty}
+      USERS_BASE_URL: ${USERS_BASE_URL:-http://users:8002}
+      USERS_INTERNAL_AUTH_TOKEN: ${USERS_INTERNAL_AUTH_TOKEN:-ecommerce-users-internal-secret}
+      JWT_PUBLIC_KEY_PATH: ${JWT_PUBLIC_KEY_PATH:-jwt_public.pem}
       PAYMENTS_BASE_URL: ${PAYMENTS_BASE_URL:-http://payments:8001}
       PAYMENTS_INTERNAL_AUTH_TOKEN: ${PAYMENTS_INTERNAL_AUTH_TOKEN:?PAYMENTS_INTERNAL_AUTH_TOKEN must be set and non-empty}
       SMTP_HOST: ${SMTP_HOST:-mailpit}
@@ -104,6 +109,8 @@ services:
       RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
       RABBITMQ_USER: ${RABBITMQ_USER:-guest}
       RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+    volumes:
+      - ./services/users/jwt_public.pem:/app/jwt_public.pem:ro
     ports:
       - "8000:8000"
     command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
@@ -263,11 +270,20 @@ services:
       JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY:-}
       JWT_PRIVATE_KEY_PATH: ${JWT_PRIVATE_KEY_PATH:-jwt_private.pem}
       JWT_PUBLIC_KEY_PATH: ${JWT_PUBLIC_KEY_PATH:-jwt_public.pem}
+      INTERNAL_AUTH_TOKEN: ${USERS_INTERNAL_AUTH_TOKEN:-ecommerce-users-internal-secret}
       SMTP_HOST: ${SMTP_HOST:-mailpit}
       SMTP_PORT: ${SMTP_PORT:-1025}
       SMTP_FROM: ${SMTP_FROM:-noreply@example.com}
     ports:
       - "8002:8002"
+    volumes:
+      - ./services/users/jwt_private.pem:/app/jwt_private.pem:ro
+      - ./services/users/jwt_public.pem:/app/jwt_public.pem:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
     command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8002"
 
 volumes:

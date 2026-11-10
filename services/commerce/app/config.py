@@ -20,6 +20,7 @@ class Settings(BaseSettings):
 
     jwt_secret: str = "legacy_jwt_secret_at_least_32_bytes_long_fallback"
     jwt_public_key: str = ""
+    jwt_public_key_path: str = ""
     jwt_algorithm: str = "RS256"
     jwt_issuer: str = "ecommerce-users"
     jwt_audience: str = "ecommerce"
@@ -73,13 +74,15 @@ class Settings(BaseSettings):
         """Връща съдържанието на публичния RSA ключ за проверка на JWT токени от Users."""
         import os
 
-        key = self.jwt_public_key
+        key = self.jwt_public_key.strip()
+        if not key and self.jwt_public_key_path:
+            key = self.jwt_public_key_path.strip()
         if not key:
             return ""
         if os.path.exists(key):
             with open(key, encoding="utf-8") as f:
-                return f.read()
-        return key
+                return f.read().replace("\\n", "\n").strip()
+        return key.replace("\\n", "\n").strip()
 
     @field_validator("payments_internal_auth_token", mode="before")
     @classmethod

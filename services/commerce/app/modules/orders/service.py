@@ -1,4 +1,5 @@
 import datetime
+import logging
 import uuid
 from collections.abc import Sequence
 
@@ -7,7 +8,11 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.modules.accounts.repository import UserRepository
-from app.modules.accounts.users_client import UsersClient
+from app.modules.accounts.users_client import (
+    UsersClient,
+    UsersServiceAuthError,
+    UsersServiceUnavailableError,
+)
 from app.modules.cart.repository import CartRepository
 from app.modules.catalog.repository import ProductRepository
 from app.modules.orders.models import (
@@ -26,6 +31,8 @@ from app.modules.orders.payments_client import (
 )
 from app.modules.orders.repository import OrderRepository
 from app.modules.orders.schemas import ShippingAddress
+
+logger = logging.getLogger(__name__)
 
 
 class CartEmpty(Exception):
@@ -197,8 +204,10 @@ class OrderService:
                             remote_u = self._users_client.get_user_status(sid)
                             if remote_u:
                                 sellers_by_id[sid] = remote_u
-                        except Exception:
-                            pass
+                        except (UsersServiceUnavailableError, UsersServiceAuthError):
+                            logger.warning(
+                                "Failed to fetch seller status for seller_id=%d", sid
+                            )
 
             order_items_data: list[tuple[int, str, int, int, int, int]] = []
             total_minor = 0
@@ -420,8 +429,10 @@ class OrderService:
                     remote_u = self._users_client.get_user_status(order.user_id)
                     if remote_u:
                         customer_email = remote_u.email
-                except Exception:
-                    pass
+                except (UsersServiceUnavailableError, UsersServiceAuthError):
+                    logger.warning(
+                        "Failed to fetch customer email for order_id=%d", order.id
+                    )
             customer_email = customer_email or ""
             customer_phone = (order.shipping_phone or "").strip() or None
 
@@ -509,8 +520,10 @@ class OrderService:
                 remote_u = self._users_client.get_user_status(order.user_id)
                 if remote_u:
                     customer_email = remote_u.email
-            except Exception:
-                pass
+            except (UsersServiceUnavailableError, UsersServiceAuthError):
+                logger.warning(
+                    "Failed to fetch customer email for order_id=%d", order.id
+                )
         customer_email = customer_email or ""
         customer_phone = (order.shipping_phone or "").strip() or None
         now = datetime.datetime.now(datetime.UTC)

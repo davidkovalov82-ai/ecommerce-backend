@@ -361,11 +361,20 @@ def test_change_password_legacy_token_compatibility_without_version(
     user, _ = _create_user(db_session, email)
     # Старите HS256 токени отпреди превключването към Users се отхвърлят веднага
     old_hs_token = jwt.encode(
-        {"sub": str(user.id), "iat": int(datetime.now(UTC).timestamp()), "exp": int(datetime.now(UTC).timestamp()) + 900},
+        {
+            "sub": str(user.id),
+            "iat": int(datetime.now(UTC).timestamp()),
+            "exp": int(datetime.now(UTC).timestamp()) + 900,
+        },
         settings.jwt_secret,
         algorithm="HS256",
     )
-    assert client.get("/users/me", headers={"Authorization": f"Bearer {old_hs_token}"}).status_code == 401
+    assert (
+        client.get(
+            "/users/me", headers={"Authorization": f"Bearer {old_hs_token}"}
+        ).status_code
+        == 401
+    )
 
     # Създаваме валиден RS256 токен без token_version claim (третира се като версия 0)
     now = int(datetime.now(UTC).timestamp())

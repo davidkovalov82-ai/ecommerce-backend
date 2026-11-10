@@ -1,12 +1,20 @@
+import logging
+
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.modules.accounts.repository import UserRepository
-from app.modules.accounts.users_client import UsersClient
+from app.modules.accounts.users_client import (
+    UsersClient,
+    UsersServiceAuthError,
+    UsersServiceUnavailableError,
+)
 from app.modules.cart.repository import CartRepository
 from app.modules.cart.schemas import CartItemResponse, CartResponse
 from app.modules.catalog.repository import ProductRepository
 from app.modules.catalog.service import ProductNotFound
+
+logger = logging.getLogger(__name__)
 
 
 class InsufficientStock(Exception):
@@ -57,8 +65,10 @@ class CartService:
                         remote_seller = self._users_client.get_user_status(sid)
                         if remote_seller:
                             sellers_by_id[sid] = remote_seller
-                    except Exception:
-                        pass
+                    except (UsersServiceUnavailableError, UsersServiceAuthError):
+                        logger.warning(
+                            "Failed to fetch seller status for seller_id=%d", sid
+                        )
 
         item_responses: list[CartItemResponse] = []
         total_minor = 0

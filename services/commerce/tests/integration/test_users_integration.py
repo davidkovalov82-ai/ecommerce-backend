@@ -8,10 +8,10 @@
 5. При спиране на Users защитените заявки в Commerce получават 503, а публичният преглед на каталога продължава да работи с 200.
 """
 
+import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
-import uuid
 
 import httpx
 import pytest
@@ -25,7 +25,11 @@ from app.main import app
 from app.modules.accounts.dependencies import get_users_client
 from app.modules.accounts.models import User
 from app.modules.accounts.service import _DUMMY_HASH
-from app.modules.accounts.tokens import create_access_token, decode_access_token
+from app.modules.accounts.tokens import (
+    InvalidToken,
+    create_access_token,
+    decode_access_token,
+)
 from app.modules.accounts.users_client import (
     RemoteUserInfo,
     UsersClient,
@@ -34,7 +38,7 @@ from app.modules.accounts.users_client import (
 from app.modules.cart.models import CartItem
 from app.modules.catalog.models import Product
 from app.modules.orders.models import Order, OrderItem
-from tests.orders.helpers import DEFAULT_SHIPPING_ADDRESS, ORDER_PAYLOAD
+from tests.orders.helpers import ORDER_PAYLOAD
 
 client = TestClient(app)
 _hasher = PasswordHash.recommended()
@@ -120,7 +124,7 @@ class StandaloneUsersClient(UsersClient):
                     issuer=settings.jwt_issuer,
                     audience=settings.jwt_audience,
                 )
-            except Exception:
+            except InvalidToken:
                 return (
                     401,
                     {
@@ -292,7 +296,9 @@ class StandaloneUsersClient(UsersClient):
                 headers={"content-type": "application/json"},
             )
 
-        elif path.startswith("/users/") and path.endswith("/block") and method == "POST":
+        elif (
+            path.startswith("/users/") and path.endswith("/block") and method == "POST"
+        ):
             c, u_or_err, hdrs = _get_auth()
             if c != 200:
                 return httpx.Response(c, json=u_or_err, headers=hdrs)
@@ -328,7 +334,9 @@ class StandaloneUsersClient(UsersClient):
                 )
             return httpx.Response(
                 404,
-                json={"detail": {"code": "USER_NOT_FOUND", "message": "User not found"}},
+                json={
+                    "detail": {"code": "USER_NOT_FOUND", "message": "User not found"}
+                },
             )
 
         return httpx.Response(404)
@@ -410,7 +418,9 @@ def test_migrated_buyer_logs_in_and_sees_existing_cart_and_orders(
     db_session.commit()
 
     # Купувачът влиза успешно през публичния вход с предишната си парола
-    login_res = client.post("/auth/login", json={"email": email, "password": raw_password})
+    login_res = client.post(
+        "/auth/login", json={"email": email, "password": raw_password}
+    )
     assert login_res.status_code == 200, login_res.text
     token = login_res.json()["access_token"]
     auth_header = {"Authorization": f"Bearer {token}"}
@@ -449,7 +459,9 @@ def test_new_buyer_registers_via_public_url_and_places_order_without_commerce_us
         text("SELECT id FROM users WHERE email = :email"),
         {"email": email},
     ).scalar_one_or_none()
-    assert user_in_commerce is None, "В Commerce users не трябва да се създава shadow ред!"
+    assert user_in_commerce is None, (
+        "В Commerce users не трябва да се създава shadow ред!"
+    )
 
     # 3. Вход през публичния вход
     login_res = client.post("/auth/login", json={"email": email, "password": password})
@@ -513,7 +525,7 @@ def test_seller_owns_product_and_can_update_while_non_owner_is_denied(
         "/users", json={"email": seller_email, "password": seller_pass}
     )
     assert reg_seller.status_code == 201
-    seller_id = reg_seller.json()["id"]
+    assert reg_seller.json()["id"] > 0
 
     login_seller = client.post(
         "/auth/login", json={"email": seller_email, "password": seller_pass}
@@ -584,7 +596,9 @@ def test_blocked_user_token_immediately_invalidated(
         status="active",
     )
     setup_standalone_users.email_map["admin_blocker@example.com"] = admin_id
-    admin_token = create_access_token(user_id=admin_id, role="admin", email="admin_blocker@example.com")
+    admin_token = create_access_token(
+        user_id=admin_id, role="admin", email="admin_blocker@example.com"
+    )
     admin_header = {"Authorization": f"Bearer {admin_token}"}
 
     user_email = "target_suspend_user@example.com"
@@ -627,6 +641,7 @@ def test_users_service_downtime_protected_fails_with_503_while_catalog_read_retu
     db_session: Session,
 ) -> None:
     """5. При спиране на Users защитените заявки получават 503, а публичният каталог връща 200."""
+
     class UnavailableUsersClient(UsersClient):
         def get_user_status(self, user_id: int):
             raise UsersServiceUnavailableError("Users service down")
@@ -638,7 +653,9 @@ def test_users_service_downtime_protected_fails_with_503_while_catalog_read_retu
     app.dependency_overrides[get_users_client] = lambda: UnavailableUsersClient()
 
     try:
-        valid_token = create_access_token(user_id=10, role="customer", email="buyer@example.com")
+        valid_token = create_access_token(
+            user_id=10, role="customer", email="buyer@example.com"
+        )
         auth_header = {"Authorization": f"Bearer {valid_token}"}
 
         # Създаваме продукт за публичен преглед

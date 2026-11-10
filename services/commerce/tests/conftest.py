@@ -302,7 +302,6 @@ class LocalTestUsersClient(UsersClient):
         import json
 
         import httpx
-        from pwdlib import PasswordHash
 
         from app.modules.accounts.dependencies import _password_hasher
         from app.modules.accounts.repository import UserRepository
@@ -321,13 +320,15 @@ class LocalTestUsersClient(UsersClient):
             TechnicalAccountProtected,
             UserNotFound,
         )
-        from app.modules.accounts.tokens import create_access_token, decode_access_token
+        from app.modules.accounts.tokens import (
+            InvalidToken,
+            create_access_token,
+            decode_access_token,
+        )
 
         with self._get_session() as session:
             repo = UserRepository(session)
-            service = AccountService(
-                repo, session, password_hasher=_password_hasher
-            )
+            service = AccountService(repo, session, password_hasher=_password_hasher)
             data = json.loads(content) if content else {}
 
             def _get_auth_user() -> tuple[int, Any, dict[str, str]]:
@@ -352,7 +353,7 @@ class LocalTestUsersClient(UsersClient):
                         issuer=settings.jwt_issuer,
                         audience=settings.jwt_audience,
                     )
-                except Exception:
+                except InvalidToken:
                     return (
                         401,
                         {
@@ -633,16 +634,12 @@ class LocalTestUsersClient(UsersClient):
             except AccountBlocked as exc:
                 return httpx.Response(
                     403,
-                    json={
-                        "detail": {"code": "ACCOUNT_BLOCKED", "message": str(exc)}
-                    },
+                    json={"detail": {"code": "ACCOUNT_BLOCKED", "message": str(exc)}},
                 )
             except AccountClosed as exc:
                 return httpx.Response(
                     403,
-                    json={
-                        "detail": {"code": "ACCOUNT_CLOSED", "message": str(exc)}
-                    },
+                    json={"detail": {"code": "ACCOUNT_CLOSED", "message": str(exc)}},
                 )
             except UserNotFound as exc:
                 return httpx.Response(

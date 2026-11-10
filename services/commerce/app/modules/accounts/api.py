@@ -70,7 +70,12 @@ def _forward(
         )
 
     content_type = resp.headers.get("content-type", "application/json")
-    hop_by_hop = {"content-length", "content-encoding", "transfer-encoding", "connection"}
+    hop_by_hop = {
+        "content-length",
+        "content-encoding",
+        "transfer-encoding",
+        "connection",
+    }
     response_headers = {
         k: v for k, v in resp.headers.items() if k.lower() not in hop_by_hop
     }
@@ -93,7 +98,11 @@ async def login(
 ) -> Response:
     """Вход на потребител (проксира се към Users)."""
     return _forward(
-        request, "/auth/login", "POST", users_client, body.model_dump_json().encode("utf-8")
+        request,
+        "/auth/login",
+        "POST",
+        users_client,
+        body.model_dump_json().encode("utf-8"),
     )
 
 
@@ -168,7 +177,11 @@ async def update_me(
 ) -> Response:
     """Редакция на профил на текущия потребител (проксира се към Users)."""
     return _forward(
-        request, "/users/me", "PATCH", users_client, body.model_dump_json().encode("utf-8")
+        request,
+        "/users/me",
+        "PATCH",
+        users_client,
+        body.model_dump_json().encode("utf-8"),
     )
 
 

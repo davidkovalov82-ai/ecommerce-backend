@@ -36,6 +36,9 @@ services:
       PAYMENTS_APP_USER: payments_app
       PAYMENTS_APP_PASSWORD: payments_app
       PAYMENTS_DB_NAME: payments
+      USERS_APP_USER: users_app
+      USERS_APP_PASSWORD: users_app
+      USERS_DB_NAME: users
     restart: "no"
     volumes:
       - ./scripts/postgres_db_init.sh:/usr/local/bin/postgres_db_init.sh:ro
@@ -156,6 +159,47 @@ services:
       RABBITMQ_PASSWORD: guest
     command: sh -c "python scripts/process_outbox.py --daemon --poll-interval 0.2"
 
+  users-e2e:
+    build:
+      context: ./services/users
+      dockerfile: Dockerfile
+    container_name: users-api-e2e
+    restart: unless-stopped
+    depends_on:
+      db-init-e2e:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: db-e2e
+      DB_PORT: "5432"
+      DB_USER: users_app
+      DB_PASSWORD: users_app
+      DB_NAME: users
+      JWT_ALGORITHM: RS256
+      JWT_ACCESS_TOKEN_EXPIRE_MINUTES: "15"
+      JWT_ISSUER: ecommerce-users
+      JWT_AUDIENCE: ecommerce
+      JWT_PRIVATE_KEY_PATH: jwt_private.pem
+      JWT_PUBLIC_KEY_PATH: jwt_public.pem
+      INTERNAL_AUTH_TOKEN: ecommerce-users-internal-secret
+      SMTP_HOST: mailpit-e2e
+      SMTP_PORT: "1025"
+      SMTP_FROM: noreply@example.com
+    ports:
+      - "127.0.0.1:58002:8002"
+    volumes:
+      - ./services/users/jwt_private.pem:/app/jwt_private.pem:ro
+      - ./services/users/jwt_public.pem:/app/jwt_public.pem:ro
+    networks:
+      default:
+        aliases:
+          - users
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8002"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
   commerce-api-e2e:
     build:
       context: ./services/commerce
@@ -163,6 +207,8 @@ services:
     depends_on:
       db-init-e2e:
         condition: service_completed_successfully
+      users-e2e:
+        condition: service_healthy
     environment:
       DB_HOST: db-e2e
       DB_PORT: "5432"
@@ -170,6 +216,9 @@ services:
       DB_PASSWORD: commerce_app
       DB_NAME: commerce
       JWT_SECRET: k4-e2e-test-jwt-secret-key-at-least-32-bytes-long!
+      USERS_BASE_URL: http://users:8002
+      USERS_INTERNAL_AUTH_TOKEN: ecommerce-users-internal-secret
+      JWT_PUBLIC_KEY_PATH: jwt_public.pem
       PAYMENTS_BASE_URL: http://payments-e2e:8001
       PAYMENTS_INTERNAL_AUTH_TOKEN: k5-e2e-internal-payments-token-32b!
       SMTP_HOST: mailpit-e2e
@@ -179,6 +228,8 @@ services:
       RABBITMQ_PORT: "5672"
       RABBITMQ_USER: guest
       RABBITMQ_PASSWORD: guest
+    volumes:
+      - ./services/users/jwt_public.pem:/app/jwt_public.pem:ro
     ports:
       - "127.0.0.1:58000:8000"
     command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
@@ -227,12 +278,17 @@ services:
       DB_PASSWORD: commerce_app
       DB_NAME: commerce
       JWT_SECRET: k4-e2e-test-jwt-secret-key-at-least-32-bytes-long!
+      USERS_BASE_URL: http://users:8002
+      USERS_INTERNAL_AUTH_TOKEN: ecommerce-users-internal-secret
+      JWT_PUBLIC_KEY_PATH: jwt_public.pem
       PAYMENTS_BASE_URL: http://payments-e2e:8001
       PAYMENTS_INTERNAL_AUTH_TOKEN: k5-e2e-internal-payments-token-32b!
       RABBITMQ_HOST: rabbitmq-e2e
       RABBITMQ_PORT: "5672"
       RABBITMQ_USER: guest
       RABBITMQ_PASSWORD: guest
+    volumes:
+      - ./services/users/jwt_public.pem:/app/jwt_public.pem:ro
     command: sh -c "python scripts/consume_payment_events.py --daemon"
 
   notifications-e2e:

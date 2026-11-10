@@ -1,8 +1,9 @@
 from collections.abc import Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
+from app.modules.accounts.models import User
 from app.modules.catalog.models import Category, Product
 
 
@@ -54,9 +55,11 @@ class ProductRepository:
         """Извлича активен продукт по неговото ID."""
         stmt = (
             select(Product)
+            .outerjoin(User, Product.seller_id == User.id)
             .where(
                 Product.id == product_id,
                 Product.active.is_(True),
+                or_(User.id.is_(None), User.status == "active"),
             )
         )
         return self._session.scalars(stmt).one_or_none()
@@ -86,7 +89,14 @@ class ProductRepository:
         self, limit: int, offset: int, category_id: int | None = None
     ) -> Sequence[Product]:
         """Извлича списък с активни продукти, подредени по ID възходящо с пагинация."""
-        stmt = select(Product).where(Product.active.is_(True))
+        stmt = (
+            select(Product)
+            .outerjoin(User, Product.seller_id == User.id)
+            .where(
+                Product.active.is_(True),
+                or_(User.id.is_(None), User.status == "active"),
+            )
+        )
         if category_id is not None:
             stmt = stmt.where(Product.category_id == category_id)
         stmt = stmt.order_by(Product.id.asc()).limit(limit).offset(offset)
