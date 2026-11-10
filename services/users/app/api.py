@@ -1,6 +1,6 @@
 """HTTP обработчици (FastAPI Routers) за Users: регистрация, вход, профил, пароли и модерация."""
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -10,10 +10,12 @@ from app.dependencies import (
     CurrentUserDep,
     DbSession,
     UserServiceDep,
+    require_internal_auth,
 )
 from app.schemas import (
     ChangePasswordRequest,
     HealthResponse,
+    InternalUserResponse,
     ModerationActionResponse,
     ModerationRequest,
     PasswordResetConfirmRequest,
@@ -43,6 +45,7 @@ from app.tokens import create_access_token
 
 router = APIRouter(tags=["users"])
 auth_router = APIRouter(prefix="/auth", tags=["auth"])
+internal_router = APIRouter(prefix="/internal/users", tags=["internal-users"])
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -422,3 +425,25 @@ def get_public_key() -> dict[str, str]:
         "issuer": settings.jwt_issuer,
         "audience": settings.jwt_audience,
     }
+
+
+@internal_router.get(
+    "/{user_id}",
+    response_model=InternalUserResponse,
+    dependencies=[Depends(require_internal_auth)],
+)
+def get_internal_user(
+    user_id: int,
+    user_service: UserServiceDep,
+) -> InternalUserResponse:
+    """Вътрешен маршрут за валидация на потребител от други микросервизи (напр. Commerce)."""
+    user = user_service.get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "USER_NOT_FOUND",
+                "message": f"User with id {user_id} not found",
+            },
+        )
+    return InternalUserResponse.model_validate(user)

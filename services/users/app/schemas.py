@@ -152,6 +152,19 @@ class ModerationActionResponse(BaseModel):
     message: str
 
 
+class InternalUserResponse(BaseModel):
+    """Схема за вътрешна валидация на потребител между микросервизи."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    email: str
+    role: str
+    status: str
+    token_version: int
+    display_name: str | None = None
+
+
 class HealthResponse(BaseModel):
     """Схема за отговор от health endpoint."""
 

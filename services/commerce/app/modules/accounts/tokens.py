@@ -1,3 +1,11 @@
+"""Генериране и верификация на JWT токени за Commerce.
+
+След отделянето на микросервиса Users, Commerce приема само асиметрично
+подписани RS256 токени, издадени от Users с issuer 'ecommerce-users'
+и audience 'ecommerce'.
+"""
+
+import os
 from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
 
@@ -12,44 +20,76 @@ class TokenData(NamedTuple):
     """Декодирани данни от JWT токен."""
 
     user_id: int
+    role: str
+    email: str
     token_version: int
 
 
 def create_access_token(
     user_id: int,
-    secret: str,
-    algorithm: str = "HS256",
+    secret: str | None = None,
+    private_key: str | None = None,
+    algorithm: str = "RS256",
     expire_minutes: int = 15,
     token_version: int = 0,
+    role: str = "customer",
+    email: str = "",
+    issuer: str = "ecommerce-users",
+    audience: str = "ecommerce",
 ) -> str:
-    """Генерира подписан JWT токен с фиксиран срок на валидност, версия на токена и задължителни claims."""
+    """Генерира подписан JWT access-токен (за тестове и интеграция)."""
     now = datetime.now(UTC)
     payload = {
         "sub": str(user_id),
+        "role": role,
+        "email": email,
         "token_version": token_version,
+        "iss": issuer,
+        "aud": audience,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=expire_minutes)).timestamp()),
     }
-    return jwt.encode(payload, secret, algorithm=algorithm)
+    key = private_key
+    if not key and secret and "BEGIN" in str(secret):
+        key = secret
+    if not key:
+        key = os.environ.get("JWT_PRIVATE_KEY", "")
+    if not key:
+        raise ValueError("RSA private key is required to sign RS256 token")
+
+    return jwt.encode(payload, key, algorithm="RS256")
 
 
 def decode_access_token(
     token: str,
-    secret: str,
-    algorithm: str = "HS256",
+    public_key: str,
+    algorithm: str = "RS256",
+    issuer: str = "ecommerce-users",
+    audience: str = "ecommerce",
 ) -> TokenData:
-    """Декодира и верифицира JWT токен, като изисква валиден sub, iat и exp, и връща TokenData."""
+    """Декодира и верифицира RS256 JWT токен от Users по публичен RSA ключ.
+
+    Стари HS256 токени или токени с невалидна подпись, срок, issuer или audience
+    се отхвърлят с InvalidToken.
+    """
+    if not public_key:
+        raise InvalidToken("JWT public key is not configured")
+
     try:
-        # Изрично разрешаваме само посочения алгоритъм (HS256), без избор от заглавката
+        # Изрично разрешаваме само посочения алгоритъм (RS256), без избор от заглавката
         payload = jwt.decode(
             token,
-            secret,
+            public_key,
             algorithms=[algorithm],
+            audience=audience,
+            issuer=issuer,
             options={
-                "require": ["sub", "iat", "exp"],
+                "require": ["sub", "iat", "exp", "iss", "aud"],
                 "verify_signature": True,
                 "verify_exp": True,
                 "verify_iat": True,
+                "verify_iss": True,
+                "verify_aud": True,
             },
         )
     except jwt.PyJWTError as exc:
@@ -68,6 +108,14 @@ def decode_access_token(
             "Token claim 'sub' must represent a positive integer"
         ) from exc
 
+    role = payload.get("role")
+    if not isinstance(role, str) or not role:
+        role = "customer"
+
+    email = payload.get("email")
+    if not isinstance(email, str) or not email:
+        email = ""
+
     raw_token_version = payload.get("token_version")
     if raw_token_version is None:
         token_version = 0
@@ -76,4 +124,9 @@ def decode_access_token(
     else:
         raise InvalidToken("Token claim 'token_version' must be a non-negative integer")
 
-    return TokenData(user_id=user_id, token_version=token_version)
+    return TokenData(
+        user_id=user_id,
+        role=role,
+        email=email,
+        token_version=token_version,
+    )

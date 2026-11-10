@@ -53,8 +53,11 @@ class Order(Base):
     )
     user_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("users.id", ondelete="RESTRICT"),
         nullable=False,
+    )
+    customer_email: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
     )
     status: Mapped[str] = mapped_column(
         String(50),
@@ -225,7 +228,6 @@ class OrderItem(Base):
     )
     seller_id: Mapped[int | None] = mapped_column(
         Integer,
-        ForeignKey("users.id", ondelete="RESTRICT"),
         nullable=True,
         index=True,
     )
@@ -267,7 +269,6 @@ class Shipment(Base):
     )
     seller_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("users.id", ondelete="RESTRICT"),
         nullable=False,
     )
     status: Mapped[str] = mapped_column(

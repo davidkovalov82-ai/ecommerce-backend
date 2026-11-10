@@ -1,9 +1,10 @@
 """FastAPI зависимости за сесии, хранилища, автентикация и права в Users."""
 
+import hmac
 from collections.abc import Generator
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -142,3 +143,26 @@ def require_admin(
 
 
 AdminUserDep = Annotated[User, Depends(require_admin)]
+
+
+def require_internal_auth(
+    x_internal_token: Annotated[str | None, Header(alias="X-Internal-Token")] = None,
+) -> None:
+    """Изисква валиден вътрешен таен токен за междусервизни заявки (/internal/*)."""
+    expected = settings.internal_auth_token
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "code": "INTERNAL_AUTH_NOT_CONFIGURED",
+                "message": "Internal service authentication is not configured",
+            },
+        )
+    if not x_internal_token or not hmac.compare_digest(x_internal_token, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "UNAUTHORIZED_INTERNAL_REQUEST",
+                "message": "Unauthorized internal request",
+            },
+        )

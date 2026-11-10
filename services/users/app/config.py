@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     # Порт на услугата
     app_port: int = 8002
 
+    # Споделен таен токен за междусервизен вътрешен достъп (/internal/users/*)
+    internal_auth_token: str = "ecommerce-users-internal-secret"
+
     # JWT настройки
     jwt_algorithm: str = "RS256"
     jwt_access_token_expire_minutes: int = 15

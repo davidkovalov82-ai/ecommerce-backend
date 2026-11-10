@@ -2,10 +2,12 @@ import datetime
 import uuid
 from collections.abc import Sequence
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.modules.accounts.repository import UserRepository
+from app.modules.accounts.users_client import UsersClient
 from app.modules.cart.repository import CartRepository
 from app.modules.catalog.repository import ProductRepository
 from app.modules.orders.models import (
@@ -96,9 +98,10 @@ class OrderService:
         order_repository: OrderRepository,
         cart_repository: CartRepository,
         product_repository: ProductRepository,
-        user_repository: UserRepository,
-        session: Session,
+        user_repository: UserRepository | None = None,
+        session: Session | None = None,
         payments_client: PaymentsClient | None = None,
+        users_client: UsersClient | None = None,
     ) -> None:
         self._order_repository = order_repository
         self._cart_repository = cart_repository
@@ -106,12 +109,14 @@ class OrderService:
         self._user_repository = user_repository
         self._session = session
         self._payments_client = payments_client or HttpPaymentsClient()
+        self._users_client = users_client or UsersClient()
 
     def create_order(
         self,
         user_id: int,
         idempotency_key: str,
         shipping_address: ShippingAddress,
+        customer_email: str | None = None,
     ) -> Order:
         """Сценарий: оформяне на цялата текуща количка в нова поръчка с адрес и пратки.
 
@@ -132,7 +137,12 @@ class OrderService:
         """
         try:
             # 1. Обща DB блокировка за текущия потребител
-            self._user_repository.lock_by_id(user_id)
+            self._session.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                {"lock_key": user_id},
+            )
+            if self._user_repository is not None:
+                self._user_repository.lock_by_id(user_id)
 
             # 2. Проверка за съществуваща поръчка със същия ключ (идемпотентност)
             existing_order = self._order_repository.get_by_user_and_idempotency_key(
@@ -174,8 +184,19 @@ class OrderService:
 
             # 5. Проверка на активност, наличност и статус на продавачите
             seller_ids = [p.seller_id for p in locked_products]
-            sellers = self._user_repository.get_by_ids(seller_ids)
-            sellers_by_id = {u.id: u for u in sellers}
+            sellers_by_id: dict[int, object] = {}
+            if self._user_repository is not None:
+                sellers = self._user_repository.get_by_ids(seller_ids)
+                sellers_by_id = {u.id: u for u in sellers}
+            if self._users_client is not None:
+                for sid in seller_ids:
+                    if sid not in sellers_by_id:
+                        try:
+                            remote_u = self._users_client.get_user_status(sid)
+                            if remote_u:
+                                sellers_by_id[sid] = remote_u
+                        except Exception:
+                            pass
 
             order_items_data: list[tuple[int, str, int, int, int, int]] = []
             total_minor = 0
@@ -186,7 +207,7 @@ class OrderService:
                     raise CartProductUnavailable(item.product_id)
 
                 seller = sellers_by_id.get(product.seller_id)
-                if seller is None or seller.status != "active":
+                if seller is not None and getattr(seller, "status", None) != "active":
                     raise CartProductUnavailable(item.product_id)
 
                 if product.stock < item.quantity:
@@ -213,6 +234,7 @@ class OrderService:
             )
             order = Order(
                 user_id=user_id,
+                customer_email=customer_email,
                 status="pending_payment",
                 fulfillment_status="unshipped",
                 currency="EUR",
@@ -387,8 +409,18 @@ class OrderService:
                 order.fulfillment_status = "partially_shipped"
 
             # Намиране на контактите на купувача за известието (избягваме логиране на PII)
-            customer = self._user_repository.get_by_id(order.user_id)
-            customer_email = customer.email if customer else ""
+            customer_email = order.customer_email
+            if not customer_email and self._user_repository is not None:
+                customer = self._user_repository.get_by_id(order.user_id)
+                customer_email = customer.email if customer else ""
+            if not customer_email and self._users_client is not None:
+                try:
+                    remote_u = self._users_client.get_user_status(order.user_id)
+                    if remote_u:
+                        customer_email = remote_u.email
+                except Exception:
+                    pass
+            customer_email = customer_email or ""
             customer_phone = (order.shipping_phone or "").strip() or None
 
             # Позиции само за този продавач
@@ -466,8 +498,18 @@ class OrderService:
         if existing is not None:
             return
 
-        user = self._user_repository.get_by_id(order.user_id)
-        customer_email = user.email if user else ""
+        customer_email = order.customer_email
+        if not customer_email and self._user_repository is not None:
+            user = self._user_repository.get_by_id(order.user_id)
+            customer_email = user.email if user else ""
+        if not customer_email and self._users_client is not None:
+            try:
+                remote_u = self._users_client.get_user_status(order.user_id)
+                if remote_u:
+                    customer_email = remote_u.email
+            except Exception:
+                pass
+        customer_email = customer_email or ""
         customer_phone = (order.shipping_phone or "").strip() or None
         now = datetime.datetime.now(datetime.UTC)
 

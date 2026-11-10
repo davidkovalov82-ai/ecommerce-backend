@@ -17,7 +17,6 @@ class CartItem(Base):
 
     user_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("users.id", ondelete="CASCADE"),
         primary_key=True,
     )
     product_id: Mapped[int] = mapped_column(

@@ -43,7 +43,6 @@ class Product(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     seller_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("users.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
         default=1,

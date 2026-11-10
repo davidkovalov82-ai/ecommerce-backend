@@ -1,6 +1,8 @@
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.modules.accounts.repository import UserRepository
+from app.modules.accounts.users_client import UsersClient
 from app.modules.cart.repository import CartRepository
 from app.modules.cart.schemas import CartItemResponse, CartResponse
 from app.modules.catalog.repository import ProductRepository
@@ -18,12 +20,14 @@ class CartService:
         self,
         cart_repository: CartRepository,
         product_repository: ProductRepository,
-        user_repository: UserRepository,
         session: Session,
+        user_repository: UserRepository | None = None,
+        users_client: UsersClient | None = None,
     ) -> None:
         self._cart_repository = cart_repository
         self._product_repository = product_repository
         self._user_repository = user_repository
+        self._users_client = users_client or UsersClient()
         self._session = session
 
     def get_cart(self, user_id: int) -> CartResponse:
@@ -41,8 +45,20 @@ class CartService:
         products_by_id = {product.id: product for product in products}
 
         seller_ids = [p.seller_id for p in products]
-        sellers = self._user_repository.get_by_ids(seller_ids)
-        sellers_by_id = {u.id: u for u in sellers}
+        sellers_by_id: dict[int, object] = {}
+        if self._user_repository is not None:
+            sellers = self._user_repository.get_by_ids(seller_ids)
+            sellers_by_id = {u.id: u for u in sellers}
+
+        if self._users_client is not None:
+            for sid in seller_ids:
+                if sid not in sellers_by_id:
+                    try:
+                        remote_seller = self._users_client.get_user_status(sid)
+                        if remote_seller:
+                            sellers_by_id[sid] = remote_seller
+                    except Exception:
+                        pass
 
         item_responses: list[CartItemResponse] = []
         total_minor = 0
@@ -53,7 +69,10 @@ class CartService:
                 continue
 
             seller = sellers_by_id.get(product.seller_id)
-            is_seller_active = bool(seller is not None and seller.status == "active")
+            if seller is not None:
+                is_seller_active = getattr(seller, "status", None) == "active"
+            else:
+                is_seller_active = True
 
             subtotal_minor = product.price_minor * item.quantity
             total_minor += subtotal_minor
@@ -93,7 +112,12 @@ class CartService:
         Управлява транзакционната граница (commit/rollback).
         """
         try:
-            self._user_repository.lock_by_id(user_id)
+            self._session.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                {"lock_key": user_id},
+            )
+            if self._user_repository is not None:
+                self._user_repository.lock_by_id(user_id)
 
             product = self._product_repository.get_active_by_id(product_id)
             if product is None:
@@ -121,7 +145,12 @@ class CartService:
         Идемпотентна операция. Управлява транзакционната граница (commit/rollback).
         """
         try:
-            self._user_repository.lock_by_id(user_id)
+            self._session.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                {"lock_key": user_id},
+            )
+            if self._user_repository is not None:
+                self._user_repository.lock_by_id(user_id)
 
             self._cart_repository.delete_item(user_id=user_id, product_id=product_id)
             self._session.commit()

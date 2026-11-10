@@ -56,6 +56,7 @@ def create_order(
             user_id=current_user.id,
             idempotency_key=str(idempotency_key),
             shipping_address=payload.shipping_address,
+            customer_email=current_user.email,
         )
         return OrderDetailResponse.model_validate(order)
     except IdempotencyPayloadConflict as e:

@@ -18,9 +18,17 @@ class Settings(BaseSettings):
     db_admin_password: str | None = None
     db_admin_name: str | None = None
 
-    jwt_secret: str
-    jwt_algorithm: str = "HS256"
+    jwt_secret: str = "legacy_jwt_secret_at_least_32_bytes_long_fallback"
+    jwt_public_key: str = ""
+    jwt_algorithm: str = "RS256"
+    jwt_issuer: str = "ecommerce-users"
+    jwt_audience: str = "ecommerce"
     jwt_access_token_expire_minutes: int = 15
+
+    # Независим Users сервис (аккаунтите се управляват от services/users)
+    users_base_url: str = "http://localhost:8002"
+    users_internal_auth_token: str = "ecommerce-users-internal-secret"
+    users_timeout_seconds: float = 2.0
 
     # Независим Payments сервис (Stripe ключовете живеят само в services/payments)
     payments_base_url: str = "http://localhost:8001"
@@ -57,9 +65,21 @@ class Settings(BaseSettings):
     @field_validator("jwt_secret")
     @classmethod
     def validate_jwt_secret(cls, v: str) -> str:
-        if not v or len(v.encode("utf-8")) < 32:
+        if v and len(v.encode("utf-8")) < 32:
             raise ValueError("JWT_SECRET must be at least 32 bytes long")
         return v
+
+    def get_public_key(self) -> str:
+        """Връща съдържанието на публичния RSA ключ за проверка на JWT токени от Users."""
+        import os
+
+        key = self.jwt_public_key
+        if not key:
+            return ""
+        if os.path.exists(key):
+            with open(key, encoding="utf-8") as f:
+                return f.read()
+        return key
 
     @field_validator("payments_internal_auth_token", mode="before")
     @classmethod

@@ -130,6 +130,10 @@ class UserService:
         self._mailer = mailer or AccountMailer()
         self._rate_limiter = rate_limiter or _default_rate_limiter
 
+    def get_user_by_id(self, user_id: int) -> User | None:
+        """Връща потребител по ID или None ако не съществува."""
+        return self._user_repository.get_by_id(user_id)
+
     def register_user(self, email: str, password: str) -> User:
         """Сценарий: регистрация на нов потребител (винаги с роля 'customer' и статус 'active')."""
         if self._user_repository.get_by_email(email) is not None:

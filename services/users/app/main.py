@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api import auth_router, router
+from app.api import auth_router, internal_router, router
 from app.db import db
 
 
@@ -25,3 +25,4 @@ app = FastAPI(
 
 app.include_router(router)
 app.include_router(auth_router)
+app.include_router(internal_router)

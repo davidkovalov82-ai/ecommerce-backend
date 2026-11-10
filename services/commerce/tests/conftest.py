@@ -4,7 +4,33 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-# Задаваме отделен тестов таен ключ и вътрешен токен за тестовата среда
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+# Генерираме изолирана RSA 2048 тестова двойка ключове за тестовата среда
+_test_private_key = rsa.generate_private_key(
+    public_exponent=65537,
+    key_size=2048,
+)
+_test_private_pem = _test_private_key.private_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PrivateFormat.PKCS8,
+    encryption_algorithm=serialization.NoEncryption(),
+).decode("utf-8")
+_test_public_pem = (
+    _test_private_key.public_key()
+    .public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    .decode("utf-8")
+)
+
+os.environ["JWT_PRIVATE_KEY"] = _test_private_pem
+os.environ["JWT_PUBLIC_KEY"] = _test_public_pem
+os.environ["JWT_ALGORITHM"] = "RS256"
+os.environ["JWT_ISSUER"] = "ecommerce-users"
+os.environ["JWT_AUDIENCE"] = "ecommerce"
 os.environ.setdefault(
     "JWT_SECRET", "ci-and-test-jwt-secret-key-at-least-32-bytes-long!"
 )
@@ -22,6 +48,14 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config import settings
 from app.dependencies import get_db_session
 from app.main import app
+from app.modules.accounts.dependencies import get_users_client
+from app.modules.accounts.models import User
+from app.modules.accounts.users_client import RemoteUserInfo, UsersClient
+
+settings.jwt_public_key = _test_public_pem
+settings.jwt_algorithm = "RS256"
+settings.jwt_issuer = "ecommerce-users"
+settings.jwt_audience = "ecommerce"
 
 TEST_DB_NAME = "commerce_test"
 TEST_ROLE_NAME = "commerce_test_role"
@@ -231,14 +265,69 @@ def clean_users_table() -> Generator[None]:
         _cleanup_test_tables(session)
 
 
+class LocalTestUsersClient(UsersClient):
+    """Тестов клиент, който извлича статус на потребителя от локалната тестова сесия."""
+
+    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+        super().__init__(base_url="http://test-users", internal_token="test-token")
+        self.session_factory = session_factory
+
+    def get_user_status(self, user_id: int) -> RemoteUserInfo | None:
+        with self.session_factory() as session:
+            user = session.get(User, user_id)
+            if user is None:
+                return None
+            return RemoteUserInfo(
+                id=user.id,
+                email=user.email,
+                role=user.role,
+                status=user.status,
+                token_version=user.token_version,
+                display_name=user.display_name,
+            )
+
+    def forward_request(
+        self,
+        method: str,
+        path: str,
+        content: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        import sys
+        users_dir = Path(__file__).resolve().parent.parent.parent / "users"
+        if str(users_dir) not in sys.path:
+            sys.path.insert(0, str(users_dir))
+        from app.main import app as users_app
+        from fastapi.testclient import TestClient as UsersTestClient
+
+        with UsersTestClient(users_app) as client:
+            req_headers = {}
+            if headers:
+                for k, v in headers.items():
+                    if k.lower() not in ("host", "content-length"):
+                        req_headers[k] = v
+            return client.request(
+                method=method,
+                url=path,
+                content=content,
+                headers=req_headers,
+                params=params,
+            )
+
+
 @pytest.fixture(autouse=True)
 def override_db_dependency() -> Generator[None]:
-    """Пренасочва FastAPI зависимостта get_db_session към commerce_test за всички тестове."""
+    """Пренасочва FastAPI зависимостта get_db_session и get_users_client към commerce_test за всички тестове."""
 
     def _get_test_db() -> Generator[Session]:
         with TestingSessionLocal() as session:
             yield session
 
     app.dependency_overrides[get_db_session] = _get_test_db
+    app.dependency_overrides[get_users_client] = lambda: LocalTestUsersClient(
+        TestingSessionLocal
+    )
     yield
     app.dependency_overrides.pop(get_db_session, None)
+    app.dependency_overrides.pop(get_users_client, None)
