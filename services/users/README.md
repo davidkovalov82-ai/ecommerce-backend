@@ -45,15 +45,24 @@
 
 ## Тестове и линтинг
 
-- Изпълнение на тестовия пакет (използва изолирана база `users_test`):
+- Изпълнение на пълния тестов пакет (използва изолирана база `users_test` и Mailpit):
   ```bash
   uv run --locked pytest -q
+  ```
+- Изпълнение конкретно на интеграционната проверка за възстановяване на парола през Mailpit:
+  ```bash
+  uv run --locked pytest tests/test_password_reset_mailpit.py
   ```
 - Проверка на код и форматиране с Ruff:
   ```bash
   uv run --locked ruff check .
   uv run --locked ruff format --check .
   ```
+
+## SMTP и Mailpit
+За изпращане на имейли за възстановяване на парола Users използва SMTP:
+- По подразбиране в Docker Compose: `SMTP_HOST=mailpit`, `SMTP_PORT=1025`, `SMTP_FROM=noreply@example.com`.
+- Локално за разработка/тестове се свързва към Mailpit на `localhost:1025`, а получените писма могат да се преглеждат в Web UI на `http://localhost:8025`.
 
 ## Стартиране с Docker Compose
 ```bash

@@ -57,4 +57,3 @@ def downgrade() -> None:
         existing_type=sa.BigInteger(),
         nullable=False,
     )
-
