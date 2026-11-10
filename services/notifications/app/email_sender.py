@@ -1,28 +1,54 @@
-"""SMTP клиент за изпращане на имейл известия."""
+"""SMTP адаптер за имейл известия (съвместим с Mailpit)."""
 
 import smtplib
 from email.message import EmailMessage
+from typing import Any, Protocol
 
 from app.config import settings
 
 
+class EmailSenderProtocol(Protocol):
+    """Протокол за изпращач на имейл известия."""
+
+    def send_order_paid_email(
+        self,
+        *,
+        to_email: str,
+        order_id: int,
+        total_minor: int,
+        currency: str,
+    ) -> None: ...
+
+    def send_shipment_shipped_email(
+        self,
+        *,
+        to_email: str,
+        order_id: int,
+        shipment_id: int,
+        items: list[dict[str, Any]],
+    ) -> None: ...
+
+
 class EmailSender:
-    """Изпращач на съобщения през SMTP сървър (напр. Mailpit локално)."""
+    """Изпращач на имейли през SMTP (напр. Mailpit локално)."""
 
     def __init__(
         self,
         host: str | None = None,
         port: int | None = None,
         from_email: str | None = None,
-        timeout: float = 10.0,
+        timeout: float | None = None,
     ) -> None:
         self.host = host or settings.smtp_host
         self.port = port or settings.smtp_port
         self.from_email = from_email or settings.smtp_from
-        self.timeout = timeout
+        self.timeout = timeout if timeout is not None else settings.smtp_timeout_seconds
+        if self.timeout <= 0:
+            raise ValueError("SMTP timeout must be positive")
 
     def send_order_paid_email(
         self,
+        *,
         to_email: str,
         order_id: int,
         total_minor: int,
@@ -52,10 +78,11 @@ class EmailSender:
 
     def send_shipment_shipped_email(
         self,
+        *,
         to_email: str,
         order_id: int,
         shipment_id: int,
-        items: list[dict[str, object]],
+        items: list[dict[str, Any]],
     ) -> None:
         """Изпраща потвърждение за изпратена пратка със списък на включените позиции."""
         items_lines = []

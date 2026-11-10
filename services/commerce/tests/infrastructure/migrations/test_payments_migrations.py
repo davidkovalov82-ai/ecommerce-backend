@@ -1,35 +1,22 @@
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from alembic import command
-from alembic.config import Config
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-
-from app.config import settings
 
 ALEMBIC_INI_PATH = str(Path(__file__).resolve().parents[3] / "alembic.ini")
 
 
-def test_payments_migration_upgrade_with_existing_orders() -> None:
+def test_payments_migration_upgrade_with_existing_orders(
+    temp_migration_db: Callable[..., Any],
+) -> None:
     """Проверка за обновяване от 568b759ac3a0 с вече съществуваща поръчка и безопасно връщане назад."""
-    temp_db_name = "commerce_temp_payments_mig_test"
-    admin_engine = create_engine(settings.database_url, isolation_level="AUTOCOMMIT")
-
-    with admin_engine.connect() as conn:
-        conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
-        conn.execute(text(f"CREATE DATABASE {temp_db_name}"))
-
-    temp_db_url = (
-        f"postgresql+psycopg://{settings.db_user}:{settings.db_password}"
-        f"@{settings.db_host}:{settings.db_port}/{temp_db_name}"
-    )
-
-    temp_engine = create_engine(temp_db_url)
-    try:
-        alembic_cfg = Config(ALEMBIC_INI_PATH)
-        alembic_cfg.set_main_option("sqlalchemy.url", temp_db_url)
-
+    with temp_migration_db(
+        "commerce_temp_payments_mig_test", alembic_ini_path=ALEMBIC_INI_PATH
+    ) as (alembic_cfg, temp_engine):
         # 1. Миграция до 568b759ac3a0 (създаване на orders с pending_payment CHECK)
         command.upgrade(alembic_cfg, "568b759ac3a0")
 
@@ -114,33 +101,16 @@ def test_payments_migration_upgrade_with_existing_orders() -> None:
                 text("SELECT status FROM orders WHERE id = 500")
             ).scalar()
             assert rem_status == "pending_payment"
-    finally:
-        temp_engine.dispose()
-        with admin_engine.connect() as conn:
-            conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
-        admin_engine.dispose()
 
 
-def test_stripe_migration_upgrade_and_downgrade() -> None:
+def test_stripe_migration_upgrade_and_downgrade(
+    temp_migration_db: Callable[..., Any],
+) -> None:
     """Проверка за обновяване от c74a9d821e5f до e2b83a741f90 и безопасно връщане назад."""
-    temp_db_name = "commerce_temp_stripe_mig_test"
-    admin_engine = create_engine(settings.database_url, isolation_level="AUTOCOMMIT")
-
-    with admin_engine.connect() as conn:
-        conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
-        conn.execute(text(f"CREATE DATABASE {temp_db_name}"))
-
-    temp_db_url = (
-        f"postgresql+psycopg://{settings.db_user}:{settings.db_password}"
-        f"@{settings.db_host}:{settings.db_port}/{temp_db_name}"
-    )
-
-    temp_engine = create_engine(temp_db_url)
-    try:
-        alembic_cfg = Config(ALEMBIC_INI_PATH)
-        alembic_cfg.set_main_option("sqlalchemy.url", temp_db_url)
-
-        # 1. Миграция до c74a9d821e5f (преди Stripe таблиците)
+    with temp_migration_db(
+        "commerce_temp_stripe_mig_test", alembic_ini_path=ALEMBIC_INI_PATH
+    ) as (alembic_cfg, temp_engine):
+        # 1. Миграция до предишната ревизия c74a9d821e5f (преди Stripe таблиците)
         command.upgrade(alembic_cfg, "c74a9d821e5f")
 
         # 2. Вмъкване на поръчка
@@ -234,14 +204,11 @@ def test_stripe_migration_upgrade_and_downgrade() -> None:
                 text("SELECT id FROM orders WHERE id = 600")
             ).scalar()
             assert order_rem == 600
-    finally:
-        temp_engine.dispose()
-        with admin_engine.connect() as conn:
-            conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
-        admin_engine.dispose()
 
 
-def test_order_processing_and_stripe_mode_migration() -> None:
+def test_order_processing_and_stripe_mode_migration(
+    temp_migration_db: Callable[..., Any],
+) -> None:
     """Тества миграция b4f8c2e1a9d0:
 
     - Добавяне на expires_at в orders
@@ -251,23 +218,9 @@ def test_order_processing_and_stripe_mode_migration() -> None:
     - Ограничение за mode ('test', 'live')
     - Безопасен downgrade назад до e2b83a741f90
     """
-    temp_db_name = "commerce_temp_mode_mig_test"
-    admin_engine = create_engine(settings.database_url, isolation_level="AUTOCOMMIT")
-
-    with admin_engine.connect() as conn:
-        conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
-        conn.execute(text(f"CREATE DATABASE {temp_db_name}"))
-
-    temp_db_url = (
-        f"postgresql+psycopg://{settings.db_user}:{settings.db_password}"
-        f"@{settings.db_host}:{settings.db_port}/{temp_db_name}"
-    )
-
-    temp_engine = create_engine(temp_db_url)
-    try:
-        alembic_cfg = Config(ALEMBIC_INI_PATH)
-        alembic_cfg.set_main_option("sqlalchemy.url", temp_db_url)
-
+    with temp_migration_db(
+        "commerce_temp_mode_mig_test", alembic_ini_path=ALEMBIC_INI_PATH
+    ) as (alembic_cfg, temp_engine):
         # 1. Миграция до предишната ревизия e2b83a741f90
         command.upgrade(alembic_cfg, "e2b83a741f90")
 
@@ -366,8 +319,3 @@ def test_order_processing_and_stripe_mode_migration() -> None:
                 )
             ).scalar()
             assert col_exp_exists is False
-    finally:
-        temp_engine.dispose()
-        with admin_engine.connect() as conn:
-            conn.execute(text(f"DROP DATABASE IF EXISTS {temp_db_name} WITH (FORCE)"))
-        admin_engine.dispose()

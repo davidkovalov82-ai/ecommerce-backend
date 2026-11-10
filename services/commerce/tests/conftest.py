@@ -1,5 +1,7 @@
 import os
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Iterator
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 # Задаваме отделен тестов таен ключ за тестовата среда
@@ -10,7 +12,8 @@ os.environ.setdefault(
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, text
+from sqlalchemy import Engine, create_engine, text
+from sqlalchemy.engine import URL
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
@@ -18,8 +21,13 @@ from app.dependencies import get_db_session
 from app.main import app
 
 TEST_DB_NAME = "commerce_test"
+TEST_ROLE_NAME = "commerce_test_role"
+TEST_ROLE_PASSWORD = "commerce_test_role_password"
+COMMERCE_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_ALEMBIC_INI_PATH = str(COMMERCE_DIR / "alembic.ini")
+DEFAULT_ALEMBIC_SCRIPT_LOCATION = str(COMMERCE_DIR / "migrations")
 TEST_DATABASE_URL = (
-    f"postgresql+psycopg://{settings.db_user}:{settings.db_password}"
+    f"postgresql+psycopg://{TEST_ROLE_NAME}:{TEST_ROLE_PASSWORD}"
     f"@{settings.db_host}:{settings.db_port}/{TEST_DB_NAME}"
 )
 
@@ -41,6 +49,57 @@ def session_factory() -> sessionmaker[Session]:
     return TestingSessionLocal
 
 
+@contextmanager
+def _temporary_migration_database(
+    temp_db_name: str,
+    *,
+    alembic_ini_path: str = DEFAULT_ALEMBIC_INI_PATH,
+    script_location: str | None = None,
+) -> Iterator[tuple[Config, Engine]]:
+    """Подготвя временна БД през admin ролята и връща (alembic_cfg, engine) с DB_USER."""
+    admin_engine = create_engine(
+        settings.admin_database_url, isolation_level="AUTOCOMMIT"
+    )
+    quoted_db = temp_db_name.replace('"', '""')
+    quoted_user = settings.db_user.replace('"', '""')
+
+    with admin_engine.connect() as conn:
+        conn.execute(text(f'DROP DATABASE IF EXISTS "{quoted_db}" WITH (FORCE)'))
+        conn.execute(text(f'CREATE DATABASE "{quoted_db}" OWNER "{quoted_user}"'))
+        conn.execute(text(f'REVOKE ALL ON DATABASE "{quoted_db}" FROM PUBLIC'))
+        conn.execute(
+            text(f'GRANT CONNECT, TEMP ON DATABASE "{quoted_db}" TO "{quoted_user}"')
+        )
+
+    temp_db_url_obj = URL.create(
+        drivername="postgresql+psycopg",
+        username=settings.db_user,
+        password=settings.db_password,
+        host=settings.db_host,
+        port=settings.db_port,
+        database=temp_db_name,
+    )
+    temp_db_url = temp_db_url_obj.render_as_string(hide_password=False)
+    temp_engine = create_engine(temp_db_url)
+    try:
+        alembic_cfg = Config(alembic_ini_path)
+        if script_location is not None:
+            alembic_cfg.set_main_option("script_location", script_location)
+        alembic_cfg.set_main_option("sqlalchemy.url", temp_db_url.replace("%", "%%"))
+        yield alembic_cfg, temp_engine
+    finally:
+        temp_engine.dispose()
+        with admin_engine.connect() as conn:
+            conn.execute(text(f'DROP DATABASE IF EXISTS "{quoted_db}" WITH (FORCE)'))
+        admin_engine.dispose()
+
+
+@pytest.fixture
+def temp_migration_db() -> Callable[..., Any]:
+    """Фабрика за временни БД за миграционни тестове (admin DDL vs непривилегирована DB_USER)."""
+    return _temporary_migration_database
+
+
 def _sync_products_sequence(conn: Any) -> None:
     """Синхронизира PostgreSQL sequence-а на products с текущото максимално ID."""
     conn.execute(
@@ -53,24 +112,39 @@ def _sync_products_sequence(conn: Any) -> None:
 
 @pytest.fixture(scope="session", autouse=True)
 def setup_test_database() -> Generator[None]:
-    """Инициализира commerce_test чрез реални Alembic миграции (upgrade head)."""
-    # 1. Пълно пресъздаване само на отделната commerce_test база
-    main_engine = create_engine(settings.database_url, isolation_level="AUTOCOMMIT")
+    """Инициализира commerce_test с отделна тестова роля и реални Alembic миграции (upgrade head)."""
+    main_engine = create_engine(
+        settings.admin_database_url, isolation_level="AUTOCOMMIT"
+    )
+    escaped_pw = TEST_ROLE_PASSWORD.replace("'", "''")
     with main_engine.connect() as conn:
         conn.execute(text(f"DROP DATABASE IF EXISTS {TEST_DB_NAME} WITH (FORCE)"))
-        conn.execute(text(f"CREATE DATABASE {TEST_DB_NAME}"))
+        # Използваме отделна тестова роля без да пипаме пароли/права на работни роли
+        conn.execute(text(f"DROP ROLE IF EXISTS {TEST_ROLE_NAME}"))
+        conn.execute(
+            text(
+                f"CREATE ROLE {TEST_ROLE_NAME} "
+                f"WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '{escaped_pw}'"
+            )
+        )
+        conn.execute(text(f"CREATE DATABASE {TEST_DB_NAME} OWNER {TEST_ROLE_NAME}"))
+        conn.execute(text(f"REVOKE ALL ON DATABASE {TEST_DB_NAME} FROM PUBLIC"))
+        conn.execute(
+            text(f"GRANT CONNECT, TEMP ON DATABASE {TEST_DB_NAME} TO {TEST_ROLE_NAME}")
+        )
 
-    # 2. Изпълняваме реалните Alembic миграции до последната (head)
-    # Последната миграция автоматично синхронизира sequence-а на products с id=1
+    # Изпълняваме реалните Alembic миграции през не-superuser тестовата роля
     alembic_cfg = Config("alembic.ini")
     alembic_cfg.set_main_option("sqlalchemy.url", TEST_DATABASE_URL)
     command.upgrade(alembic_cfg, "head")
 
     yield
 
-    # 4. Почистване след тестовата сесия
+    test_engine.dispose()
     with main_engine.connect() as conn:
         conn.execute(text(f"DROP DATABASE IF EXISTS {TEST_DB_NAME} WITH (FORCE)"))
+        conn.execute(text(f"DROP ROLE IF EXISTS {TEST_ROLE_NAME}"))
+    main_engine.dispose()
 
 
 def _sync_users_sequence(conn: Any) -> None:

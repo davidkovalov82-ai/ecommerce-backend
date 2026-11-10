@@ -6,18 +6,72 @@ services:
     container_name: commerce-db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: commerce
-      POSTGRES_PASSWORD: commerce
+      # В съществуващ volume bootstrap админ ролята може да е 'commerce' (не се изисква изтриване на volume)
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:-commerce}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-commerce}
       POSTGRES_DB: commerce
     ports:
       - "127.0.0.1:5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U commerce -d commerce"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_ADMIN_USER:-commerce} -d commerce"]
       interval: 5s
       timeout: 5s
       retries: 5
     volumes:
       - postgres_data:/var/lib/postgresql/data
+
+  db-init:
+    image: postgres:17-alpine
+    container_name: commerce-db-init
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:-commerce}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-commerce}
+      POSTGRES_DB: commerce
+      COMMERCE_APP_USER: ${COMMERCE_DB_USER:-commerce_app}
+      COMMERCE_APP_PASSWORD: ${COMMERCE_DB_PASSWORD:-commerce_app}
+      COMMERCE_DB_NAME: commerce
+      NOTIF_APP_USER: ${NOTIFICATIONS_DB_USER:-notifications}
+      NOTIF_APP_PASSWORD: ${NOTIFICATIONS_DB_PASSWORD:-notifications}
+      NOTIF_DB_NAME: notifications
+    restart: "no"
+    volumes:
+      - ./scripts/postgres_db_init.sh:/usr/local/bin/postgres_db_init.sh:ro
+    command: ["sh", "/usr/local/bin/postgres_db_init.sh"]
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    container_name: commerce-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: commerce-mailpit
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   api:
     build:
@@ -26,13 +80,13 @@ services:
     container_name: commerce-api
     restart: unless-stopped
     depends_on:
-      db:
-        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
     environment:
       DB_HOST: db
       DB_PORT: "5432"
-      DB_USER: commerce
-      DB_PASSWORD: commerce
+      DB_USER: ${COMMERCE_DB_USER:-commerce_app}
+      DB_PASSWORD: ${COMMERCE_DB_PASSWORD:-commerce_app}
       DB_NAME: commerce
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set and non-empty}
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
@@ -41,17 +95,66 @@ services:
       SMTP_HOST: ${SMTP_HOST:-mailpit}
       SMTP_PORT: ${SMTP_PORT:-1025}
       SMTP_FROM: ${SMTP_FROM:-noreply@example.com}
+      RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
+      RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
     ports:
       - "8000:8000"
     command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
 
-  mailpit:
-    image: axllent/mailpit:latest
-    container_name: commerce-mailpit
+  commerce-outbox:
+    build:
+      context: ./services/commerce
+      dockerfile: Dockerfile
+    container_name: commerce-outbox
     restart: unless-stopped
-    ports:
-      - "1025:1025"
-      - "8025:8025"
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      api:
+        condition: service_started
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: ${COMMERCE_DB_USER:-commerce_app}
+      DB_PASSWORD: ${COMMERCE_DB_PASSWORD:-commerce_app}
+      DB_NAME: commerce
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set and non-empty}
+      RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
+      RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+    command: sh -c "python scripts/process_outbox.py --daemon --poll-interval 1.0"
+
+  notifications:
+    build:
+      context: ./services/notifications
+      dockerfile: Dockerfile
+    container_name: notifications-worker
+    restart: unless-stopped
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: ${NOTIFICATIONS_DB_USER:-notifications}
+      DB_PASSWORD: ${NOTIFICATIONS_DB_PASSWORD:-notifications}
+      DB_NAME: notifications
+      RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
+      RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_FROM: ${SMTP_FROM:-noreply@example.com}
+      SMS_MODE: ${SMS_MODE:-test}
+      SMS_API_BASE_URL: ${SMS_API_BASE_URL:-}
+    command: sh -c "alembic upgrade head && python -m app.main"
 
 volumes:
   postgres_data:
+  rabbitmq_data:

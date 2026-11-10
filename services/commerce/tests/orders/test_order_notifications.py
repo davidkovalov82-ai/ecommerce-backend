@@ -1,11 +1,10 @@
 import datetime
 import json
-import time
-import urllib.request
+import logging
 import uuid
-from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pika.exceptions
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import IntegrityError
@@ -16,13 +15,19 @@ from app.main import app
 from app.modules.accounts.repository import UserRepository
 from app.modules.cart.repository import CartRepository
 from app.modules.catalog.repository import ProductRepository
-from app.modules.orders.mailer import EmailSender
 from app.modules.orders.models import (
     Order,
     OrderOutboxEvent,
     StripeCheckoutSession,
 )
 from app.modules.orders.outbox_processor import OutboxProcessor
+from app.modules.orders.publisher import (
+    BrokerUnavailableError,
+    EventPublisher,
+    PublishConfirmLostError,
+    RabbitMQEventPublisher,
+    UnroutableEventError,
+)
 from app.modules.orders.repository import OrderRepository
 from app.modules.orders.service import OrderService
 from app.modules.orders.stripe_client import StripeClient
@@ -98,6 +103,9 @@ def test_webhook_completed_creates_outbox_event(db_session: Session) -> None:
     assert outbox_ev is not None
     assert outbox_ev.status == "pending"
     assert outbox_ev.retry_count == 0
+    assert uuid.UUID(outbox_ev.event_id)
+    assert outbox_ev.event_version == 1
+    assert outbox_ev.occurred_at is not None
     assert outbox_ev.payload["order_id"] == order.id
     assert outbox_ev.payload["customer_email"] == "buyer_webhook@example.com"
     assert outbox_ev.payload["total_minor"] == 4500
@@ -463,21 +471,25 @@ def test_no_outbox_event_for_pending_cancelled_expired(db_session: Session) -> N
     assert len(events_expired) == 0
 
 
-def test_outbox_processor_sends_email_and_marks_sent(
+def test_outbox_processor_publishes_to_rabbitmq_and_marks_published(
     db_session: Session,
     session_factory: sessionmaker[Session],
 ) -> None:
-    """Критерий: OutboxProcessor изпраща имейл с данни за поръчката и маркира записа като 'sent'."""
-    user, _ = _create_user_and_token(db_session, email="customer_mailer@example.com")
-    product = _create_product(db_session, "Mailer Prod", price_minor=7999)
+    """Критерий: OutboxProcessor публикува версия 1 конверт с event_id и отбелязва 'published'."""
+    user, _ = _create_user_and_token(db_session, email="customer_pub@example.com")
+    product = _create_product(db_session, "Publisher Prod", price_minor=7999)
     order = _create_order(db_session, user.id, product, quantity=1)
 
+    fixed_event_id = str(uuid.uuid4())
     outbox_event = OrderOutboxEvent(
+        event_id=fixed_event_id,
+        event_version=1,
         order_id=order.id,
         event_type="order.paid",
         payload={
             "order_id": order.id,
-            "customer_email": "customer_mailer@example.com",
+            "customer_email": "customer_pub@example.com",
+            "customer_phone": "+359888112233",
             "total_minor": 7999,
             "currency": "EUR",
         },
@@ -486,50 +498,64 @@ def test_outbox_processor_sends_email_and_marks_sent(
     db_session.add(outbox_event)
     db_session.commit()
 
-    mock_mailer = MagicMock(spec=EmailSender)
+    mock_publisher = MagicMock(spec=EventPublisher)
 
     processor = OutboxProcessor(
         session_factory=session_factory,
-        email_sender=mock_mailer,
+        publisher=mock_publisher,
     )
     stats = processor.process_pending_events()
 
-    assert stats["processed"] == 1
-    assert stats["sent"] == 1
-    assert stats["failed"] == 0
+    assert stats == {"processed": 1, "published": 1, "failed": 0}
+    mock_publisher.publish_event.assert_called_once()
+    call_kwargs = mock_publisher.publish_event.call_args.kwargs
+    assert call_kwargs["routing_key"] == "order.paid"
+    envelope = call_kwargs["envelope"]
+    assert envelope["event_id"] == fixed_event_id
+    assert envelope["event_type"] == "order.paid"
+    assert envelope["event_version"] == 1
+    assert envelope["producer"] == "commerce"
+    assert envelope["occurred_at"]
+    assert envelope["data"]["customer_phone"] == "+359888112233"
 
-    # Проверка, че send_order_paid_email е извикан с коректните аргументи
-    mock_mailer.send_order_paid_email.assert_called_once_with(
-        to_email="customer_mailer@example.com",
-        order_id=order.id,
-        total_minor=7999,
-        currency="EUR",
-    )
-
-    # Проверка в базата: събитието е маркирано като sent
     with session_factory() as s:
         db_event = s.get(OrderOutboxEvent, outbox_event.id)
         assert db_event is not None
-        assert db_event.status == "sent"
+        assert db_event.status == "published"
+        assert db_event.published_at is not None
         assert db_event.processed_at is not None
         assert db_event.retry_count == 0
+        assert db_event.last_error is None
 
 
-def test_outbox_processor_smtp_failure_keeps_order_paid_and_event_pending(
+@pytest.mark.parametrize(
+    "error_factory",
+    [
+        lambda: BrokerUnavailableError("RabbitMQ connection refused"),
+        lambda: UnroutableEventError("NO_ROUTE returned by broker"),
+        lambda: PublishConfirmLostError("Broker nacked confirm"),
+    ],
+)
+def test_outbox_processor_keeps_pending_and_stable_event_id_on_publish_failures(
     db_session: Session,
     session_factory: sessionmaker[Session],
+    error_factory,
 ) -> None:
-    """Критерий: При недостъпен SMTP поръчката остава paid, а събитието остава pending с retry_count = 1."""
-    user, _ = _create_user_and_token(db_session, email="fail_smtp@example.com")
-    product = _create_product(db_session, "Fail SMTP", price_minor=5000)
+    """При недостъпен брокер, липса на маршрут или загубено потвърждение event_id остава същият и се повтаря успешно."""
+    user, _ = _create_user_and_token(db_session, email="fail_pub@example.com")
+    product = _create_product(db_session, "Fail Publish", price_minor=5000)
     order = _create_order(db_session, user.id, product, status="paid")
 
+    fixed_event_id = str(uuid.uuid4())
     outbox_event = OrderOutboxEvent(
+        event_id=fixed_event_id,
+        event_version=1,
         order_id=order.id,
         event_type="order.paid",
         payload={
             "order_id": order.id,
-            "customer_email": "fail_smtp@example.com",
+            "customer_email": "fail_pub@example.com",
+            "customer_phone": "+359888999000",
             "total_minor": 5000,
             "currency": "EUR",
         },
@@ -538,86 +564,57 @@ def test_outbox_processor_smtp_failure_keeps_order_paid_and_event_pending(
     db_session.add(outbox_event)
     db_session.commit()
 
-    mock_mailer = MagicMock(spec=EmailSender)
-    mock_mailer.send_order_paid_email.side_effect = ConnectionRefusedError(
-        "Mailpit SMTP connection refused on port 1025"
-    )
+    failing_publisher = MagicMock(spec=EventPublisher)
+    failing_publisher.publish_event.side_effect = error_factory()
 
     processor = OutboxProcessor(
         session_factory=session_factory,
-        email_sender=mock_mailer,
+        publisher=failing_publisher,
     )
-    stats = processor.process_pending_events()
+    stats_fail = processor.process_pending_events()
+    assert stats_fail == {"processed": 1, "published": 0, "failed": 1}
 
-    assert stats["processed"] == 1
-    assert stats["sent"] == 0
-    assert stats["failed"] == 1
-
-    # Проверка в базата:
     with session_factory() as s:
         db_order = s.get(Order, order.id)
         assert db_order is not None
-        assert db_order.status == "paid"  # Поръчката остава paid!
+        assert db_order.status == "paid"
 
         db_event = s.get(OrderOutboxEvent, outbox_event.id)
         assert db_event is not None
-        assert db_event.status == "pending"  # Остава pending за повторен опит!
+        assert db_event.status == "pending"
+        assert db_event.event_id == fixed_event_id
+        assert db_event.published_at is None
         assert db_event.retry_count == 1
-        assert "Mailpit SMTP connection refused" in (db_event.last_error or "")
+        assert db_event.last_error is not None
 
-
-def test_outbox_processor_retry_after_smtp_recovery_succeeds(
-    db_session: Session,
-    session_factory: sessionmaker[Session],
-) -> None:
-    """Критерий: След неуспешен опит при възстановен SMTP следващият опит успява и маркира събитието 'sent'."""
-    user, _ = _create_user_and_token(db_session, email="recover@example.com")
-    product = _create_product(db_session, "Recover SMTP", price_minor=3000)
-    order = _create_order(db_session, user.id, product, status="paid")
-
-    outbox_event = OrderOutboxEvent(
-        order_id=order.id,
-        event_type="order.paid",
-        payload={
-            "order_id": order.id,
-            "customer_email": "recover@example.com",
-            "total_minor": 3000,
-            "currency": "EUR",
-        },
-        status="pending",
-        retry_count=1,
-        last_error="Previous network timeout",
-    )
-    db_session.add(outbox_event)
-    db_session.commit()
-
-    mock_mailer = MagicMock(spec=EmailSender)  # Успешен SMTP
-
-    processor = OutboxProcessor(
+    # Възстановяване: вторият опит изпраща СЪЩИЯ event_id
+    healthy_publisher = MagicMock(spec=EventPublisher)
+    healthy_processor = OutboxProcessor(
         session_factory=session_factory,
-        email_sender=mock_mailer,
+        publisher=healthy_publisher,
     )
-    stats = processor.process_pending_events()
-
-    assert stats["processed"] == 1
-    assert stats["sent"] == 1
-    assert stats["failed"] == 0
+    stats_ok = healthy_processor.process_pending_events()
+    assert stats_ok == {"processed": 1, "published": 1, "failed": 0}
+    retried_envelope = healthy_publisher.publish_event.call_args.kwargs["envelope"]
+    assert retried_envelope["event_id"] == fixed_event_id
 
     with session_factory() as s:
         db_event = s.get(OrderOutboxEvent, outbox_event.id)
         assert db_event is not None
-        assert db_event.status == "sent"
-        assert db_event.processed_at is not None
-        assert db_event.retry_count == 1  # Пази историята от предишния опит
+        assert db_event.status == "published"
+        assert db_event.published_at is not None
+        assert db_event.retry_count == 1
 
 
-def test_outbox_processor_idempotent_after_sent(
+@pytest.mark.parametrize("already_done_status", ["legacy_sent", "published"])
+def test_outbox_processor_does_not_republish_legacy_sent_or_published(
     db_session: Session,
     session_factory: sessionmaker[Session],
+    already_done_status: str,
 ) -> None:
-    """Критерий: Повторен запуск на командата след успех не изпраща ново писмо."""
+    """Критерий: Исторически 'legacy_sent' и вече 'published' събития не се публикуват повторно."""
     user, _ = _create_user_and_token(db_session, email="idemp@example.com")
-    product = _create_product(db_session, "Idemp SMTP", price_minor=2000)
+    product = _create_product(db_session, "Idemp RabbitMQ", price_minor=2000)
     order = _create_order(db_session, user.id, product, status="paid")
 
     outbox_event = OrderOutboxEvent(
@@ -629,33 +626,129 @@ def test_outbox_processor_idempotent_after_sent(
             "total_minor": 2000,
             "currency": "EUR",
         },
-        status="sent",
+        status=already_done_status,
         processed_at=datetime.datetime.now(datetime.UTC),
     )
     db_session.add(outbox_event)
     db_session.commit()
 
-    mock_mailer = MagicMock(spec=EmailSender)
-
+    mock_publisher = MagicMock(spec=EventPublisher)
     processor = OutboxProcessor(
         session_factory=session_factory,
-        email_sender=mock_mailer,
+        publisher=mock_publisher,
     )
     stats = processor.process_pending_events()
 
-    assert stats["processed"] == 0
-    assert stats["sent"] == 0
-    assert stats["failed"] == 0
-    assert mock_mailer.send_order_paid_email.call_count == 0
+    assert stats == {"processed": 0, "published": 0, "failed": 0}
+    assert mock_publisher.publish_event.call_count == 0
+
+
+def test_outbox_processor_never_logs_customer_contacts_and_logs_correlation_ids(
+    db_session: Session,
+    session_factory: sessionmaker[Session],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Контактите на купувача не се извеждат в логовете или last_error; записват се order_id, shipment_id, event_id."""
+    secret_email = "private.buyer.pii@example.com"
+    secret_phone = "+359887654321"
+    user, _ = _create_user_and_token(db_session, email=secret_email)
+    product = _create_product(db_session, "PII Guard Prod", price_minor=1500)
+    order = _create_order(db_session, user.id, product, status="paid")
+
+    event_uuid = str(uuid.uuid4())
+    ev = OrderOutboxEvent(
+        event_id=event_uuid,
+        event_version=1,
+        order_id=order.id,
+        shipment_id=None,
+        event_type="order.paid",
+        payload={
+            "order_id": order.id,
+            "customer_email": secret_email,
+            "customer_phone": secret_phone,
+            "total_minor": 1500,
+            "currency": "EUR",
+        },
+        status="pending",
+    )
+    db_session.add(ev)
+    db_session.commit()
+
+    failing_publisher = MagicMock(spec=EventPublisher)
+    # Дори ако външна грешка споменава контактите, те трябва да се санитизират
+    failing_publisher.publish_event.side_effect = BrokerUnavailableError(
+        f"Leak attempt {secret_email} {secret_phone}"
+    )
+
+    caplog.set_level(logging.INFO)
+    processor = OutboxProcessor(
+        session_factory=session_factory,
+        publisher=failing_publisher,
+    )
+    processor.process_pending_events()
+
+    # Успешен повторен опит
+    ok_publisher = MagicMock(spec=EventPublisher)
+    processor_ok = OutboxProcessor(
+        session_factory=session_factory,
+        publisher=ok_publisher,
+    )
+    processor_ok.process_pending_events()
+
+    full_logs = caplog.text
+    assert secret_email not in full_logs
+    assert secret_phone not in full_logs
+    assert event_uuid in full_logs
+    assert f"order_id={order.id}" in full_logs
+    assert "shipment_id=None" in full_logs
+
+    with session_factory() as s:
+        db_ev = s.get(OrderOutboxEvent, ev.id)
+        assert db_ev is not None
+        assert db_ev.last_error is None
+
+
+def test_rabbitmq_publisher_raises_on_unroutable_nack_and_broker_unavailable() -> None:
+    """Проверява, че RabbitMQEventPublisher не потвърждава при UnroutableError, NackError и срив на връзката."""
+    publisher = RabbitMQEventPublisher(auto_declare_topology=False)
+    envelope = {
+        "event_id": str(uuid.uuid4()),
+        "event_type": "order.paid",
+        "event_version": 1,
+        "occurred_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        "producer": "commerce",
+        "data": {"order_id": 1},
+    }
+
+    mock_channel = MagicMock()
+    mock_channel.is_open = True
+    mock_conn = MagicMock()
+    mock_conn.is_open = True
+    publisher._connection = mock_conn
+    publisher._channel = mock_channel
+
+    mock_channel.basic_publish.side_effect = pika.exceptions.UnroutableError([])
+    with pytest.raises(UnroutableEventError):
+        publisher.publish_event(routing_key="order.paid", envelope=envelope)
+
+    mock_channel.basic_publish.side_effect = pika.exceptions.NackError([])
+    with pytest.raises(PublishConfirmLostError):
+        publisher.publish_event(routing_key="order.paid", envelope=envelope)
+
+    mock_channel.basic_publish.side_effect = pika.exceptions.AMQPConnectionError("lost")
+    with pytest.raises(BrokerUnavailableError):
+        publisher.publish_event(routing_key="order.paid", envelope=envelope)
 
 
 def test_outbox_database_constraints(db_session: Session) -> None:
-    """Критерий: UNIQUE(order_id, event_type) и CHECK(status) ограничения на outbox таблицата."""
+    """Критерий: UNIQUE(event_id), UNIQUE(order_id, event_type) и CHECK(status) ограничения на outbox таблицата."""
     user, _ = _create_user_and_token(db_session)
     product = _create_product(db_session)
     order = _create_order(db_session, user.id, product)
 
+    fixed_id = str(uuid.uuid4())
     ev1 = OrderOutboxEvent(
+        event_id=fixed_id,
         order_id=order.id,
         event_type="order.paid",
         payload={"order_id": order.id},
@@ -676,260 +769,27 @@ def test_outbox_database_constraints(db_session: Session) -> None:
         db_session.commit()
     db_session.rollback()
 
-    # 2. Невалиден статус извън ('pending', 'sent', 'failed') -> CHECK ограничение
+    # 2. Дублиран event_id -> UNIQUE(event_id)
+    ev_dup_uuid = OrderOutboxEvent(
+        event_id=fixed_id,
+        order_id=order.id,
+        event_type="other.event",
+        payload={"order_id": order.id},
+        status="pending",
+    )
+    db_session.add(ev_dup_uuid)
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+    db_session.rollback()
+
+    # 3. Невалиден статус извън ('pending', 'legacy_sent', 'published', 'failed') -> CHECK ограничение
     ev_invalid_status = OrderOutboxEvent(
         order_id=order.id,
         event_type="order.shipped",
         payload={"order_id": order.id},
-        status="unknown_status",
+        status="sent",
     )
     db_session.add(ev_invalid_status)
     with pytest.raises(IntegrityError):
         db_session.commit()
     db_session.rollback()
-
-
-def _is_mailpit_live() -> bool:
-    """Проверява дали Mailpit Web API е достъпен на localhost:8025."""
-    try:
-        req = urllib.request.Request("http://127.0.0.1:8025/api/v1/messages")
-        with urllib.request.urlopen(req, timeout=1) as resp:
-            return resp.status == 200
-    except (OSError, TimeoutError):
-        return False
-
-
-def _get_messages_for_recipient(recipient_email: str) -> list[dict[str, Any]]:
-    """Извлича съобщенията от Mailpit API само за конкретен получател."""
-    req = urllib.request.Request("http://127.0.0.1:8025/api/v1/messages")
-    with urllib.request.urlopen(req, timeout=2) as r:
-        data = json.loads(r.read().decode())
-    return [
-        m
-        for m in data.get("messages", [])
-        if any(to.get("Address") == recipient_email for to in m.get("To", []))
-    ]
-
-
-def _wait_for_messages_for_recipient(
-    recipient_email: str,
-    expected_count: int,
-    timeout_seconds: float = 5.0,
-    poll_interval: float = 0.1,
-) -> list[dict[str, Any]]:
-    """Изчаква с краен срок (deadline) получените писма за даден получател."""
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        msgs = _get_messages_for_recipient(recipient_email)
-        if len(msgs) == expected_count:
-            return msgs
-        time.sleep(poll_interval)
-    return _get_messages_for_recipient(recipient_email)
-
-
-def _get_message_detail(message_id: str) -> dict[str, Any]:
-    """Извлича детайлно съдържание на писмо (заглавие, текст) от Mailpit по ID."""
-    req = urllib.request.Request(f"http://127.0.0.1:8025/api/v1/message/{message_id}")
-    with urllib.request.urlopen(req, timeout=2) as r:
-        return json.loads(r.read().decode())
-
-
-def test_notifications_retry_e2e_live_mailpit(
-    db_session: Session,
-    session_factory: sessionmaker[Session],
-) -> None:
-    """E2E интеграционен тест с реален Mailpit и retry цикъл при SMTP срив и възстановяване.
-
-    Сценарий:
-    1. Един подписан Stripe webhook превежда поръчката в 'paid' и записва outbox събитие.
-    2. Отказана SMTP връзка: поръчката остава 'paid', събитието 'pending' с грешка, 0 писма за получателя.
-    3. Успешен повторен опит: писмото е доставено (проверка на номер на поръчка, сума и валута).
-    4. Точно едно писмо за този получател и след третото пускане на обработката.
-    """
-    # 1. Липсата на Mailpit проваля теста (в CI и локално), без skip
-    assert _is_mailpit_live(), (
-        "Mailpit услугата не е достъпна на http://127.0.0.1:8025 - проверката се проваля. "
-        "Уверете се, че Mailpit работи (напр. през 'make test-notifications-retry' или като service в CI)."
-    )
-
-    # 2. Уникален получател за теста (без глобално изтриване на пощенската кутия)
-    customer_email = f"order_retry_{uuid.uuid4().hex[:12]}@example.com"
-    assert len(_get_messages_for_recipient(customer_email)) == 0, (
-        f"Кутията вече съдържа писма за новия уникален получател {customer_email}"
-    )
-
-    # Стъпка 1: Един подписан Stripe webhook
-    user, _ = _create_user_and_token(db_session, email=customer_email)
-    product = _create_product(db_session, "Retry Product", price_minor=4500)
-    order = _create_order(
-        db_session, user.id, product, quantity=1
-    )  # 4500 EUR (45.00 EUR)
-
-    event_id = f"evt_retry_{uuid.uuid4().hex[:12]}"
-    session_id = f"cs_retry_{uuid.uuid4().hex[:12]}"
-    session_rec = StripeCheckoutSession(
-        order_id=order.id,
-        status="open",
-        amount_minor=4500,
-        currency="EUR",
-        mode="test",
-        stripe_session_id=session_id,
-        checkout_url="https://checkout.stripe.com/pay/cs_retry_test",
-        idempotency_key=f"idemp_{session_id}",
-    )
-    db_session.add(session_rec)
-    db_session.commit()
-
-    event_payload = {
-        "id": event_id,
-        "type": "checkout.session.completed",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": session_id,
-                "livemode": False,
-                "payment_status": "paid",
-                "amount_total": 4500,
-                "currency": "eur",
-                "client_reference_id": str(order.id),
-                "metadata": {
-                    "order_id": str(order.id),
-                    "attempt_id": str(session_rec.id),
-                },
-            }
-        },
-    }
-    payload_bytes = json.dumps(event_payload).encode()
-    sig = _generate_stripe_signature(payload_bytes, TEST_WEBHOOK_SECRET)
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=payload_bytes,
-            headers={"Stripe-Signature": sig},
-        )
-    assert resp.status_code == 200, (
-        f"Стъпка 1 пропадна: Webhook върна статус {resp.status_code}"
-    )
-
-    with session_factory() as s:
-        db_order = s.get(Order, order.id)
-        assert db_order is not None and db_order.status == "paid", (
-            "Стъпка 1 пропадна: Поръчката не е в статус 'paid'"
-        )
-        event = OrderRepository(s).get_outbox_event(order.id, "order.paid")
-        assert event is not None, "Стъпка 1 пропадна: Липсва outbox събитие order.paid"
-        assert event.status == "pending", (
-            f"Стъпка 1 пропадна: Очаква се статус pending, получен {event.status}"
-        )
-        assert event.retry_count == 0
-        outbox_id = event.id
-
-    # Стъпка 2: Отказана SMTP връзка (недостъпен порт 19999)
-    failing_mailer = EmailSender(host="127.0.0.1", port=19999, timeout=2.0)
-    failing_processor = OutboxProcessor(
-        session_factory=session_factory,
-        email_sender=failing_mailer,
-    )
-    stats_fail = failing_processor.process_pending_events()
-    assert stats_fail["processed"] >= 1, (
-        "Стъпка 2 пропадна: Процесорът не обработи чакащото събитие"
-    )
-    assert stats_fail["failed"] >= 1, (
-        "Стъпка 2 пропадна: Очаква се неуспех при недостъпен SMTP"
-    )
-    assert stats_fail["sent"] == 0, (
-        "Стъпка 2 пропадна: Не бива да се изпращат писма при срив"
-    )
-
-    # Поръчката остава paid, събитието остава pending с увеличен retry_count
-    with session_factory() as s:
-        db_order = s.get(Order, order.id)
-        assert db_order is not None and db_order.status == "paid", (
-            "Стъпка 2 пропадна: Поръчката не остана в статус 'paid' след SMTP срив"
-        )
-        db_event = s.get(OrderOutboxEvent, outbox_id)
-        assert db_event is not None
-        assert db_event.status == "pending", (
-            "Стъпка 2 пропадна: Събитието не остана в статус 'pending' за повторен опит"
-        )
-        assert db_event.retry_count == 1, (
-            f"Стъпка 2 пропадна: Очаква се retry_count=1, получен {db_event.retry_count}"
-        )
-        assert db_event.last_error is not None, (
-            "Стъпка 2 пропадна: Липсва записана грешка в last_error"
-        )
-
-    # Проверка, че няма изпратени писма за този получател
-    assert len(_get_messages_for_recipient(customer_email)) == 0, (
-        "Стъпка 2 пропадна: Mailpit съдържа писма за получателя след неуспешен опит"
-    )
-
-    # Стъпка 3: Възстановяване на SMTP (реален Mailpit порт 1025) и успешен повторен опит
-    live_mailer = EmailSender(host="127.0.0.1", port=1025)
-    live_processor = OutboxProcessor(
-        session_factory=session_factory,
-        email_sender=live_mailer,
-    )
-    stats_retry = live_processor.process_pending_events()
-    assert stats_retry["sent"] >= 1, (
-        "Стъпка 3 пропадна: Повторният опит не отчете изпратено писмо"
-    )
-    assert stats_retry["failed"] == 0, (
-        "Стъпка 3 пропадна: Повторният опит отчете неочаквана грешка"
-    )
-
-    with session_factory() as s:
-        db_event = s.get(OrderOutboxEvent, outbox_id)
-        assert db_event is not None
-        assert db_event.status == "sent", (
-            f"Стъпка 3 пропадна: Събитието не е 'sent', текущ статус: {db_event.status}"
-        )
-        assert db_event.processed_at is not None, (
-            "Стъпка 3 пропадна: Липсва processed_at timestamp"
-        )
-
-    # Изчакваме доставката с краен срок (краен срок 5.0s)
-    delivered_msgs = _wait_for_messages_for_recipient(
-        customer_email, expected_count=1, timeout_seconds=5.0
-    )
-    assert len(delivered_msgs) == 1, (
-        f"Стъпка 3 пропадна: Очаква се точно 1 писмо за {customer_email}, намерени {len(delivered_msgs)}"
-    )
-
-    # Проверяваме номер на поръчката, сума и валута
-    msg_summary = delivered_msgs[0]
-    assert f"#{order.id}" in msg_summary["Subject"], (
-        f"Стъпка 3 пропадна: Липсва номер на поръчка #{order.id} в заглавието: {msg_summary['Subject']}"
-    )
-    assert any(
-        to.get("Address") == customer_email for to in msg_summary.get("To", [])
-    ), (
-        f"Стъпка 3 пропадна: Получателят {customer_email} не съвпада: {msg_summary.get('To')}"
-    )
-
-    detail = _get_message_detail(msg_summary["ID"])
-    text_body = detail.get("Text", "")
-    assert f"#{order.id}" in text_body, (
-        f"Стъпка 3 пропадна: Липсва номер на поръчка #{order.id} в тялото: {text_body}"
-    )
-    assert "45.00" in text_body, (
-        f"Стъпка 3 пропадна: Липсва форматирана сума 45.00 в тялото: {text_body}"
-    )
-    assert "EUR" in text_body, (
-        f"Стъпка 3 пропадна: Липсва валута EUR в тялото: {text_body}"
-    )
-
-    # Стъпка 4: Трето пускане на обработката – точно едно писмо за този получател
-    stats_3rd = live_processor.process_pending_events()
-    assert stats_3rd["sent"] == 0, (
-        "Стъпка 4 пропадна: Изпратено е дублирано писмо при 3-тото пускане"
-    )
-    assert stats_3rd["processed"] == 0, (
-        "Стъпка 4 пропадна: Обработено е събитие при 3-тото пускане"
-    )
-
-    # Проверяваме, че писмата за този получател остават точно 1 и след третото пускане
-    final_msgs = _get_messages_for_recipient(customer_email)
-    assert len(final_msgs) == 1, (
-        f"Стъпка 4 пропадна: След третото пускане писмата за {customer_email} не са точно 1 ({len(final_msgs)})"
-    )

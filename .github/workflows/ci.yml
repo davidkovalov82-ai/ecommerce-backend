@@ -30,6 +30,10 @@ jobs:
       SMTP_PORT: "1025"
       SMTP_FROM: "noreply@example.com"
       MAILPIT_WEB_URL: "http://127.0.0.1:8025"
+      RABBITMQ_HOST: 127.0.0.1
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
 
     services:
       postgres:
@@ -53,6 +57,17 @@ jobs:
           - 8025:8025
         options: >-
           --health-cmd "/mailpit readyz"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      rabbitmq:
+        image: rabbitmq:4-management-alpine
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -89,3 +104,115 @@ jobs:
 
       - name: Run all tests
         run: uv run --locked pytest -q
+
+  notifications-checks:
+    name: notifications-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        working-directory: services/notifications
+
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: "5432"
+      DB_USER: notifications
+      DB_PASSWORD: notifications_ci
+      DB_NAME: notifications
+      DB_ADMIN_USER: commerce
+      DB_ADMIN_PASSWORD: commerce_ci
+      DB_ADMIN_NAME: commerce
+      SMTP_HOST: 127.0.0.1
+      SMTP_PORT: "1025"
+      SMTP_FROM: "noreply@example.com"
+      MAILPIT_WEB_URL: "http://127.0.0.1:8025"
+      RABBITMQ_HOST: 127.0.0.1
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: commerce
+          POSTGRES_PASSWORD: commerce_ci
+          POSTGRES_DB: commerce
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U commerce -d commerce"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      mailpit:
+        image: axllent/mailpit:latest
+        ports:
+          - 1025:1025
+          - 8025:8025
+        options: >-
+          --health-cmd "/mailpit readyz"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      rabbitmq:
+        image: rabbitmq:4-management-alpine
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.6"
+
+      - name: Install Python
+        run: uv python install 3.13
+
+      - name: Install locked dependencies
+        run: uv sync --locked --dev --python 3.13
+
+      - name: Check lint
+        run: uv run --locked ruff check .
+
+      - name: Check formatting
+        run: uv run --locked ruff format --check .
+
+      - name: Run notifications tests
+        run: uv run --locked pytest -q
+
+  k4-e2e-checks:
+    name: k4-e2e-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.6"
+
+      - name: Install Python
+        run: uv python install 3.13
+
+      - name: Install locked notifications dependencies for E2E runner
+        working-directory: services/notifications
+        run: uv sync --locked --dev --python 3.13
+
+      - name: Run isolated K4 E2E suite from repository root
+        run: make test-k4-e2e

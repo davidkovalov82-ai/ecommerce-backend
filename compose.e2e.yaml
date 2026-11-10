@@ -1,0 +1,174 @@
+name: commerce-k4-e2e
+
+services:
+  db-e2e:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: pgadmin
+      POSTGRES_PASSWORD: pgadmin_e2e_password
+      POSTGRES_DB: postgres
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pgadmin -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    volumes:
+      - postgres_e2e_data:/var/lib/postgresql/data
+
+  db-init-e2e:
+    image: postgres:17-alpine
+    depends_on:
+      db-e2e:
+        condition: service_healthy
+    environment:
+      DB_HOST: db-e2e
+      POSTGRES_USER: pgadmin
+      POSTGRES_PASSWORD: pgadmin_e2e_password
+      POSTGRES_DB: postgres
+      COMMERCE_APP_USER: commerce_app
+      COMMERCE_APP_PASSWORD: commerce_app
+      COMMERCE_DB_NAME: commerce
+      NOTIF_APP_USER: notifications_app
+      NOTIF_APP_PASSWORD: notifications_app
+      NOTIF_DB_NAME: notifications
+    restart: "no"
+    volumes:
+      - ./scripts/postgres_db_init.sh:/usr/local/bin/postgres_db_init.sh:ro
+    command: ["sh", "/usr/local/bin/postgres_db_init.sh"]
+
+  rabbitmq-e2e:
+    image: rabbitmq:4-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "127.0.0.1:55672:5672"
+      - "127.0.0.1:55673:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - rabbitmq_e2e_data:/var/lib/rabbitmq
+
+  mailpit-e2e:
+    image: axllent/mailpit:latest
+    ports:
+      - "127.0.0.1:51025:1025"
+      - "127.0.0.1:58025:8025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - mailpit_e2e_data:/data
+    environment:
+      MP_DATABASE: /data/mailpit.db
+
+  sms-mock-e2e:
+    image: python:3.13-slim
+    volumes:
+      - ./scripts/e2e_sms_mock.py:/app/e2e_sms_mock.py:ro
+    ports:
+      - "127.0.0.1:58080:8080"
+    command: python /app/e2e_sms_mock.py
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  commerce-api-e2e:
+    build:
+      context: ./services/commerce
+      dockerfile: Dockerfile
+    depends_on:
+      db-init-e2e:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: db-e2e
+      DB_PORT: "5432"
+      DB_USER: commerce_app
+      DB_PASSWORD: commerce_app
+      DB_NAME: commerce
+      JWT_SECRET: k4-e2e-test-jwt-secret-key-at-least-32-bytes-long!
+      STRIPE_MODE: test
+      STRIPE_WEBHOOK_SECRET: whsec_k4_e2e_secret_stripe_commerce_32_bytes_ok
+      SMTP_HOST: mailpit-e2e
+      SMTP_PORT: "1025"
+      SMTP_FROM: noreply@example.com
+      RABBITMQ_HOST: rabbitmq-e2e
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+    ports:
+      - "127.0.0.1:58000:8000"
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/openapi.json', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  commerce-outbox-e2e:
+    build:
+      context: ./services/commerce
+      dockerfile: Dockerfile
+    depends_on:
+      db-init-e2e:
+        condition: service_completed_successfully
+      commerce-api-e2e:
+        condition: service_healthy
+    environment:
+      DB_HOST: db-e2e
+      DB_PORT: "5432"
+      DB_USER: commerce_app
+      DB_PASSWORD: commerce_app
+      DB_NAME: commerce
+      JWT_SECRET: k4-e2e-test-jwt-secret-key-at-least-32-bytes-long!
+      RABBITMQ_HOST: rabbitmq-e2e
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+    command: sh -c "python scripts/process_outbox.py --daemon --poll-interval 0.3"
+
+  notifications-e2e:
+    build:
+      context: ./services/notifications
+      dockerfile: Dockerfile
+    depends_on:
+      db-init-e2e:
+        condition: service_completed_successfully
+      rabbitmq-e2e:
+        condition: service_healthy
+      sms-mock-e2e:
+        condition: service_healthy
+    environment:
+      DB_HOST: db-e2e
+      DB_PORT: "5432"
+      DB_USER: notifications_app
+      DB_PASSWORD: notifications_app
+      DB_NAME: notifications
+      RABBITMQ_HOST: rabbitmq-e2e
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+      SMTP_HOST: mailpit-e2e
+      SMTP_PORT: "1025"
+      SMTP_FROM: noreply@example.com
+      SMS_MODE: test
+      SMS_API_BASE_URL: http://sms-mock-e2e:8080
+      EMAIL_RETRY_DELAY_SECONDS: "1"
+      SMS_RETRY_DELAY_SECONDS: "1"
+      DELIVERY_LEASE_SECONDS: "30"
+      WORKER_POLL_INTERVAL_SECONDS: "0.3"
+    command: sh -c "alembic upgrade head && python -m app.main"
+
+volumes:
+  postgres_e2e_data:
+  rabbitmq_e2e_data:
+  mailpit_e2e_data:

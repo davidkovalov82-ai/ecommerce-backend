@@ -9,8 +9,8 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.modules.accounts.models import User
 from scripts.promote_admin import promote_user
+from tests.conftest import TEST_DB_NAME, TEST_ROLE_NAME, TEST_ROLE_PASSWORD
 
-TEST_DB_NAME = "commerce_test"
 SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "promote_admin.py"
 
 
@@ -21,8 +21,8 @@ def _get_cli_test_env() -> dict[str, str]:
         {
             "DB_HOST": settings.db_host,
             "DB_PORT": str(settings.db_port),
-            "DB_USER": settings.db_user,
-            "DB_PASSWORD": settings.db_password,
+            "DB_USER": TEST_ROLE_NAME,
+            "DB_PASSWORD": TEST_ROLE_PASSWORD,
             "DB_NAME": TEST_DB_NAME,
             "JWT_SECRET": settings.jwt_secret,
         }

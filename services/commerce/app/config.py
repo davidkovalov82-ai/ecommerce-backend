@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     db_user: str = "commerce"
     db_password: str = "commerce"
     db_name: str = "commerce"
+    db_admin_user: str | None = None
+    db_admin_password: str | None = None
+    db_admin_name: str | None = None
 
     jwt_secret: str
     jwt_algorithm: str = "HS256"
@@ -32,6 +35,18 @@ class Settings(BaseSettings):
     smtp_port: int = 1025
     smtp_from: str = "noreply@example.com"
     mailpit_web_url: str = "http://localhost:8025"
+
+    rabbitmq_host: str = "localhost"
+    rabbitmq_port: int = 5672
+    rabbitmq_user: str = "guest"
+    rabbitmq_password: str = "guest"
+    rabbitmq_vhost: str = "/"
+    rabbitmq_exchange: str = "commerce.events"
+    rabbitmq_notifications_queue: str = "notifications.events"
+    rabbitmq_dlx_exchange: str = "notifications.dlx"
+    rabbitmq_dlq_queue: str = "notifications.events.dlq"
+    rabbitmq_dlq_routing_key: str = "notifications.events.dead"
+    rabbitmq_socket_timeout_seconds: float = 5.0
 
     password_reset_base_url: str = "http://localhost:8000/auth/password-reset/confirm"
     password_reset_expire_minutes: int = 15
@@ -79,6 +94,21 @@ class Settings(BaseSettings):
         return (
             f"postgresql+psycopg://{self.db_user}:{self.db_password}"
             f"@{self.db_host}:{self.db_port}/{self.db_name}"
+        )
+
+    @property
+    def admin_database_url(self) -> str:
+        """Административен URL само за управление на изолирани тестови БД/роли."""
+        admin_user = self.db_admin_user or self.db_user
+        admin_password = (
+            self.db_admin_password
+            if self.db_admin_password is not None
+            else self.db_password
+        )
+        admin_name = self.db_admin_name or self.db_name
+        return (
+            f"postgresql+psycopg://{admin_user}:{admin_password}"
+            f"@{self.db_host}:{self.db_port}/{admin_name}"
         )
 
 
