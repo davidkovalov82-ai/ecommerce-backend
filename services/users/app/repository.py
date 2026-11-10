@@ -120,19 +120,3 @@ class UserRepository:
                     text(f"SELECT setval('{seq}', :new_val, true)"),
                     {"new_val": max_id},
                 )
-
-            max_id = self._session.scalar(text(f"SELECT MAX(id) FROM {table}"))
-            if max_id is None:
-                continue
-
-            seq_row = self._session.execute(
-                text(f"SELECT last_value, is_called FROM {seq}")
-            ).mappings().one()
-            curr_val = int(seq_row["last_value"])
-            is_called = bool(seq_row["is_called"])
-
-            if max_id > curr_val or (max_id == curr_val and not is_called):
-                self._session.execute(
-                    text(f"SELECT setval('{seq}', :new_val, true)"),
-                    {"new_val": max_id},
-                )

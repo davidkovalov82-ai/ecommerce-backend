@@ -52,7 +52,9 @@ class MigrationStats:
     @property
     def total_skipped(self) -> int:
         return (
-            self.users_skipped + self.moderation_logs_skipped + self.reset_tokens_skipped
+            self.users_skipped
+            + self.moderation_logs_skipped
+            + self.reset_tokens_skipped
         )
 
 
@@ -70,20 +72,6 @@ def _validate_distinct_databases(commerce_engine: Engine, users_engine: Engine) 
             raise AccountMigrationError(
                 "Source and target databases must be different databases"
             )
-
-
-def _validate_distinct_databases(commerce_engine: Engine, users_engine: Engine) -> None:
-    """Проверява, че изходната и целевата база данни са различни."""
-    with commerce_engine.connect() as c_conn, users_engine.connect() as u_conn:
-        c_db = c_conn.scalar(text("SELECT current_database()"))
-        u_db = u_conn.scalar(text("SELECT current_database()"))
-        c_host = c_conn.scalar(text("SELECT inet_server_addr()"))
-        u_host = u_conn.scalar(text("SELECT inet_server_addr()"))
-        c_port = c_conn.scalar(text("SELECT inet_server_port()"))
-        u_port = u_conn.scalar(text("SELECT inet_server_port()"))
-
-        if c_db == u_db and c_host == u_host and c_port == u_port:
-            raise AccountMigrationError("Source and target databases must be different databases")
 
 
 def _fetch_source_records(commerce_engine: Engine) -> dict[str, list[dict[str, Any]]]:
@@ -386,28 +374,21 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args, is_dry_run = parse_migration_args(parser, argv)
 
-    has_dry_run = args.dry_run or (args.mode == "dry-run")
-    has_apply = args.apply or (args.mode == "apply")
-
-    if has_dry_run and has_apply:
-        parser.error("Conflicting mode options: specify either --dry-run or --apply, not both.")
-
-    # По подразбиране е dry-run
-    is_dry_run = not has_apply
-    return args, is_dry_run
-
-
-def main(argv: list[str] | None = None) -> None:
-    parser = build_parser()
-    args, is_dry_run = parse_migration_args(parser, argv)
-
-    c_engine = create_engine(args.commerce_url, pool_pre_ping=True)
-    u_engine = create_engine(args.users_url, pool_pre_ping=True)
-
-    mode_label = "DRY-RUN (симулация без запис)" if is_dry_run else "APPLY (запис)"
-    print(f"Стартиране на пренос на акаунти в режим: {mode_label}")
+    c_engine: Engine | None = None
+    u_engine: Engine | None = None
 
     try:
+        try:
+            c_engine = create_engine(args.commerce_url, pool_pre_ping=True)
+            u_engine = create_engine(args.users_url, pool_pre_ping=True)
+        except Exception as exc:  # noqa: BLE001
+            raise AccountMigrationError(
+                f"Failed to initialize database engine ({type(exc).__name__})"
+            ) from None
+
+        mode_label = "DRY-RUN (симулация без запис)" if is_dry_run else "APPLY (запис)"
+        print(f"Стартиране на пренос на акаунти в режим: {mode_label}")
+
         stats = migrate_commerce_accounts(c_engine, u_engine, dry_run=is_dry_run)
         action_verb = "биха били добавени" if is_dry_run else "добавени"
         print(
@@ -422,17 +403,15 @@ def main(argv: list[str] | None = None) -> None:
     except Exception as exc:  # noqa: BLE001
         # Без показване на SQL параметри, пароли или connection strings
         print(
-            f"ГРЕШКА ПРИ ПРЕНОСА: неочаквана грешка ({type(exc).__name__})",
+            f"ГРЕШКА ПРИ ПРЕНОСА: грешка при връзка или изпълнение ({type(exc).__name__})",
             file=sys.stderr,
         )
         sys.exit(1)
-    except Exception as exc:  # noqa: BLE001
-        # Без показване на SQL параметри, пароли или connection strings
-        print(f"ГРЕШКА ПРИ ПРЕНОСА: неочаквана грешка ({type(exc).__name__})", file=sys.stderr)
-        sys.exit(1)
     finally:
-        c_engine.dispose()
-        u_engine.dispose()
+        if c_engine is not None:
+            c_engine.dispose()
+        if u_engine is not None:
+            u_engine.dispose()
 
 
 if __name__ == "__main__":

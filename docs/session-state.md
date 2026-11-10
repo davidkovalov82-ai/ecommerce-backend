@@ -1,19 +1,15 @@
 # Session State
 
-- **Текуща задача**: Етап K6.1 — доработка на миграцията Commerce → Users (валидация на БД, защита на sequences, хигиена на грешките, README).
+- **Текуща задача**: Етап K6.1 — поправка на users-checks (чисти дефиниции, защита на тайни в URL, коректно освобождаване на DB движки).
 - **Реализирано**:
-  - `migrate_from_commerce.py`: dry-run по подразбиране; валидация отхвърляща `--dry-run --apply` преди свързване към БД.
-  - Валидация за различни бази данни и за наличие на трите задължителни таблици в източника (без промени по целта при грешка).
-  - `UserRepository.sync_sequences()`: не намалява ID броячите, ако вече изпреварват `max(id)`; повторен apply не ги променя.
-  - Саниране на грешките: ясна причина в `stderr` без изтичане на email адреси, хешове, SQL параметри и connection strings.
-  - `README.md`: описани условията за финален cutover (замразяване на Commerce, затворен Users) и работа само на изолирани бази.
-  - `test_migrate_from_commerce.py`: разширен до 9 интеграционни теста покриващи всички нови изисквания.
+  - `migrate_from_commerce.py`: единични `_validate_distinct_databases` и `main`; валидация на аргументи преди engine; прихващане на грешки при инициализация на engine без изтичане на пароли/URL; освобождаване само на успешно създадените движки.
+  - `app/repository.py`: премахнат дублираният SQL блок в `sync_sequences()`.
+  - `test_migrate_from_commerce.py`: премахнати петте дублирани теста; добавен сценарий за невалиден URL с фиктивен секрет без изтичане в stderr или traceback (10 теста).
 - **Проверено локално**:
-  - `services/users`: `pytest tests/test_migrate_from_commerce.py` (9 passed);
-  - `services/users`: `pytest -q` (53 passed, 1 warning);
-  - `services/users`: `ruff check .` и `ruff format --check .` (32 files);
-  - `services/commerce` и `services/payments`: ruff check & format --check (115 и 32 files).
-- **Непроверено**: превключване на Commerce API или авторизация към Users (това е само репетиция на преноса).
+  - `services/users`: `ruff check .` и `ruff format --check .` (All checks passed, 32 files);
+  - `services/users`: `pytest -q` (54 passed, 1 warning in 6.65s);
+  - `services/users`: `pytest tests/test_migrate_from_commerce.py -v` (10 passed in 2.65s).
+- **Непроверено**: превключване на Commerce API или авторизация към Users.
 - **Работещи команди**: `cd services/users && uv run --locked pytest tests/test_migrate_from_commerce.py`.
-- **Засегнати файлове**: `services/users/{scripts/migrate_from_commerce.py,app/repository.py,tests/test_migrate_from_commerce.py,README.md}`, `docs/session-state.md`.
+- **Засегнати файлове**: `services/users/{scripts/migrate_from_commerce.py,app/repository.py,tests/test_migrate_from_commerce.py}`, `docs/session-state.md`.
 - **Следваща стъпка**: Верификация на RS256 JWT токени от Users в Commerce и пренасочване на маршрутите за акаунти.
