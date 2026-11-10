@@ -1,7 +1,7 @@
 import datetime
 from collections.abc import Sequence
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.orm import Session
 
 from app.modules.accounts.models import AccountModerationLog, PasswordResetToken, User
@@ -28,6 +28,13 @@ class UserRepository:
             return []
         stmt = select(User).where(User.id.in_(user_ids))
         return self._session.scalars(stmt).all()
+
+    def lock_user(self, user_id: int) -> None:
+        """Заключва операциите за даден потребител чрез транзакционен advisory lock (без четене от users)."""
+        self._session.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_key)"),
+            {"lock_key": user_id},
+        )
 
     def lock_by_id(self, user_id: int) -> User | None:
         """Заключва реда на потребителя с FOR UPDATE и опреснява данните му от БД."""

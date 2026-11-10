@@ -236,13 +236,13 @@ def test_parallel_checkout_and_cart_modification(
     op2_about_to_lock = threading.Event()
     op1_proceed = threading.Event()
 
-    original_lock_by_id = UserRepository.lock_by_id
+    original_lock_user = UserRepository.lock_user
 
-    def _sync_lock_by_id(self: UserRepository, user_id: int):
+    def _sync_lock_user(self: UserRepository, user_id: int):
         op = self._session.info.get("operation")
         if op == first_op:
             # 1. Първата операция действително придобива DB блокировката:
-            user_row = original_lock_by_id(self, user_id)
+            res = original_lock_user(self, user_id)
             op1_locked.set()
 
             # 3. Първата операция получава разрешение да продължи:
@@ -250,7 +250,7 @@ def test_parallel_checkout_and_cart_modification(
                 raise TimeoutError(
                     f"Operation 1 ({first_op}) timed out waiting for permission to proceed"
                 )
-            return user_row
+            return res
 
         if op == second_op:
             # Изчакваме първата операция действително да придобие DB блокировката:
@@ -265,11 +265,11 @@ def test_parallel_checkout_and_cart_modification(
             op1_proceed.set()
 
             # Втората операция се опитва да придобие същата блокировка (блокира се в PostgreSQL):
-            return original_lock_by_id(self, user_id)
+            return original_lock_user(self, user_id)
 
-        return original_lock_by_id(self, user_id)
+        return original_lock_user(self, user_id)
 
-    monkeypatch.setattr(UserRepository, "lock_by_id", _sync_lock_by_id)
+    monkeypatch.setattr(UserRepository, "lock_user", _sync_lock_user)
 
     idempotency_key = str(uuid.uuid4())
 

@@ -1,8 +1,10 @@
 """SQLAlchemy ORM модели за микросервиса Users."""
 
 import datetime
+from typing import Any
 
 from sqlalchemy import (
+    JSON,
     DateTime,
     ForeignKey,
     Integer,
@@ -100,4 +102,30 @@ class AccountModerationLog(Base):
         nullable=False,
         default=lambda: datetime.datetime.now(datetime.UTC),
         server_default=func.now(),
+    )
+
+
+class UserOutboxEvent(Base):
+    """SQLAlchemy ORM модел за outbox събития при промяна на потребителски статус."""
+
+    __tablename__ = "user_outbox_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[str] = mapped_column(
+        String(64), unique=True, index=True, nullable=False
+    )
+    event_type: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    event_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    occurred_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.datetime.now(datetime.UTC),
+        server_default=func.now(),
+    )
+    user_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    published_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
     )

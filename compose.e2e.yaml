@@ -234,6 +234,10 @@ services:
       SMTP_HOST: mailpit-e2e
       SMTP_PORT: "1025"
       SMTP_FROM: noreply@example.com
+      RABBITMQ_HOST: rabbitmq-e2e
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
     ports:
       - "127.0.0.1:58002:8002"
     volumes:
@@ -372,6 +376,52 @@ services:
       DELIVERY_LEASE_SECONDS: "30"
       WORKER_POLL_INTERVAL_SECONDS: "0.25"
     command: sh -c "alembic upgrade head && python -m app.main"
+
+  commerce-user-consumer-e2e:
+    build:
+      context: ./services/commerce
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      commerce-migrations-e2e:
+        condition: service_completed_successfully
+      commerce-api-e2e:
+        condition: service_healthy
+      rabbitmq-e2e:
+        condition: service_healthy
+    environment:
+      DB_HOST: db-e2e
+      DB_PORT: "5432"
+      DB_USER: commerce_app
+      DB_PASSWORD: commerce_app
+      DB_NAME: commerce
+      RABBITMQ_HOST: rabbitmq-e2e
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+    command: sh -c "python scripts/consume_user_events.py --daemon"
+
+  users-outbox-e2e:
+    build:
+      context: ./services/users
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      users-e2e:
+        condition: service_healthy
+      rabbitmq-e2e:
+        condition: service_healthy
+    environment:
+      DB_HOST: db-e2e
+      DB_PORT: "5432"
+      DB_USER: users_app
+      DB_PASSWORD: users_app
+      DB_NAME: users
+      RABBITMQ_HOST: rabbitmq-e2e
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+    command: sh -c "python scripts/process_outbox.py --daemon --poll-interval 0.2"
 
 volumes:
   postgres_e2e_data:

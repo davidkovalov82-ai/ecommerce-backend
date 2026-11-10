@@ -274,6 +274,10 @@ services:
       SMTP_HOST: ${SMTP_HOST:-mailpit}
       SMTP_PORT: ${SMTP_PORT:-1025}
       SMTP_FROM: ${SMTP_FROM:-noreply@example.com}
+      RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
+      RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
     ports:
       - "8002:8002"
     volumes:
@@ -285,6 +289,56 @@ services:
       timeout: 3s
       retries: 15
     command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8002"
+
+  commerce-user-consumer:
+    build:
+      context: ./services/commerce
+      dockerfile: Dockerfile
+    container_name: commerce-user-consumer
+    restart: unless-stopped
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      api:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: ${COMMERCE_DB_USER:-commerce_app}
+      DB_PASSWORD: ${COMMERCE_DB_PASSWORD:-commerce_app}
+      DB_NAME: commerce
+      RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
+      RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+    command: sh -c "python scripts/consume_user_events.py --daemon"
+
+  users-outbox:
+    build:
+      context: ./services/users
+      dockerfile: Dockerfile
+    container_name: users-outbox
+    restart: unless-stopped
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      users:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: ${USERS_DB_USER:-users}
+      DB_PASSWORD: ${USERS_DB_PASSWORD:-users}
+      DB_NAME: users
+      RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
+      RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+    command: sh -c "python scripts/process_outbox.py --daemon --poll-interval 1.0"
 
 volumes:
   postgres_data:

@@ -10,7 +10,6 @@ from app.config import settings
 from app.modules.accounts.repository import UserRepository
 from app.modules.accounts.users_client import (
     UsersClient,
-    UsersServiceAuthError,
     UsersServiceUnavailableError,
 )
 from app.modules.cart.repository import CartRepository
@@ -113,7 +112,9 @@ class OrderService:
         self._order_repository = order_repository
         self._cart_repository = cart_repository
         self._product_repository = product_repository
-        self._user_repository = user_repository
+        self._user_repository = user_repository or (
+            UserRepository(session) if session is not None else None
+        )
         self._session = session
         self._payments_client = payments_client or HttpPaymentsClient()
         self._users_client = users_client or UsersClient()
@@ -143,11 +144,10 @@ class OrderService:
         11. Commit на транзакцията.
         """
         try:
-            # 1. Обща DB блокировка за текущия потребител
-            user_row = None
+            # 1. Единна DB блокировка за текущия потребител по user_id
             if self._user_repository is not None:
-                user_row = self._user_repository.lock_by_id(user_id)
-            if user_row is None:
+                self._user_repository.lock_user(user_id)
+            elif self._session is not None:
                 self._session.execute(
                     text("SELECT pg_advisory_xact_lock(:lock_key)"),
                     {"lock_key": user_id},
@@ -423,21 +423,13 @@ class OrderService:
             else:
                 order.fulfillment_status = "partially_shipped"
 
-            # Намиране на контактите на купувача за известието (избягваме логиране на PII)
+            # Намиране на контактите на купувача за известието от записания email в поръчката
             customer_email = order.customer_email
-            if not customer_email and self._user_repository is not None:
-                customer = self._user_repository.get_by_id(order.user_id)
-                customer_email = customer.email if customer else ""
-            if not customer_email and self._users_client is not None:
-                try:
-                    remote_u = self._users_client.get_user_status(order.user_id)
-                    if remote_u:
-                        customer_email = remote_u.email
-                except (UsersServiceUnavailableError, UsersServiceAuthError):
-                    logger.warning(
-                        "Failed to fetch customer email for order_id=%d", order.id
-                    )
-            customer_email = customer_email or ""
+            if not customer_email:
+                from app.modules.accounts.models import User
+
+                user_row = self._session.query(User).filter_by(id=order.user_id).first()
+                customer_email = user_row.email if (user_row and user_row.email) else ""
             customer_phone = (order.shipping_phone or "").strip() or None
 
             # Позиции само за този продавач
@@ -516,19 +508,11 @@ class OrderService:
             return
 
         customer_email = order.customer_email
-        if not customer_email and self._user_repository is not None:
-            user = self._user_repository.get_by_id(order.user_id)
-            customer_email = user.email if user else ""
-        if not customer_email and self._users_client is not None:
-            try:
-                remote_u = self._users_client.get_user_status(order.user_id)
-                if remote_u:
-                    customer_email = remote_u.email
-            except (UsersServiceUnavailableError, UsersServiceAuthError):
-                logger.warning(
-                    "Failed to fetch customer email for order_id=%d", order.id
-                )
-        customer_email = customer_email or ""
+        if not customer_email:
+            from app.modules.accounts.models import User
+
+            user_row = self._session.query(User).filter_by(id=order.user_id).first()
+            customer_email = user_row.email if (user_row and user_row.email) else ""
         customer_phone = (order.shipping_phone or "").strip() or None
         now = datetime.datetime.now(datetime.UTC)
 

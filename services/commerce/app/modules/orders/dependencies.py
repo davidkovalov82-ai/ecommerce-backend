@@ -3,8 +3,7 @@ from typing import Annotated
 from fastapi import Depends
 
 from app.dependencies import DbSession
-from app.modules.accounts.dependencies import get_user_repository, get_users_client
-from app.modules.accounts.repository import UserRepository
+from app.modules.accounts.dependencies import get_users_client
 from app.modules.accounts.users_client import UsersClient
 from app.modules.cart.dependencies import get_cart_repository
 from app.modules.cart.repository import CartRepository
@@ -30,7 +29,6 @@ def get_order_service(
     order_repository: Annotated[OrderRepository, Depends(get_order_repository)],
     cart_repository: Annotated[CartRepository, Depends(get_cart_repository)],
     product_repository: Annotated[ProductRepository, Depends(get_product_repository)],
-    user_repository: Annotated[UserRepository, Depends(get_user_repository)],
     payments_client: Annotated[PaymentsClient, Depends(get_payments_client)],
     users_client: Annotated[UsersClient, Depends(get_users_client)],
 ) -> OrderService:
@@ -39,7 +37,6 @@ def get_order_service(
         order_repository=order_repository,
         cart_repository=cart_repository,
         product_repository=product_repository,
-        user_repository=user_repository,
         session=session,
         payments_client=payments_client,
         users_client=users_client,

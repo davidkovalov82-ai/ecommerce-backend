@@ -83,11 +83,17 @@ def _create_order(
     product: Product,
     quantity: int = 2,
     status: str = "pending_payment",
+    customer_email: str | None = None,
 ) -> Order:
     """Директно създава поръчка със запазена позиция и резервиран stock."""
+    if customer_email is None:
+        user = db_session.query(User).filter_by(id=user_id).first()
+        customer_email = user.email if user else "customer@example.com"
+
     total_minor = product.price_minor * quantity
     order = Order(
         user_id=user_id,
+        customer_email=customer_email,
         status=status,
         currency="EUR",
         total_minor=total_minor,

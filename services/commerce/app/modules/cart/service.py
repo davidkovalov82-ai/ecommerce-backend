@@ -1,17 +1,11 @@
 import logging
+from typing import Any
 
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.modules.accounts.repository import UserRepository
-from app.modules.accounts.users_client import (
-    UsersClient,
-    UsersServiceAuthError,
-    UsersServiceUnavailableError,
-)
 from app.modules.cart.repository import CartRepository
 from app.modules.cart.schemas import CartItemResponse, CartResponse
-from app.modules.catalog.repository import ProductRepository
+from app.modules.catalog.repository import ProductRepository, SellerStatusRepository
 from app.modules.catalog.service import ProductNotFound
 
 logger = logging.getLogger(__name__)
@@ -29,13 +23,18 @@ class CartService:
         cart_repository: CartRepository,
         product_repository: ProductRepository,
         session: Session,
-        user_repository: UserRepository | None = None,
-        users_client: UsersClient | None = None,
+        seller_status_repository: SellerStatusRepository | None = None,
+        user_repository: Any = None,
+        users_client: Any = None,
     ) -> None:
         self._cart_repository = cart_repository
         self._product_repository = product_repository
-        self._user_repository = user_repository
-        self._users_client = users_client or UsersClient()
+        self._seller_status_repository = (
+            seller_status_repository or SellerStatusRepository(session)
+        )
+        from app.modules.accounts.repository import UserRepository
+
+        self._user_repository = user_repository or UserRepository(session)
         self._session = session
 
     def get_cart(self, user_id: int) -> CartResponse:
@@ -43,6 +42,7 @@ class CartService:
 
         Извлича продуктите групово чрез една IN заявка за избягване на N+1 проблем.
         Актуалните цени и наличности идват директно от каталога.
+        Статусът на продавачите се проверява през локалния регистър за видимост (без зависимост от Users HTTP).
         """
         cart_items = self._cart_repository.list_by_user_id(user_id)
         if not cart_items:
@@ -53,22 +53,7 @@ class CartService:
         products_by_id = {product.id: product for product in products}
 
         seller_ids = [p.seller_id for p in products]
-        sellers_by_id: dict[int, object] = {}
-        if self._user_repository is not None:
-            sellers = self._user_repository.get_by_ids(seller_ids)
-            sellers_by_id = {u.id: u for u in sellers}
-
-        if self._users_client is not None:
-            for sid in seller_ids:
-                if sid not in sellers_by_id:
-                    try:
-                        remote_seller = self._users_client.get_user_status(sid)
-                        if remote_seller:
-                            sellers_by_id[sid] = remote_seller
-                    except (UsersServiceUnavailableError, UsersServiceAuthError):
-                        logger.warning(
-                            "Failed to fetch seller status for seller_id=%d", sid
-                        )
+        seller_statuses = self._seller_status_repository.get_by_ids(seller_ids)
 
         item_responses: list[CartItemResponse] = []
         total_minor = 0
@@ -78,11 +63,15 @@ class CartService:
             if product is None:
                 continue
 
-            seller = sellers_by_id.get(product.seller_id)
-            if seller is not None:
-                is_seller_active = getattr(seller, "status", None) == "active"
-            else:
-                is_seller_active = True
+            status = seller_statuses.get(product.seller_id)
+            if status is None:
+                from app.modules.accounts.models import User
+
+                user_row = (
+                    self._session.query(User).filter_by(id=product.seller_id).first()
+                )
+                status = user_row.status if user_row else "active"
+            is_seller_active = status == "active"
 
             subtotal_minor = product.price_minor * item.quantity
             total_minor += subtotal_minor
@@ -122,14 +111,7 @@ class CartService:
         Управлява транзакционната граница (commit/rollback).
         """
         try:
-            user_row = None
-            if self._user_repository is not None:
-                user_row = self._user_repository.lock_by_id(user_id)
-            if user_row is None:
-                self._session.execute(
-                    text("SELECT pg_advisory_xact_lock(:lock_key)"),
-                    {"lock_key": user_id},
-                )
+            self._user_repository.lock_user(user_id)
 
             product = self._product_repository.get_active_by_id(product_id)
             if product is None:
@@ -157,14 +139,7 @@ class CartService:
         Идемпотентна операция. Управлява транзакционната граница (commit/rollback).
         """
         try:
-            user_row = None
-            if self._user_repository is not None:
-                user_row = self._user_repository.lock_by_id(user_id)
-            if user_row is None:
-                self._session.execute(
-                    text("SELECT pg_advisory_xact_lock(:lock_key)"),
-                    {"lock_key": user_id},
-                )
+            self._user_repository.lock_user(user_id)
 
             self._cart_repository.delete_item(user_id=user_id, product_id=product_id)
             self._session.commit()

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 import uuid
 
@@ -159,6 +160,35 @@ def main() -> None:
     buyer_headers = {"Authorization": f"Bearer {buyer_token}"}
     print(f"    Buyer registered (ID={buyer_id}) and authenticated.")
 
+    # 3.1. Купувачът вижда стоката в каталога и я добавя в количката
+    print("==> Step 3.1: Buyer sees product in catalog (list & card) and adds to cart")
+    cat_initial = httpx.get(f"{COMMERCE_API_URL}/products", timeout=10.0)
+    assert cat_initial.status_code == 200
+    assert any(p["id"] == valid_product_id for p in cat_initial.json()["items"]), (
+        "Product missing from catalog list!"
+    )
+    card_initial = httpx.get(
+        f"{COMMERCE_API_URL}/products/{valid_product_id}", timeout=10.0
+    )
+    assert card_initial.status_code == 200
+    assert card_initial.json()["title"] == "E2E Тестов артикул"
+
+    put_initial = httpx.put(
+        f"{COMMERCE_API_URL}/cart/items/{valid_product_id}",
+        headers=buyer_headers,
+        json={"quantity": 2},
+        timeout=10.0,
+    )
+    assert put_initial.status_code == 200
+    cart_pre = httpx.get(
+        f"{COMMERCE_API_URL}/cart", headers=buyer_headers, timeout=10.0
+    ).json()
+    item_pre = next(i for i in cart_pre["items"] if i["product_id"] == valid_product_id)
+    assert item_pre["available"] is True, f"Expected available=True, got {item_pre}"
+    print(
+        "    Product verified in catalog list and card, added to cart (available=True)."
+    )
+
     # 4. Отрицателен сценарий A: Артикул с несъществуващ продавач в Users (seller_id=999999)
     print(
         "==> Step 4A: Negative scenario - order with non-existent seller (seller_id=999999)"
@@ -205,20 +235,25 @@ def main() -> None:
     cart_check = httpx.get(
         f"{COMMERCE_API_URL}/cart", headers=buyer_headers, timeout=10.0
     ).json()
-    assert len(cart_check["items"]) == 1, "Cart was unexpectedly cleared!"
+    assert len(cart_check["items"]) == 2, "Cart was unexpectedly cleared!"
     del_res = httpx.delete(
         f"{COMMERCE_API_URL}/cart/items/{invalid_prod_id}",
         headers=buyer_headers,
         timeout=10.0,
     )
     assert del_res.status_code in (200, 204)
+    cart_after_del = httpx.get(
+        f"{COMMERCE_API_URL}/cart", headers=buyer_headers, timeout=10.0
+    ).json()
+    assert len(cart_after_del["items"]) == 1
+    assert cart_after_del["items"][0]["product_id"] == valid_product_id
     print(
         "    Negative scenario A confirmed: 409 CART_PRODUCT_UNAVAILABLE, state preserved."
     )
 
-    # 4B. Отрицателен сценарий B: Блокиран продавач през реалния API на Users
+    # 4B. Сценарий: Блокиране на продавач през Users API -> Събитие към Commerce -> Каталог и количка
     print(
-        "==> Step 4B: Negative scenario - order rejection when seller is blocked via API"
+        "==> Step 4B: Seller blocked via API -> Event processor propagates visibility to Commerce"
     )
     block_res = httpx.post(
         f"{COMMERCE_API_URL}/users/{seller_id}/block",
@@ -229,15 +264,47 @@ def main() -> None:
     assert block_res.status_code == 200, f"Failed blocking seller: {block_res.text}"
     assert block_res.json()["status"] == "blocked"
 
-    # Купувачът добавя артикула на блокирания продавач
-    put_blocked = httpx.put(
-        f"{COMMERCE_API_URL}/cart/items/{valid_product_id}",
-        headers=buyer_headers,
-        json={"quantity": 2},
-        timeout=10.0,
+    # Изчакваме събитието за блокиране (Users outbox -> RabbitMQ -> Commerce consumer -> seller_statuses)
+    start_wait = time.time()
+    block_event_delivered = False
+    while time.time() - start_wait < 15.0:
+        check_card = httpx.get(
+            f"{COMMERCE_API_URL}/products/{valid_product_id}", timeout=2.0
+        )
+        if check_card.status_code == 404:
+            block_event_delivered = True
+            break
+        time.sleep(0.5)
+    assert block_event_delivered, (
+        "Timed out waiting for seller block event to be processed in Commerce!"
     )
-    assert put_blocked.status_code == 200
 
+    # Продуктът изчезва от списъка на публичния каталог
+    cat_post_block = httpx.get(f"{COMMERCE_API_URL}/products", timeout=10.0).json()
+    assert not any(p["id"] == valid_product_id for p in cat_post_block["items"]), (
+        "Blocked seller product still visible in public catalog list!"
+    )
+
+    # Публичната карточка на продукта връща 404
+    card_post_block = httpx.get(
+        f"{COMMERCE_API_URL}/products/{valid_product_id}", timeout=10.0
+    )
+    assert card_post_block.status_code == 404, (
+        f"Expected 404 for product card of blocked seller, got {card_post_block.status_code}"
+    )
+
+    # Вече добавената позиция остава в количката на купувача, но с признак available: false
+    cart_check_b = httpx.get(
+        f"{COMMERCE_API_URL}/cart", headers=buyer_headers, timeout=10.0
+    ).json()
+    assert len(cart_check_b["items"]) == 1
+    item_blocked = cart_check_b["items"][0]
+    assert item_blocked["product_id"] == valid_product_id
+    assert item_blocked["available"] is False, (
+        f"Expected item available=False, got: {item_blocked}"
+    )
+
+    # Опитът за поръчка на блокирания продавач се отхвърля с 409
     fail_blocked_res = httpx.post(
         f"{COMMERCE_API_URL}/orders",
         headers={**buyer_headers, "Idempotency-Key": str(uuid.uuid4())},
@@ -254,15 +321,14 @@ def main() -> None:
         assert cur.fetchone()[0] == 0
         cur.execute("SELECT stock FROM products WHERE id = %s", (valid_product_id,))
         assert cur.fetchone()[0] == 10
-    cart_check_b = httpx.get(
-        f"{COMMERCE_API_URL}/cart", headers=buyer_headers, timeout=10.0
-    ).json()
-    assert len(cart_check_b["items"]) == 1
     print(
-        "    Negative scenario B confirmed: 409 CART_PRODUCT_UNAVAILABLE after seller block."
+        "    Block verified: hidden from catalog & card (404), item available=False in cart, checkout rejected (409)."
     )
 
-    # Отблокиране на продавача през API
+    # 4C. Отблокиране на продавача през API -> Събитие към Commerce -> Продуктът отново е видим и достъпен
+    print(
+        "==> Step 4C: Seller unblocked -> Product becomes visible in catalog and available in cart"
+    )
     unblock_res = httpx.post(
         f"{COMMERCE_API_URL}/users/{seller_id}/unblock",
         headers=admin_headers,
@@ -270,7 +336,92 @@ def main() -> None:
     )
     assert unblock_res.status_code == 200
     assert unblock_res.json()["status"] == "active"
-    print("    Seller successfully unblocked.")
+
+    # Изчакваме събитието за отблокиране
+    start_wait = time.time()
+    unblock_event_delivered = False
+    while time.time() - start_wait < 15.0:
+        check_card = httpx.get(
+            f"{COMMERCE_API_URL}/products/{valid_product_id}", timeout=2.0
+        )
+        if check_card.status_code == 200:
+            unblock_event_delivered = True
+            break
+        time.sleep(0.5)
+    assert unblock_event_delivered, (
+        "Timed out waiting for seller unblock event to be processed in Commerce!"
+    )
+
+    # Продуктът отново е видим в списъка на каталога и на карточката
+    cat_post_unblock = httpx.get(f"{COMMERCE_API_URL}/products", timeout=10.0).json()
+    assert any(p["id"] == valid_product_id for p in cat_post_unblock["items"]), (
+        "Unblocked seller product not visible in catalog list!"
+    )
+    card_post_unblock = httpx.get(
+        f"{COMMERCE_API_URL}/products/{valid_product_id}", timeout=10.0
+    )
+    assert card_post_unblock.status_code == 200
+
+    # В количката позицията отново е налична (available: true)
+    cart_post_unblock = httpx.get(
+        f"{COMMERCE_API_URL}/cart", headers=buyer_headers, timeout=10.0
+    ).json()
+    item_unblocked = next(
+        i for i in cart_post_unblock["items"] if i["product_id"] == valid_product_id
+    )
+    assert item_unblocked["available"] is True, (
+        f"Expected item available=True, got: {item_unblocked}"
+    )
+    print(
+        "    Unblock verified: product visible in catalog & card (200), item available=True in cart."
+    )
+
+    # 4D. Проверка при спрян Users: Публичният каталог работи локално, а checkout връща 503
+    print(
+        "==> Step 4D: Users stopped -> Public catalog readable locally, Checkout returns 503"
+    )
+    compose_cmd = ["docker", "compose"]
+    proj = os.environ.get("COMPOSE_PROJECT_NAME")
+    cfile = os.environ.get("COMPOSE_FILE")
+    if proj:
+        compose_cmd.extend(["-p", proj])
+    if cfile:
+        compose_cmd.extend(["-f", cfile])
+
+    subprocess.run([*compose_cmd, "stop", "users-e2e"], check=True)
+    time.sleep(1.0)
+
+    try:
+        # Публичният каталог продължава да се чете локално от Commerce
+        cat_down = httpx.get(f"{COMMERCE_API_URL}/products", timeout=5.0)
+        assert cat_down.status_code == 200, (
+            f"Catalog list failed with status {cat_down.status_code} when Users is stopped!"
+        )
+        card_down = httpx.get(
+            f"{COMMERCE_API_URL}/products/{valid_product_id}", timeout=5.0
+        )
+        assert card_down.status_code == 200, (
+            f"Product card failed with status {card_down.status_code} when Users is stopped!"
+        )
+
+        # Checkout прави проверка на живо в Users и връща 503
+        fail_down_res = httpx.post(
+            f"{COMMERCE_API_URL}/orders",
+            headers={**buyer_headers, "Idempotency-Key": str(uuid.uuid4())},
+            json=ORDER_PAYLOAD,
+            timeout=5.0,
+        )
+        assert fail_down_res.status_code == 503, (
+            f"Expected 503 USERS_SERVICE_UNAVAILABLE, got {fail_down_res.status_code}: {fail_down_res.text}"
+        )
+        assert fail_down_res.json()["detail"]["code"] == "USERS_SERVICE_UNAVAILABLE"
+        print(
+            "    Users down verified: Catalog list & card 200 OK locally; Checkout returns 503 USERS_SERVICE_UNAVAILABLE."
+        )
+    finally:
+        subprocess.run([*compose_cmd, "start", "users-e2e"], check=True)
+        wait_for_services()
+        print("    Users restarted and healthy.")
 
     # 5. Положителен сценарий: Покупка на артикул от активен продавач (утвърден от Users)
     print(
@@ -357,6 +508,22 @@ def main() -> None:
     assert prod_s2_res.status_code == 201
     s2_prod_id = prod_s2_res.json()["id"]
 
+    # Купувачът добавя артикул 1 (на активния продавач) и артикул 2 (на втория продавач)
+    put1 = httpx.put(
+        f"{COMMERCE_API_URL}/cart/items/{valid_product_id}",
+        headers=buyer_headers,
+        json={"quantity": 2},
+        timeout=10.0,
+    )
+    assert put1.status_code == 200
+    put2 = httpx.put(
+        f"{COMMERCE_API_URL}/cart/items/{s2_prod_id}",
+        headers=buyer_headers,
+        json={"quantity": 3},
+        timeout=10.0,
+    )
+    assert put2.status_code == 200
+
     # Блокираме втория продавач
     block_s2 = httpx.post(
         f"{COMMERCE_API_URL}/users/{s2_id}/block",
@@ -365,18 +532,22 @@ def main() -> None:
     )
     assert block_s2.status_code == 200
 
-    # Купувачът добавя артикул 1 (на активния продавач) и артикул 2 (на блокирания продавач)
-    httpx.put(
-        f"{COMMERCE_API_URL}/cart/items/{valid_product_id}",
-        headers=buyer_headers,
-        json={"quantity": 2},
-        timeout=10.0,
-    )
-    httpx.put(
-        f"{COMMERCE_API_URL}/cart/items/{s2_prod_id}",
-        headers=buyer_headers,
-        json={"quantity": 3},
-        timeout=10.0,
+    # Изчакваме събитието за блокиране (продуктът на продавач 2 става unavailable в количката)
+    start_wait = time.time()
+    s2_blocked_in_cart = False
+    while time.time() - start_wait < 15.0:
+        c_check = httpx.get(
+            f"{COMMERCE_API_URL}/cart", headers=buyer_headers, timeout=2.0
+        ).json()
+        item2 = next(
+            (i for i in c_check["items"] if i["product_id"] == s2_prod_id), None
+        )
+        if item2 and item2.get("available") is False:
+            s2_blocked_in_cart = True
+            break
+        time.sleep(0.5)
+    assert s2_blocked_in_cart, (
+        "Timed out waiting for seller 2 block to reflect in cart!"
     )
 
     # Опит за поръчка: отказва целия чек-аут
@@ -406,13 +577,30 @@ def main() -> None:
         "    Multi-seller rejection confirmed: partial order prevented, both stocks intact."
     )
 
-    # Отблокираме Продавач 2 и изпълняваме поръчката успешно
+    # Отблокираме Продавач 2 и изчакваме събитието артикулът да стане отново available
     unblock_s2 = httpx.post(
         f"{COMMERCE_API_URL}/users/{s2_id}/unblock",
         headers=admin_headers,
         timeout=10.0,
     )
     assert unblock_s2.status_code == 200
+
+    start_wait = time.time()
+    s2_active_in_cart = False
+    while time.time() - start_wait < 15.0:
+        c_check = httpx.get(
+            f"{COMMERCE_API_URL}/cart", headers=buyer_headers, timeout=2.0
+        ).json()
+        item2 = next(
+            (i for i in c_check["items"] if i["product_id"] == s2_prod_id), None
+        )
+        if item2 and item2.get("available") is True:
+            s2_active_in_cart = True
+            break
+        time.sleep(0.5)
+    assert s2_active_in_cart, (
+        "Timed out waiting for seller 2 unblock to reflect in cart!"
+    )
 
     multi_success = httpx.post(
         f"{COMMERCE_API_URL}/orders",

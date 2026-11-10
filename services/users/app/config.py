@@ -53,6 +53,16 @@ class Settings(BaseSettings):
     password_reset_expire_minutes: int = 15
     password_reset_base_url: str = "http://localhost:8002/auth/password-reset/confirm"
 
+    # RabbitMQ настройки за домейнови събития
+    rabbitmq_host: str = "localhost"
+    rabbitmq_port: int = 5672
+    rabbitmq_user: str = "guest"
+    rabbitmq_password: str = "guest"
+    rabbitmq_vhost: str = "/"
+    rabbitmq_exchange: str = "users.events"
+    rabbitmq_user_events_queue: str = "commerce.user_events"
+    rabbitmq_socket_timeout_seconds: float = 5.0
+
     @property
     def database_url(self) -> str:
         """Синхронен PostgreSQL URL с psycopg драйвер."""

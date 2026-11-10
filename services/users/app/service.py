@@ -6,6 +6,7 @@ import logging
 import secrets
 import smtplib
 import time
+import uuid
 
 from pwdlib import PasswordHash
 from pwdlib.exceptions import UnknownHashError
@@ -14,7 +15,12 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.mailer import AccountMailer
-from app.models import AccountModerationLog, PasswordResetToken, User
+from app.models import (
+    AccountModerationLog,
+    PasswordResetToken,
+    User,
+    UserOutboxEvent,
+)
 from app.repository import UserRepository
 
 logger = logging.getLogger(__name__)
@@ -366,6 +372,22 @@ class UserService:
         )
         self._user_repository.create_moderation_log(log_entry)
 
+        event_id = str(uuid.uuid4())
+        outbox_event = UserOutboxEvent(
+            event_id=event_id,
+            event_type="user.blocked",
+            user_id=target_user.id,
+            payload={
+                "event_id": event_id,
+                "event_type": "user.blocked",
+                "user_id": target_user.id,
+                "status": "blocked",
+                "action": "blocked",
+                "occurred_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            },
+        )
+        self._user_repository.create_outbox_event(outbox_event)
+
         try:
             self._session.commit()
             return target_user
@@ -405,6 +427,22 @@ class UserService:
         )
         self._user_repository.create_moderation_log(log_entry)
 
+        event_id = str(uuid.uuid4())
+        outbox_event = UserOutboxEvent(
+            event_id=event_id,
+            event_type="user.unblocked",
+            user_id=target_user.id,
+            payload={
+                "event_id": event_id,
+                "event_type": "user.unblocked",
+                "user_id": target_user.id,
+                "status": "active",
+                "action": "unblocked",
+                "occurred_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            },
+        )
+        self._user_repository.create_outbox_event(outbox_event)
+
         try:
             self._session.commit()
             return target_user
@@ -443,6 +481,22 @@ class UserService:
             reason=reason,
         )
         self._user_repository.create_moderation_log(log_entry)
+
+        event_id = str(uuid.uuid4())
+        outbox_event = UserOutboxEvent(
+            event_id=event_id,
+            event_type="user.closed",
+            user_id=target_user.id,
+            payload={
+                "event_id": event_id,
+                "event_type": "user.closed",
+                "user_id": target_user.id,
+                "status": "closed",
+                "action": "closed",
+                "occurred_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            },
+        )
+        self._user_repository.create_outbox_event(outbox_event)
 
         try:
             self._session.commit()

@@ -21,7 +21,6 @@ from sqlalchemy.exc import (
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.modules.accounts.repository import UserRepository
 from app.modules.cart.repository import CartRepository
 from app.modules.catalog.repository import ProductRepository
 from app.modules.orders.payment_contracts import (
@@ -164,7 +163,6 @@ class RabbitMQPaymentEventConsumer:
                     order_repository=OrderRepository(session),
                     cart_repository=CartRepository(session),
                     product_repository=ProductRepository(session),
-                    user_repository=UserRepository(session),
                     session=session,
                 )
                 outcome = service.apply_payment_event(event)

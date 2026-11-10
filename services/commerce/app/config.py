@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     rabbitmq_payments_dlx_exchange: str = "commerce.payments.dlx"
     rabbitmq_payments_dlq_queue: str = "commerce.payment_events.dlq"
     rabbitmq_payments_dlq_routing_key: str = "commerce.payment_events.dead"
+    rabbitmq_users_exchange: str = "users.events"
+    rabbitmq_users_queue: str = "commerce.user_events"
     rabbitmq_prefetch_count: int = 10
     rabbitmq_socket_timeout_seconds: float = 5.0
 

@@ -12,6 +12,12 @@ export USERS_E2E_JWT_PRIVATE_KEY_PATH="${KEYS_DIR}/jwt_private.pem"
 export USERS_E2E_JWT_PUBLIC_KEY_PATH="${KEYS_DIR}/jwt_public.pem"
 
 cleanup() {
+  local exit_code=$?
+  if [ "${exit_code}" -ne 0 ]; then
+    echo "==> Failure detected (exit code: ${exit_code}). Dumping consumer and outbox logs..."
+    docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" logs users-outbox-e2e || true
+    docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" logs commerce-user-consumer-e2e || true
+  fi
   echo "==> Cleaning up isolated Users E2E stack (${PROJECT_NAME})..."
   docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" down -v --remove-orphans >/dev/null 2>&1 || true
   rm -rf "${KEYS_DIR:-}"
@@ -26,6 +32,8 @@ docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" up -d --build --wait
 echo "==> [2/3] Running reproducible Commerce -> Users E2E verification..."
 (
   cd "${ROOT_DIR}/services/commerce"
+  export COMPOSE_PROJECT_NAME="${PROJECT_NAME}"
+  export COMPOSE_FILE="${COMPOSE_FILE}"
   uv run --locked python "${ROOT_DIR}/scripts/users_e2e_verify.py"
 )
 

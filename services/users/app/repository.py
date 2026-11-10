@@ -1,11 +1,17 @@
 """Слой за достъп до данни (Repository) за потребителите, токените и одит логовете."""
 
 import datetime
+from collections.abc import Sequence
 
 from sqlalchemy import select, text, update
 from sqlalchemy.orm import Session
 
-from app.models import AccountModerationLog, PasswordResetToken, User
+from app.models import (
+    AccountModerationLog,
+    PasswordResetToken,
+    User,
+    UserOutboxEvent,
+)
 
 
 class UserRepository:
@@ -120,3 +126,32 @@ class UserRepository:
                     text(f"SELECT setval('{seq}', :new_val, true)"),
                     {"new_val": max_id},
                 )
+
+    def create_outbox_event(self, event: UserOutboxEvent) -> UserOutboxEvent:
+        """Записва ново outbox събитие в същата транзакция."""
+        self._session.add(event)
+        self._session.flush()
+        return event
+
+    def list_pending_outbox_events(self, limit: int = 50) -> Sequence[UserOutboxEvent]:
+        """Извлича чакащи за публикуване outbox събития, сортирани по id възходящо."""
+        stmt = (
+            select(UserOutboxEvent)
+            .where(UserOutboxEvent.published_at.is_(None))
+            .order_by(UserOutboxEvent.id.asc())
+            .limit(limit)
+        )
+        return self._session.scalars(stmt).all()
+
+    def mark_outbox_event_published(
+        self, event_id: str, published_at: datetime.datetime | None = None
+    ) -> None:
+        """Отбелязва outbox събитие като публикувано."""
+        now = published_at or datetime.datetime.now(datetime.UTC)
+        stmt = (
+            update(UserOutboxEvent)
+            .where(UserOutboxEvent.event_id == event_id)
+            .values(published_at=now)
+        )
+        self._session.execute(stmt)
+        self._session.flush()

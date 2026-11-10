@@ -3,7 +3,11 @@ from typing import Annotated
 from fastapi import Depends
 
 from app.dependencies import DbSession
-from app.modules.catalog.repository import CategoryRepository, ProductRepository
+from app.modules.catalog.repository import (
+    CategoryRepository,
+    ProductRepository,
+    SellerStatusRepository,
+)
 from app.modules.catalog.service import CatalogService
 
 
@@ -15,6 +19,11 @@ def get_product_repository(session: DbSession) -> ProductRepository:
 def get_category_repository(session: DbSession) -> CategoryRepository:
     """Фабрика за CategoryRepository с текущата сесия на заявката."""
     return CategoryRepository(session)
+
+
+def get_seller_status_repository(session: DbSession) -> SellerStatusRepository:
+    """Фабрика за SellerStatusRepository с текущата сесия на заявката."""
+    return SellerStatusRepository(session)
 
 
 def get_catalog_service(

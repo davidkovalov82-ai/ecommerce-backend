@@ -236,6 +236,8 @@ def _cleanup_test_tables(session: Session) -> None:
     _sync_categories_sequence(session)
     session.execute(text("DELETE FROM password_reset_tokens"))
     session.execute(text("DELETE FROM account_moderation_logs"))
+    session.execute(text("DELETE FROM seller_inbox_events"))
+    session.execute(text("DELETE FROM seller_statuses"))
     session.execute(
         text("DELETE FROM users WHERE email != 'legacy-catalog@internal.ecommerce.com'")
     )
@@ -521,6 +523,10 @@ class LocalTestUsersClient(UsersClient):
                         target_user_id=target_id,
                         reason=data.get("reason"),
                     )
+                    from app.modules.catalog.repository import SellerStatusRepository
+
+                    SellerStatusRepository(session).upsert_status(target_id, "blocked")
+                    session.commit()
                     return httpx.Response(
                         200,
                         json={
@@ -553,6 +559,10 @@ class LocalTestUsersClient(UsersClient):
                         target_user_id=target_id,
                         reason=data.get("reason"),
                     )
+                    from app.modules.catalog.repository import SellerStatusRepository
+
+                    SellerStatusRepository(session).upsert_status(target_id, "active")
+                    session.commit()
                     return httpx.Response(
                         200,
                         json={
@@ -585,6 +595,10 @@ class LocalTestUsersClient(UsersClient):
                         target_user_id=target_id,
                         reason=data.get("reason"),
                     )
+                    from app.modules.catalog.repository import SellerStatusRepository
+
+                    SellerStatusRepository(session).upsert_status(target_id, "closed")
+                    session.commit()
                     return httpx.Response(
                         200,
                         json={
