@@ -137,12 +137,14 @@ class OrderService:
         """
         try:
             # 1. Обща DB блокировка за текущия потребител
-            self._session.execute(
-                text("SELECT pg_advisory_xact_lock(:lock_key)"),
-                {"lock_key": user_id},
-            )
+            user_row = None
             if self._user_repository is not None:
-                self._user_repository.lock_by_id(user_id)
+                user_row = self._user_repository.lock_by_id(user_id)
+            if user_row is None:
+                self._session.execute(
+                    text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                    {"lock_key": user_id},
+                )
 
             # 2. Проверка за съществуваща поръчка със същия ключ (идемпотентност)
             existing_order = self._order_repository.get_by_user_and_idempotency_key(

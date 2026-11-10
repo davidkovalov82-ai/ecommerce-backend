@@ -15,6 +15,19 @@ from app.modules.accounts.dependencies import (
     CurrentUserDep,
     get_users_client,
 )
+from app.modules.accounts.schemas import (
+    ChangePasswordRequest,
+    ModerationActionResponse,
+    ModerationRequest,
+    PasswordResetConfirmRequest,
+    PasswordResetRequest,
+    PasswordResetRequestResponse,
+    TokenResponse,
+    UserLoginRequest,
+    UserRegisterRequest,
+    UserResponse,
+    UserUpdateRequest,
+)
 from app.modules.accounts.users_client import (
     UsersClient,
     UsersServiceUnavailableError,
@@ -67,54 +80,73 @@ def _forward(
 # --- Публични Auth маршрути ---
 
 
-@auth_router.post("/login")
+@auth_router.post("/login", response_model=TokenResponse)
 async def login(
+    body: UserLoginRequest,
     request: Request,
     users_client: Annotated[UsersClient, Depends(get_users_client)],
 ) -> Response:
     """Вход на потребител (проксира се към Users)."""
-    body = await request.body()
-    return _forward(request, "/auth/login", "POST", users_client, body)
+    return _forward(
+        request, "/auth/login", "POST", users_client, body.model_dump_json().encode("utf-8")
+    )
 
 
-@auth_router.post("/password-reset/request", status_code=status.HTTP_202_ACCEPTED)
+@auth_router.post(
+    "/password-reset/request",
+    response_model=PasswordResetRequestResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def request_password_reset(
+    body: PasswordResetRequest,
     request: Request,
     users_client: Annotated[UsersClient, Depends(get_users_client)],
 ) -> Response:
     """Заявка за възстановяване на парола (проксира се към Users)."""
-    body = await request.body()
     return _forward(
-        request, "/auth/password-reset/request", "POST", users_client, body
+        request,
+        "/auth/password-reset/request",
+        "POST",
+        users_client,
+        body.model_dump_json().encode("utf-8"),
     )
 
 
-@auth_router.post("/password-reset/confirm", status_code=status.HTTP_204_NO_CONTENT)
+@auth_router.post(
+    "/password-reset/confirm",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
 async def confirm_password_reset(
+    body: PasswordResetConfirmRequest,
     request: Request,
     users_client: Annotated[UsersClient, Depends(get_users_client)],
 ) -> Response:
     """Потвърждаване на възстановяване на парола (проксира се към Users)."""
-    body = await request.body()
     return _forward(
-        request, "/auth/password-reset/confirm", "POST", users_client, body
+        request,
+        "/auth/password-reset/confirm",
+        "POST",
+        users_client,
+        body.model_dump_json().encode("utf-8"),
     )
 
 
 # --- Публични Users маршрути ---
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def register(
+    body: UserRegisterRequest,
     request: Request,
     users_client: Annotated[UsersClient, Depends(get_users_client)],
 ) -> Response:
     """Регистрация на нов потребител (проксира се към Users)."""
-    body = await request.body()
-    return _forward(request, "/users", "POST", users_client, body)
+    return _forward(
+        request, "/users", "POST", users_client, body.model_dump_json().encode("utf-8")
+    )
 
 
-@router.get("/me")
+@router.get("/me", response_model=UserResponse)
 async def get_me(
     request: Request,
     users_client: Annotated[UsersClient, Depends(get_users_client)],
@@ -123,24 +155,32 @@ async def get_me(
     return _forward(request, "/users/me", "GET", users_client)
 
 
-@router.patch("/me")
+@router.patch("/me", response_model=UserResponse)
 async def update_me(
+    body: UserUpdateRequest,
     request: Request,
     users_client: Annotated[UsersClient, Depends(get_users_client)],
 ) -> Response:
     """Редакция на профил на текущия потребител (проксира се към Users)."""
-    body = await request.body()
-    return _forward(request, "/users/me", "PATCH", users_client, body)
+    return _forward(
+        request, "/users/me", "PATCH", users_client, body.model_dump_json().encode("utf-8")
+    )
 
 
 @router.post("/me/change-password", status_code=status.HTTP_204_NO_CONTENT)
 async def change_password(
+    body: ChangePasswordRequest,
     request: Request,
     users_client: Annotated[UsersClient, Depends(get_users_client)],
 ) -> Response:
     """Смяна на парола на текущия потребител (проксира се към Users)."""
-    body = await request.body()
-    return _forward(request, "/users/me/change-password", "POST", users_client, body)
+    return _forward(
+        request,
+        "/users/me/change-password",
+        "POST",
+        users_client,
+        body.model_dump_json().encode("utf-8"),
+    )
 
 
 @router.get("/me/products", response_model=ProductListResponse)
@@ -166,34 +206,37 @@ def get_my_products(
 # --- Административна модерация ---
 
 
-@router.post("/{user_id}/block")
+@router.post("/{user_id}/block", response_model=ModerationActionResponse)
 async def block_user(
     user_id: int,
     request: Request,
     users_client: Annotated[UsersClient, Depends(get_users_client)],
+    body: ModerationRequest | None = None,
 ) -> Response:
     """Блокиране на потребител от администратор (проксира се към Users)."""
-    body = await request.body()
-    return _forward(request, f"/users/{user_id}/block", "POST", users_client, body)
+    content = body.model_dump_json().encode("utf-8") if body else None
+    return _forward(request, f"/users/{user_id}/block", "POST", users_client, content)
 
 
-@router.post("/{user_id}/unblock")
+@router.post("/{user_id}/unblock", response_model=ModerationActionResponse)
 async def unblock_user(
     user_id: int,
     request: Request,
     users_client: Annotated[UsersClient, Depends(get_users_client)],
+    body: ModerationRequest | None = None,
 ) -> Response:
     """Отблокиране на потребител от администратор (проксира се към Users)."""
-    body = await request.body()
-    return _forward(request, f"/users/{user_id}/unblock", "POST", users_client, body)
+    content = body.model_dump_json().encode("utf-8") if body else None
+    return _forward(request, f"/users/{user_id}/unblock", "POST", users_client, content)
 
 
-@router.post("/{user_id}/close")
+@router.post("/{user_id}/close", response_model=ModerationActionResponse)
 async def close_user(
     user_id: int,
     request: Request,
     users_client: Annotated[UsersClient, Depends(get_users_client)],
+    body: ModerationRequest | None = None,
 ) -> Response:
     """Окончателно закриване на потребител от администратор (проксира се към Users)."""
-    body = await request.body()
-    return _forward(request, f"/users/{user_id}/close", "POST", users_client, body)
+    content = body.model_dump_json().encode("utf-8") if body else None
+    return _forward(request, f"/users/{user_id}/close", "POST", users_client, content)

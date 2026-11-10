@@ -272,8 +272,26 @@ class LocalTestUsersClient(UsersClient):
         super().__init__(base_url="http://test-users", internal_token="test-token")
         self.session_factory = session_factory
 
+    @contextmanager
+    def _get_session(self) -> Iterator[Session]:
+        override = app.dependency_overrides.get(get_db_session)
+        if override:
+            res = override()
+            if hasattr(res, "__enter__"):
+                with res as s:
+                    yield s
+            else:
+                s = next(res)
+                try:
+                    yield s
+                finally:
+                    pass
+        else:
+            with self.session_factory() as s:
+                yield s
+
     def get_user_status(self, user_id: int) -> RemoteUserInfo | None:
-        with self.session_factory() as session:
+        with self._get_session() as session:
             user = session.get(User, user_id)
             if user is None:
                 return None
@@ -294,25 +312,343 @@ class LocalTestUsersClient(UsersClient):
         headers: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
     ) -> Any:
-        import sys
-        users_dir = Path(__file__).resolve().parent.parent.parent / "users"
-        if str(users_dir) not in sys.path:
-            sys.path.insert(0, str(users_dir))
-        from app.main import app as users_app
-        from fastapi.testclient import TestClient as UsersTestClient
+        import json
 
-        with UsersTestClient(users_app) as client:
-            req_headers = {}
-            if headers:
-                for k, v in headers.items():
-                    if k.lower() not in ("host", "content-length"):
-                        req_headers[k] = v
-            return client.request(
-                method=method,
-                url=path,
-                content=content,
-                headers=req_headers,
-                params=params,
+        import httpx
+        from pwdlib import PasswordHash
+
+        from app.modules.accounts.repository import UserRepository
+        from app.modules.accounts.service import (
+            AccountBlocked,
+            AccountClosed,
+            AccountService,
+            EmailAlreadyExists,
+            InvalidAccountState,
+            InvalidCredentials,
+            InvalidCurrentPassword,
+            InvalidResetToken,
+            SamePasswordError,
+            SelfModerationForbidden,
+            TechnicalAccountProtected,
+            UserNotFound,
+        )
+        from app.modules.accounts.tokens import create_access_token, decode_access_token
+
+        with self._get_session() as session:
+            repo = UserRepository(session)
+            service = AccountService(
+                repo, session, password_hasher=PasswordHash.recommended()
+            )
+            data = json.loads(content) if content else {}
+
+            def _get_auth_user() -> User | None:
+                auth = (headers or {}).get("authorization", "")
+                if not auth.startswith("Bearer "):
+                    return None
+                token = auth[7:]
+                try:
+                    td = decode_access_token(
+                        token,
+                        public_key=settings.get_public_key(),
+                        algorithm=settings.jwt_algorithm,
+                        issuer=settings.jwt_issuer,
+                        audience=settings.jwt_audience,
+                    )
+                    return repo.get_by_id(td.user_id)
+                except Exception:
+                    return None
+
+            try:
+                if path == "/users" and method == "POST":
+                    user = service.register_user(
+                        email=data["email"], password=data["password"]
+                    )
+                    return httpx.Response(
+                        201,
+                        json={
+                            "id": user.id,
+                            "email": user.email,
+                            "role": user.role,
+                            "display_name": user.display_name,
+                        },
+                        headers={"content-type": "application/json"},
+                    )
+                elif path == "/auth/login" and method == "POST":
+                    user = service.authenticate_user(
+                        email=data["email"], password=data["password"]
+                    )
+                    token = create_access_token(
+                        user_id=user.id,
+                        role=user.role,
+                        email=user.email,
+                        token_version=user.token_version,
+                    )
+                    return httpx.Response(
+                        200,
+                        json={"access_token": token, "token_type": "bearer"},
+                        headers={"content-type": "application/json"},
+                    )
+                elif path == "/users/me" and method == "GET":
+                    u = _get_auth_user()
+                    if not u:
+                        return httpx.Response(
+                            401,
+                            json={
+                                "detail": {
+                                    "code": "AUTHENTICATION_REQUIRED",
+                                    "message": "Authentication required",
+                                }
+                            },
+                        )
+                    return httpx.Response(
+                        200,
+                        json={
+                            "id": u.id,
+                            "email": u.email,
+                            "role": u.role,
+                            "display_name": u.display_name,
+                        },
+                        headers={"content-type": "application/json"},
+                    )
+                elif path == "/users/me" and method == "PATCH":
+                    u = _get_auth_user()
+                    if not u:
+                        return httpx.Response(
+                            401,
+                            json={
+                                "detail": {
+                                    "code": "AUTHENTICATION_REQUIRED",
+                                    "message": "Authentication required",
+                                }
+                            },
+                        )
+                    updated = service.update_user_profile(
+                        user_id=u.id, display_name=data.get("display_name")
+                    )
+                    return httpx.Response(
+                        200,
+                        json={
+                            "id": updated.id,
+                            "email": updated.email,
+                            "role": updated.role,
+                            "display_name": updated.display_name,
+                        },
+                        headers={"content-type": "application/json"},
+                    )
+                elif path == "/users/me/change-password" and method == "POST":
+                    u = _get_auth_user()
+                    if not u:
+                        return httpx.Response(
+                            401,
+                            json={
+                                "detail": {
+                                    "code": "AUTHENTICATION_REQUIRED",
+                                    "message": "Authentication required",
+                                }
+                            },
+                        )
+                    service.change_password(
+                        user_id=u.id,
+                        current_password=data["current_password"],
+                        new_password=data["new_password"],
+                    )
+                    return httpx.Response(204)
+                elif path.startswith("/users/") and path.endswith("/block"):
+                    u = _get_auth_user()
+                    if not u or u.role != "admin":
+                        return httpx.Response(
+                            403,
+                            json={
+                                "detail": {
+                                    "code": "FORBIDDEN",
+                                    "message": "Admin privileges required",
+                                }
+                            },
+                        )
+                    target_id = int(path.split("/")[2])
+                    blocked = service.block_user(
+                        admin_id=u.id,
+                        target_user_id=target_id,
+                        reason=data.get("reason"),
+                    )
+                    return httpx.Response(
+                        200,
+                        json={
+                            "id": blocked.id,
+                            "email": blocked.email,
+                            "status": blocked.status,
+                            "message": "Account has been blocked",
+                        },
+                        headers={"content-type": "application/json"},
+                    )
+                elif path.startswith("/users/") and path.endswith("/unblock"):
+                    u = _get_auth_user()
+                    if not u or u.role != "admin":
+                        return httpx.Response(
+                            403,
+                            json={
+                                "detail": {
+                                    "code": "FORBIDDEN",
+                                    "message": "Admin privileges required",
+                                }
+                            },
+                        )
+                    target_id = int(path.split("/")[2])
+                    unblocked = service.unblock_user(
+                        admin_id=u.id,
+                        target_user_id=target_id,
+                        reason=data.get("reason"),
+                    )
+                    return httpx.Response(
+                        200,
+                        json={
+                            "id": unblocked.id,
+                            "email": unblocked.email,
+                            "status": unblocked.status,
+                            "message": "Account has been unblocked",
+                        },
+                        headers={"content-type": "application/json"},
+                    )
+                elif path.startswith("/users/") and path.endswith("/close"):
+                    u = _get_auth_user()
+                    if not u or u.role != "admin":
+                        return httpx.Response(
+                            403,
+                            json={
+                                "detail": {
+                                    "code": "FORBIDDEN",
+                                    "message": "Admin privileges required",
+                                }
+                            },
+                        )
+                    target_id = int(path.split("/")[2])
+                    closed = service.close_user(
+                        admin_id=u.id,
+                        target_user_id=target_id,
+                        reason=data.get("reason"),
+                    )
+                    return httpx.Response(
+                        200,
+                        json={
+                            "id": closed.id,
+                            "email": closed.email,
+                            "status": closed.status,
+                            "message": "Account has been closed",
+                        },
+                        headers={"content-type": "application/json"},
+                    )
+                elif path == "/auth/password-reset/request" and method == "POST":
+                    service.request_password_reset(email=data.get("email", ""))
+                    return httpx.Response(
+                        202,
+                        json={
+                            "message": "If the account exists and is eligible, password reset instructions have been sent."
+                        },
+                        headers={"content-type": "application/json"},
+                    )
+                elif path == "/auth/password-reset/confirm" and method == "POST":
+                    service.confirm_password_reset(
+                        token=data.get("token", ""),
+                        new_password=data.get("new_password", ""),
+                    )
+                    return httpx.Response(204)
+            except EmailAlreadyExists as exc:
+                return httpx.Response(
+                    409,
+                    json={
+                        "detail": {
+                            "code": "EMAIL_ALREADY_EXISTS",
+                            "message": str(exc),
+                        }
+                    },
+                )
+            except InvalidCredentials as exc:
+                return httpx.Response(
+                    401,
+                    json={
+                        "detail": {
+                            "code": "INVALID_CREDENTIALS",
+                            "message": str(exc),
+                        }
+                    },
+                )
+            except AccountBlocked as exc:
+                return httpx.Response(
+                    403,
+                    json={
+                        "detail": {"code": "ACCOUNT_BLOCKED", "message": str(exc)}
+                    },
+                )
+            except AccountClosed as exc:
+                return httpx.Response(
+                    403,
+                    json={
+                        "detail": {"code": "ACCOUNT_CLOSED", "message": str(exc)}
+                    },
+                )
+            except UserNotFound as exc:
+                return httpx.Response(
+                    404,
+                    json={"detail": {"code": "USER_NOT_FOUND", "message": str(exc)}},
+                )
+            except InvalidCurrentPassword as exc:
+                return httpx.Response(
+                    400,
+                    json={
+                        "detail": {
+                            "code": "INVALID_CURRENT_PASSWORD",
+                            "message": str(exc),
+                        }
+                    },
+                )
+            except SamePasswordError as exc:
+                return httpx.Response(
+                    422,
+                    json={"detail": {"code": "SAME_PASSWORD", "message": str(exc)}},
+                )
+            except SelfModerationForbidden as exc:
+                return httpx.Response(
+                    400,
+                    json={
+                        "detail": {
+                            "code": "SELF_MODERATION_FORBIDDEN",
+                            "message": str(exc),
+                        }
+                    },
+                )
+            except TechnicalAccountProtected as exc:
+                return httpx.Response(
+                    400,
+                    json={
+                        "detail": {
+                            "code": "TECHNICAL_ACCOUNT_PROTECTED",
+                            "message": str(exc),
+                        }
+                    },
+                )
+            except InvalidAccountState as exc:
+                return httpx.Response(
+                    400,
+                    json={
+                        "detail": {
+                            "code": "INVALID_ACCOUNT_STATE",
+                            "message": str(exc),
+                        }
+                    },
+                )
+            except InvalidResetToken as exc:
+                return httpx.Response(
+                    400,
+                    json={
+                        "detail": {
+                            "code": "INVALID_RESET_TOKEN",
+                            "message": str(exc),
+                        }
+                    },
+                )
+
+            return httpx.Response(
+                404, json={"detail": {"code": "NOT_FOUND", "message": "Not found"}}
             )
 
 

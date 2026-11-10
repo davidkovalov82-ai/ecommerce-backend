@@ -91,10 +91,10 @@ def test_cart_database_constraints(db_session: Session) -> None:
         db_session.commit()
     db_session.rollback()
 
-    # 6. FK CASCADE: изтриване на потребител изтрива каскадно неговите cart_items
+    # 6. След K6.1 няма блокиращ FK към users: cart_items се пазят по логически user_id
     db_session.execute(text(f"DELETE FROM users WHERE id = {user.id}"))
     db_session.commit()
     remaining_items = (
         db_session.query(CartItem).filter(CartItem.user_id == user.id).all()
     )
-    assert remaining_items == []
+    assert len(remaining_items) == 1

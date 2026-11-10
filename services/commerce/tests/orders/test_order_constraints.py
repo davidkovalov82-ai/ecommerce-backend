@@ -62,11 +62,11 @@ def test_orders_database_constraints(db_session: Session) -> None:
         db_session.commit()
     db_session.rollback()
 
-    # 5. RESTRICT на изтриване на потребител с поръчки
-    with pytest.raises(IntegrityError):
-        db_session.execute(text(f"DELETE FROM users WHERE id = {user.id}"))
-        db_session.commit()
-    db_session.rollback()
+    # 5. След K6.1 няма блокиращ FK към users: поръчката се пази по логически user_id
+    db_session.execute(text(f"DELETE FROM users WHERE id = {user.id}"))
+    db_session.commit()
+    persisted_order = db_session.get(Order, valid_order.id)
+    assert persisted_order is not None
 
     # 6. RESTRICT на изтриване на продукт с поръчки
     order_item = OrderItem(

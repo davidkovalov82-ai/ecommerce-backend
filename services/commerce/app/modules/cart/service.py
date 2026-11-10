@@ -112,12 +112,14 @@ class CartService:
         Управлява транзакционната граница (commit/rollback).
         """
         try:
-            self._session.execute(
-                text("SELECT pg_advisory_xact_lock(:lock_key)"),
-                {"lock_key": user_id},
-            )
+            user_row = None
             if self._user_repository is not None:
-                self._user_repository.lock_by_id(user_id)
+                user_row = self._user_repository.lock_by_id(user_id)
+            if user_row is None:
+                self._session.execute(
+                    text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                    {"lock_key": user_id},
+                )
 
             product = self._product_repository.get_active_by_id(product_id)
             if product is None:
@@ -145,12 +147,14 @@ class CartService:
         Идемпотентна операция. Управлява транзакционната граница (commit/rollback).
         """
         try:
-            self._session.execute(
-                text("SELECT pg_advisory_xact_lock(:lock_key)"),
-                {"lock_key": user_id},
-            )
+            user_row = None
             if self._user_repository is not None:
-                self._user_repository.lock_by_id(user_id)
+                user_row = self._user_repository.lock_by_id(user_id)
+            if user_row is None:
+                self._session.execute(
+                    text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                    {"lock_key": user_id},
+                )
 
             self._cart_repository.delete_item(user_id=user_id, product_id=product_id)
             self._session.commit()
