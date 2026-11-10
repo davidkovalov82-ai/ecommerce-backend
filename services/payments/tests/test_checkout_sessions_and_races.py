@@ -1,19 +1,27 @@
 """Тестове на /internal/payments/checkout-sessions: защита, конкурентност, загуба на отговор и нови опити."""
 
+import json
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.config import settings
 from app.dependencies import get_stripe_client
 from app.main import app
 from app.models import PaymentAttempt, StripeCheckoutSession
 from app.stripe_client import StripeClient
-from tests.helpers import TEST_INTERNAL_TOKEN, build_internal_checkout_payload
+from tests.helpers import (
+    TEST_INTERNAL_TOKEN,
+    TEST_WEBHOOK_SECRET,
+    build_internal_checkout_payload,
+    generate_stripe_signature,
+)
 
 client = TestClient(app)
 
@@ -321,3 +329,131 @@ def test_delayed_stripe_response_when_cancelled_expires_late_session(
         assert att.status == "expired"
     finally:
         app.dependency_overrides.pop(get_stripe_client, None)
+
+
+def test_cancel_concurrent_expired_webhook_and_new_key_checkout_leaves_no_second_link(
+    db_session: Session,
+) -> None:
+    """Сценарий 3: cancel започва -> идва expired за attempt_1 -> checkout с attempt_2 -> cancel завършва без втора платежна връзка."""
+    attempt_1 = PaymentAttempt(
+        order_id=96,
+        attempt_key="order_96_attempt_1",
+        status="open",
+        amount_minor=4500,
+        currency="EUR",
+    )
+    db_session.add(attempt_1)
+    db_session.flush()
+    db_session.add(
+        StripeCheckoutSession(
+            payment_attempt_id=attempt_1.id,
+            order_id=96,
+            status="open",
+            amount_minor=4500,
+            currency="EUR",
+            stripe_session_id="cs_first_96",
+            checkout_url="https://checkout.stripe.com/pay/cs_first_96",
+            idempotency_key="order_96_attempt_1",
+        )
+    )
+    db_session.commit()
+
+    cancel_entered_stripe = threading.Event()
+    allow_cancel_finish = threading.Event()
+
+    def _blocking_expire(sid: str) -> Any:
+        assert sid == "cs_first_96"
+        cancel_entered_stripe.set()
+        assert allow_cancel_finish.wait(timeout=5.0)
+        return SimpleNamespace(id="cs_first_96", status="expired")
+
+    mock_client = MagicMock(spec=StripeClient)
+    mock_client.expire_checkout_session.side_effect = _blocking_expire
+    mock_client.create_checkout_session.return_value = SimpleNamespace(
+        id="cs_second_forbidden_96",
+        url="https://checkout.stripe.com/pay/cs_second_forbidden_96",
+    )
+
+    app.dependency_overrides[get_stripe_client] = lambda: mock_client
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            cancel_future = pool.submit(
+                lambda: client.post(
+                    "/internal/payments/orders/96/cancel",
+                    json={"reason": "cancel"},
+                    headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+                )
+            )
+            assert cancel_entered_stripe.wait(timeout=5.0)
+
+            # 2. Идва webhook checkout.session.expired за първия опит (използваме реален construct_webhook_event)
+            wh_body = json.dumps(
+                {
+                    "id": "evt_race_exp_96",
+                    "type": "checkout.session.expired",
+                    "livemode": False,
+                    "data": {
+                        "object": {
+                            "id": "cs_first_96",
+                            "livemode": False,
+                            "status": "expired",
+                            "client_reference_id": "96",
+                            "metadata": {
+                                "order_id": "96",
+                                "attempt_key": "order_96_attempt_1",
+                                "payment_attempt_id": str(attempt_1.id),
+                            },
+                        }
+                    },
+                }
+            ).encode("utf-8")
+            with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
+                real_client = StripeClient(api_key="sk_test_unused")
+                mock_client.construct_webhook_event.side_effect = (
+                    real_client.construct_webhook_event
+                )
+                r_exp = client.post(
+                    "/webhooks/stripe",
+                    content=wh_body,
+                    headers={
+                        "Stripe-Signature": generate_stripe_signature(
+                            wh_body, TEST_WEBHOOK_SECRET
+                        )
+                    },
+                )
+            assert r_exp.status_code == 200
+            assert r_exp.json()["status"] == "expired"
+
+            # 3. Междувременно идва checkout с нов ключ order_96_attempt_2 -> трябва да бъде отказан!
+            r_retry_checkout = client.post(
+                "/internal/payments/checkout-sessions",
+                json=build_internal_checkout_payload(
+                    order_id=96,
+                    attempt_key="order_96_attempt_2",
+                    amount_minor=4500,
+                ),
+                headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+            )
+
+            # 4. Отмяната завършва
+            allow_cancel_finish.set()
+            r_cancel = cancel_future.result(timeout=5.0)
+    finally:
+        app.dependency_overrides.pop(get_stripe_client, None)
+
+    assert r_cancel.status_code == 200
+    assert r_cancel.json()["status"] == "can_cancel"
+    assert r_retry_checkout.status_code == 409
+    assert r_retry_checkout.json()["detail"]["code"] == "ORDER_STATUS_CONFLICT"
+    assert mock_client.create_checkout_session.call_count == 0
+
+    db_session.expire_all()
+    sessions = db_session.query(StripeCheckoutSession).filter_by(order_id=96).all()
+    attempts = db_session.query(PaymentAttempt).filter_by(order_id=96).all()
+    assert len(attempts) == 1
+    assert attempts[0].status == "expired"
+    assert len(sessions) == 1
+    assert sessions[0].status == "expired"
+    assert not any(
+        s.status in ("initiated", "open", "processing", "cancelling") for s in sessions
+    )

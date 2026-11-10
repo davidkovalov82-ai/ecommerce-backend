@@ -291,7 +291,7 @@ class PaymentOrderClosure(Base):
     __tablename__ = "payment_order_closures"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('cancelled', 'expired')",
+            "status IN ('cancelling', 'expiring', 'cancelled', 'expired')",
             name="ck_payment_order_closures_status_valid",
         ),
     )

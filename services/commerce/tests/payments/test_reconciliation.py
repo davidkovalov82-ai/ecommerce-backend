@@ -20,6 +20,7 @@ from tests.payments.helpers import (
     _create_order,
     _create_product,
     _create_user_and_token,
+    make_payment_event,
 )
 
 
@@ -173,3 +174,76 @@ def test_expired_reserve_with_unknown_initiated_payment_preserves_stock(
     db_session.refresh(product)
     assert order.status == "pending_payment"
     assert product.stock == 16
+
+
+def test_lost_create_expired_payment_event_restores_stock_once_and_ignores_retries(
+    db_session: Session,
+) -> None:
+    """Сценарий 2 (Commerce): след изяснено изтичане от Payments, payment.expired връща остатъка веднъж; повторенията се игнорират."""
+    user, _ = _create_user_and_token(db_session, email="lost_exp_once@example.com")
+    product = _create_product(db_session, "LostExpOnceProd", stock=10, price_minor=1500)
+
+    now = datetime.datetime.now(datetime.UTC)
+    past = now - datetime.timedelta(minutes=25)
+    order = _create_order(
+        db_session,
+        user.id,
+        product,
+        quantity=3,
+        expires_at=past,
+    )  # stock=7
+
+    mock_client = MagicMock(spec=PaymentsClient)
+    mock_client.cancel_order_payment.side_effect = RemotePaymentConflict(
+        current_status="initiated",
+        message="Unknown outcome",
+    )
+    service = OrderService(
+        order_repository=OrderRepository(db_session),
+        cart_repository=CartRepository(db_session),
+        product_repository=ProductRepository(db_session),
+        user_repository=UserRepository(db_session),
+        session=db_session,
+        payments_client=mock_client,
+    )
+
+    stats_before = service.reconcile_expired_orders(now=now)
+    assert stats_before["deferred"] == 1
+    assert stats_before["expired"] == 0
+    db_session.refresh(product)
+    assert product.stock == 7
+
+    ev_expired = make_payment_event(
+        event_type="payment.expired",
+        order_id=order.id,
+        attempt_key=f"order_{order.id}_attempt_1",
+        amount_minor=4500,
+    )
+    assert service.apply_payment_event(ev_expired) == "expired"
+    db_session.refresh(order)
+    db_session.refresh(product)
+    assert order.status == "expired"
+    assert product.stock == 10
+
+    # Дублирано същото събитие и повторно различно payment.expired не променят остатъка
+    assert service.apply_payment_event(ev_expired) == "already_processed"
+    assert (
+        service.apply_payment_event(
+            make_payment_event(
+                event_type="payment.expired",
+                order_id=order.id,
+                attempt_key=f"order_{order.id}_attempt_1",
+                amount_minor=4500,
+            )
+        )
+        == "ignored"
+    )
+    stats_after = service.reconcile_expired_orders(now=now)
+    assert stats_after["checked"] == 0
+
+    with pytest.raises(OrderStateConflict) as exc_info:
+        service.create_stripe_checkout_session(order.id, user.id)
+    assert exc_info.value.current_status == "expired"
+
+    db_session.refresh(product)
+    assert product.stock == 10

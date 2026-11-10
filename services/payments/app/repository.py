@@ -4,7 +4,7 @@ import datetime
 from collections.abc import Sequence
 from typing import Any
 
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, exists, func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -253,6 +253,59 @@ class PaymentRepository:
             .on_conflict_do_nothing(index_elements=["order_id"])
         )
         self._session.execute(stmt)
+
+    def upsert_transient_order_closure(
+        self, *, order_id: int, status: str, reason: str
+    ) -> None:
+        """Записва или обновява временно затваряне (cancelling/expiring), без да презаписва финално."""
+        now = datetime.datetime.now(datetime.UTC)
+        stmt = (
+            pg_insert(PaymentOrderClosure)
+            .values(order_id=order_id, status=status, reason=reason, closed_at=now)
+            .on_conflict_do_update(
+                index_elements=["order_id"],
+                set_={"status": status, "reason": reason, "closed_at": now},
+                where=PaymentOrderClosure.status.in_(["cancelling", "expiring"]),
+            )
+        )
+        self._session.execute(stmt)
+
+    def finalize_order_closure(
+        self, *, order_id: int, status: str, reason: str
+    ) -> None:
+        """Повишава временното затваряне (cancelling/expiring) до окончателно (cancelled/expired)."""
+        now = datetime.datetime.now(datetime.UTC)
+        stmt = (
+            pg_insert(PaymentOrderClosure)
+            .values(order_id=order_id, status=status, reason=reason, closed_at=now)
+            .on_conflict_do_update(
+                index_elements=["order_id"],
+                set_={"status": status, "reason": reason, "closed_at": now},
+                where=PaymentOrderClosure.status.in_(["cancelling", "expiring"]),
+            )
+        )
+        self._session.execute(stmt)
+
+    def clear_transient_order_closure(self, order_id: int) -> None:
+        """Премахва само временното затваряне (cancelling/expiring) при неуспешна отмяна или победа на плащането."""
+        stmt = delete(PaymentOrderClosure).where(
+            PaymentOrderClosure.order_id == order_id,
+            PaymentOrderClosure.status.in_(["cancelling", "expiring"]),
+        )
+        self._session.execute(stmt)
+
+    def has_discrepancy(
+        self, *, payment_attempt_id: int, source: str, reason: str
+    ) -> bool:
+        """Проверява дали вече съществува диагностично разхождение за този опит и причина."""
+        stmt = select(
+            exists().where(
+                PaymentDiscrepancy.payment_attempt_id == payment_attempt_id,
+                PaymentDiscrepancy.source == source,
+                PaymentDiscrepancy.reason == reason,
+            )
+        )
+        return bool(self._session.scalar(stmt))
 
     def record_discrepancy(self, discrepancy: PaymentDiscrepancy) -> PaymentDiscrepancy:
         self._session.add(discrepancy)

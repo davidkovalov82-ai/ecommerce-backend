@@ -2,13 +2,15 @@
 
 import datetime
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
 from app.dependencies import get_stripe_client
@@ -620,3 +622,469 @@ def test_reconcile_and_cancel_conflict_reject_mismatched_paid_and_record_discrep
         .one()
     )
     assert d_cancel.reason == expected_reason
+
+
+def test_reconcile_ignores_stale_complete_unpaid_when_webhook_recorded_failed(
+    db_session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Сценарий 1а: докато reconcile чака Stripe, webhook записва failed; старият complete/unpaid не го презаписва с processing."""
+    attempt = PaymentAttempt(
+        order_id=530,
+        attempt_key="order_530_attempt_1",
+        status="open",
+        amount_minor=4200,
+        currency="EUR",
+    )
+    db_session.add(attempt)
+    db_session.flush()
+    db_session.add(
+        StripeCheckoutSession(
+            payment_attempt_id=attempt.id,
+            order_id=530,
+            status="open",
+            amount_minor=4200,
+            currency="EUR",
+            stripe_session_id="cs_stale_rec_530",
+            idempotency_key="order_530_attempt_1",
+        )
+    )
+    db_session.commit()
+
+    entered_stripe = threading.Event()
+    allow_stripe_return = threading.Event()
+
+    def _slow_retrieve(sid: str) -> Any:
+        assert sid == "cs_stale_rec_530"
+        entered_stripe.set()
+        assert allow_stripe_return.wait(timeout=5.0)
+        return SimpleNamespace(
+            id="cs_stale_rec_530",
+            livemode=False,
+            status="complete",
+            payment_status="unpaid",
+        )
+
+    mock_stripe = MagicMock(spec=StripeClient)
+    mock_stripe.retrieve_checkout_session.side_effect = _slow_retrieve
+
+    def _run_reconcile() -> str:
+        with session_factory() as rec_session:
+            svc = PaymentService(
+                repository=PaymentRepository(rec_session),
+                session=rec_session,
+                stripe_client=mock_stripe,
+            )
+            return svc.reconcile_single_attempt(
+                attempt.id, datetime.datetime.now(datetime.UTC)
+            )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        rec_future = pool.submit(_run_reconcile)
+        assert entered_stripe.wait(timeout=5.0)
+
+        # Докато reconcile чака Stripe (без DB lock), webhook записва async_payment_failed
+        wh_body = json.dumps(
+            {
+                "id": "evt_stale_rec_fail_530",
+                "type": "checkout.session.async_payment_failed",
+                "livemode": False,
+                "data": {
+                    "object": {
+                        "id": "cs_stale_rec_530",
+                        "livemode": False,
+                        "payment_status": "unpaid",
+                        "client_reference_id": "530",
+                        "metadata": {
+                            "order_id": "530",
+                            "attempt_key": "order_530_attempt_1",
+                            "payment_attempt_id": str(attempt.id),
+                        },
+                    }
+                },
+            }
+        ).encode("utf-8")
+        with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
+            r_wh = client.post(
+                "/webhooks/stripe",
+                content=wh_body,
+                headers={
+                    "Stripe-Signature": generate_stripe_signature(
+                        wh_body, TEST_WEBHOOK_SECRET
+                    )
+                },
+            )
+        assert r_wh.status_code == 200
+        assert r_wh.json()["status"] == "failed"
+
+        allow_stripe_return.set()
+        rec_future.result(timeout=5.0)
+
+    db_session.expire_all()
+    db_session.refresh(attempt)
+    assert attempt.status == "failed"
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=530, event_type="payment.failed")
+        .count()
+        == 1
+    )
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=530, event_type="payment.processing")
+        .count()
+        == 0
+    )
+
+
+def test_cancel_conflict_ignores_stale_complete_unpaid_when_webhook_recorded_succeeded(
+    db_session: Session,
+) -> None:
+    """Сценарий 1б: докато cancel сверява конфликт със Stripe, webhook записва succeeded; старият complete/unpaid не го презаписва с processing."""
+    attempt = PaymentAttempt(
+        order_id=531,
+        attempt_key="order_531_attempt_1",
+        status="open",
+        amount_minor=4800,
+        currency="EUR",
+    )
+    db_session.add(attempt)
+    db_session.flush()
+    db_session.add(
+        StripeCheckoutSession(
+            payment_attempt_id=attempt.id,
+            order_id=531,
+            status="open",
+            amount_minor=4800,
+            currency="EUR",
+            stripe_session_id="cs_stale_cancel_531",
+            idempotency_key="order_531_attempt_1",
+        )
+    )
+    db_session.commit()
+
+    entered_retrieve = threading.Event()
+    allow_retrieve_return = threading.Event()
+
+    mock_stripe = MagicMock(spec=StripeClient)
+    mock_stripe.construct_webhook_event.side_effect = StripeClient(
+        api_key="sk_test_unused"
+    ).construct_webhook_event
+    mock_stripe.expire_checkout_session.side_effect = RuntimeError(
+        "Cannot expire Checkout Session whose status is complete"
+    )
+
+    def _slow_retrieve(sid: str) -> Any:
+        assert sid == "cs_stale_cancel_531"
+        entered_retrieve.set()
+        assert allow_retrieve_return.wait(timeout=5.0)
+        return SimpleNamespace(
+            id="cs_stale_cancel_531",
+            livemode=False,
+            status="complete",
+            payment_status="unpaid",
+        )
+
+    mock_stripe.retrieve_checkout_session.side_effect = _slow_retrieve
+
+    app.dependency_overrides[get_stripe_client] = lambda: mock_stripe
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            cancel_future = pool.submit(
+                lambda: client.post(
+                    "/internal/payments/orders/531/cancel",
+                    json={"reason": "cancel"},
+                    headers={"X-Internal-Token": TEST_INTERNAL_TOKEN},
+                )
+            )
+            assert entered_retrieve.wait(timeout=5.0)
+
+            # Без задържан DB lock webhook спокойно записва succeeded
+            wh_body = json.dumps(
+                {
+                    "id": "evt_stale_cancel_paid_531",
+                    "type": "checkout.session.async_payment_succeeded",
+                    "livemode": False,
+                    "data": {
+                        "object": {
+                            "id": "cs_stale_cancel_531",
+                            "livemode": False,
+                            "payment_status": "paid",
+                            "amount_total": 4800,
+                            "currency": "eur",
+                            "client_reference_id": "531",
+                            "metadata": {
+                                "order_id": "531",
+                                "attempt_key": "order_531_attempt_1",
+                                "payment_attempt_id": str(attempt.id),
+                            },
+                        }
+                    },
+                }
+            ).encode("utf-8")
+            with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
+                r_wh = client.post(
+                    "/webhooks/stripe",
+                    content=wh_body,
+                    headers={
+                        "Stripe-Signature": generate_stripe_signature(
+                            wh_body, TEST_WEBHOOK_SECRET
+                        )
+                    },
+                )
+            assert r_wh.status_code == 200
+            assert r_wh.json()["status"] == "success"
+
+            allow_retrieve_return.set()
+            r_cancel = cancel_future.result(timeout=5.0)
+    finally:
+        app.dependency_overrides.pop(get_stripe_client, None)
+
+    assert r_cancel.status_code == 409
+    assert r_cancel.json()["detail"]["code"] == "ORDER_ALREADY_PAID"
+    db_session.expire_all()
+    db_session.refresh(attempt)
+    assert attempt.status == "succeeded"
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=531, event_type="payment.succeeded")
+        .count()
+        == 1
+    )
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=531, event_type="payment.processing")
+        .count()
+        == 0
+    )
+
+
+def test_reconcile_initiated_without_session_within_window_expires_before_stock_restore(
+    db_session: Session,
+) -> None:
+    """Сценарий 2 (в безопасното окно): не дошлата до Stripe или потеряла отговор initiated сесия се изяснява и затваря преди payment.expired."""
+    now = datetime.datetime.now(datetime.UTC)
+    past = now - datetime.timedelta(minutes=25)
+    line_items = [
+        {
+            "price_data": {
+                "currency": "eur",
+                "unit_amount": 3000,
+                "product_data": {"name": "Lost Item"},
+            },
+            "quantity": 1,
+        }
+    ]
+
+    # Случай А: първият повик никога не е стигнал до Stripe -> сверката го повтаря със същия ключ/параметри
+    att_never_reached = PaymentAttempt(
+        order_id=540,
+        attempt_key="order_540_attempt_1",
+        status="initiated",
+        amount_minor=3000,
+        currency="EUR",
+        line_items=line_items,
+        order_expires_at=past,
+        created_at=now - datetime.timedelta(minutes=30),
+    )
+    db_session.add(att_never_reached)
+    db_session.flush()
+    db_session.add(
+        StripeCheckoutSession(
+            payment_attempt_id=att_never_reached.id,
+            order_id=540,
+            status="initiated",
+            amount_minor=3000,
+            currency="EUR",
+            idempotency_key="order_540_attempt_1",
+        )
+    )
+
+    # Случай Б: Stripe вече е създал отворена сесия по този ключ, но отговорът се е изгубил -> същият ключ я възстановява и я затваря преди payment.expired
+    att_lost_open = PaymentAttempt(
+        order_id=541,
+        attempt_key="order_541_attempt_1",
+        status="initiated",
+        amount_minor=3500,
+        currency="EUR",
+        line_items=line_items,
+        order_expires_at=past,
+        created_at=now - datetime.timedelta(minutes=30),
+    )
+    db_session.add(att_lost_open)
+    db_session.flush()
+    db_session.add(
+        StripeCheckoutSession(
+            payment_attempt_id=att_lost_open.id,
+            order_id=541,
+            status="initiated",
+            amount_minor=3500,
+            currency="EUR",
+            idempotency_key="order_541_attempt_1",
+        )
+    )
+    db_session.commit()
+
+    stripe_sessions: dict[str, dict[str, Any]] = {
+        "order_541_attempt_1": {
+            "id": "cs_recovered_open_541",
+            "url": "https://checkout.stripe.com/pay/cs_recovered_open_541",
+            "status": "open",
+            "payment_status": "unpaid",
+        }
+    }
+    captured_calls: dict[str, dict[str, Any]] = {}
+    expire_order_checks: list[tuple[str, int]] = []
+
+    mock_stripe = MagicMock(spec=StripeClient)
+
+    def _create_session(**kwargs: Any) -> Any:
+        key = kwargs["idempotency_key"]
+        captured_calls[key] = dict(kwargs)
+        existing = stripe_sessions.get(key)
+        if existing is None:
+            sid = f"cs_created_rec_{len(stripe_sessions) + 1}"
+            existing = {
+                "id": sid,
+                "url": f"https://checkout.stripe.com/pay/{sid}",
+                "status": "open",
+                "payment_status": "unpaid",
+            }
+            stripe_sessions[key] = existing
+        return SimpleNamespace(**existing)
+
+    def _retrieve_session(sid: str) -> Any:
+        for data in stripe_sessions.values():
+            if data["id"] == sid:
+                return SimpleNamespace(**data, livemode=False)
+        raise AssertionError(f"Unknown session {sid}")
+
+    def _expire_session(sid: str) -> Any:
+        for key, data in stripe_sessions.items():
+            if data["id"] == sid:
+                order_num = int(key.split("_")[1])
+                outbox_count = (
+                    db_session.query(PaymentOutboxEvent)
+                    .filter_by(order_id=order_num, event_type="payment.expired")
+                    .count()
+                )
+                expire_order_checks.append((sid, outbox_count))
+                data["status"] = "expired"
+                return SimpleNamespace(**data)
+        raise AssertionError(f"Unknown session to expire {sid}")
+
+    mock_stripe.create_checkout_session.side_effect = _create_session
+    mock_stripe.retrieve_checkout_session.side_effect = _retrieve_session
+    mock_stripe.expire_checkout_session.side_effect = _expire_session
+
+    service = PaymentService(
+        repository=PaymentRepository(db_session),
+        session=db_session,
+        stripe_client=mock_stripe,
+    )
+    stats = service.reconcile_unresolved_payments(now=now)
+    assert stats == {"checked": 2, "expired": 2, "paid": 0, "deferred": 0, "skipped": 0}
+
+    assert captured_calls["order_540_attempt_1"]["line_items"] == line_items
+    assert captured_calls["order_540_attempt_1"]["client_reference_id"] == "540"
+    assert captured_calls["order_541_attempt_1"]["client_reference_id"] == "541"
+    # Закриването в Stripe е станало ПРЕДИ запис на payment.expired в outbox!
+    assert len(expire_order_checks) == 2
+    assert all(outbox_cnt == 0 for _, outbox_cnt in expire_order_checks)
+    assert stripe_sessions["order_540_attempt_1"]["status"] == "expired"
+    assert stripe_sessions["order_541_attempt_1"]["status"] == "expired"
+
+    db_session.expire_all()
+    db_session.refresh(att_never_reached)
+    db_session.refresh(att_lost_open)
+    assert att_never_reached.status == "expired"
+    assert att_lost_open.status == "expired"
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=540, event_type="payment.expired")
+        .count()
+        == 1
+    )
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=541, event_type="payment.expired")
+        .count()
+        == 1
+    )
+
+
+def test_reconcile_initiated_without_session_outside_window_records_discrepancy(
+    db_session: Session,
+) -> None:
+    """Сценарий 2 (извън безопасното окно): не се създава нова Stripe сесия и случаят се записва за разбор."""
+    now = datetime.datetime.now(datetime.UTC)
+    too_old = now - datetime.timedelta(
+        seconds=settings.stripe_idempotency_window_seconds + 3600
+    )
+    attempt = PaymentAttempt(
+        order_id=542,
+        attempt_key="order_542_attempt_1",
+        status="initiated",
+        amount_minor=5000,
+        currency="EUR",
+        order_expires_at=now - datetime.timedelta(hours=24),
+        created_at=too_old,
+    )
+    db_session.add(attempt)
+    db_session.flush()
+    db_session.add(
+        StripeCheckoutSession(
+            payment_attempt_id=attempt.id,
+            order_id=542,
+            status="initiated",
+            amount_minor=5000,
+            currency="EUR",
+            idempotency_key="order_542_attempt_1",
+            created_at=too_old,
+        )
+    )
+    db_session.commit()
+
+    mock_stripe = MagicMock(spec=StripeClient)
+    service = PaymentService(
+        repository=PaymentRepository(db_session),
+        session=db_session,
+        stripe_client=mock_stripe,
+    )
+
+    stats1 = service.reconcile_unresolved_payments(now=now)
+    stats2 = service.reconcile_unresolved_payments(now=now)
+    assert stats1 == {
+        "checked": 1,
+        "expired": 0,
+        "paid": 0,
+        "deferred": 1,
+        "skipped": 0,
+    }
+    assert stats2 == {
+        "checked": 1,
+        "expired": 0,
+        "paid": 0,
+        "deferred": 1,
+        "skipped": 0,
+    }
+
+    mock_stripe.create_checkout_session.assert_not_called()
+    mock_stripe.expire_checkout_session.assert_not_called()
+
+    db_session.refresh(attempt)
+    assert attempt.status == "initiated"
+    assert (
+        db_session.query(PaymentOutboxEvent)
+        .filter_by(order_id=542, event_type="payment.expired")
+        .count()
+        == 0
+    )
+    discrepancies = (
+        db_session.query(PaymentDiscrepancy)
+        .filter_by(
+            order_id=542, source="reconcile", reason="idempotency_window_expired"
+        )
+        .all()
+    )
+    assert len(discrepancies) == 1

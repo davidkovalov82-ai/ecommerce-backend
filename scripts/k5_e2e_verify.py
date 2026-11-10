@@ -1061,6 +1061,50 @@ def verify_reconciliation_scripts(seller_token: str) -> None:
         )
         conn.commit()
 
+    # Докато Payments не изясни initiated без stripe_session_id, Commerce пази резерва (pending_payment)
+    compose_cmd(
+        "exec",
+        "-T",
+        "commerce-api-e2e",
+        "python",
+        "scripts/reconcile_orders.py",
+        capture_output=True,
+    )
+    assert get_order_detail(buyer3, oid3)["status"] == "pending_payment"
+    assert get_product_stock(pid) == 5
+
+    # Payments reconcile в безопасното окно възстановява lost_sid със същия ключ, вижда open + изтекъл резерв -> expire в Stripe -> payment.expired
+    sessions_snap = httpx.get(f"{STRIPE_MOCK_URL}/_sessions", timeout=5.0).json()[
+        "sessions"
+    ]
+    lost_sessions = [
+        s for s in sessions_snap if s.get("client_reference_id") == str(oid3)
+    ]
+    assert len(lost_sessions) == 1
+    lost_sid = lost_sessions[0]["id"]
+
+    rec_pay_lost = compose_cmd(
+        "exec",
+        "-T",
+        "payments-e2e",
+        "python",
+        "scripts/reconcile_payments.py",
+        capture_output=True,
+    )
+    assert "expired=1" in rec_pay_lost.stdout
+
+    mock_lost = httpx.get(
+        f"{STRIPE_MOCK_URL}/v1/checkout/sessions/{lost_sid}", timeout=5.0
+    ).json()
+    assert mock_lost["status"] == "expired"
+
+    wait_until(
+        "Recovered lost open expired session turned Commerce order expired and restored stock once",
+        lambda: True if get_order_detail(buyer3, oid3)["status"] == "expired" else None,
+    )
+    assert get_product_stock(pid) == 8
+
+    # Повторните сверки не връщат остатъка втори път
     compose_cmd(
         "exec",
         "-T",
@@ -1077,58 +1121,76 @@ def verify_reconciliation_scripts(seller_token: str) -> None:
         "scripts/reconcile_payments.py",
         capture_output=True,
     )
-    assert get_order_detail(buyer3, oid3)["status"] == "pending_payment"
-    assert get_product_stock(pid) == 5
+    assert get_product_stock(pid) == 8
+    assert get_mailpit_messages(email3) == []
+    assert get_sms_sent_for_phone(phone3) == []
 
-    # Истинският webhook намира сесията, създадена преди изгубения отговор, и завършва поръчката в paid
-    sessions_snap = httpx.get(f"{STRIPE_MOCK_URL}/_sessions", timeout=5.0).json()[
+    # D) Изгубен отговор за сесия, която клиентът вече е платил -> reconcile_payments в безопасното окно я открива като paid
+    email4 = f"k5_lost_paid_{uuid.uuid4().hex[:8]}@example.com"
+    phone4 = f"+359880{uuid.uuid4().int % 1000000:06d}"
+    _, buyer4 = register_and_login(email4)
+    add_to_cart(buyer4, pid, 1)  # stock 8 -> 7
+    o4 = create_order(buyer4, phone=phone4)
+    oid4 = int(o4["id"])
+
+    httpx.post(
+        f"{STRIPE_MOCK_URL}/_control",
+        json={"drop_next_create_after_commit": True},
+        timeout=5.0,
+    ).raise_for_status()
+    r_drop4 = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid4}/checkout-session",
+        headers={"Authorization": f"Bearer {buyer4}"},
+        timeout=10.0,
+    )
+    assert r_drop4.status_code == 502
+
+    sessions_snap4 = httpx.get(f"{STRIPE_MOCK_URL}/_sessions", timeout=5.0).json()[
         "sessions"
     ]
-    lost_sessions = [
-        s for s in sessions_snap if s.get("client_reference_id") == str(oid3)
-    ]
-    assert len(lost_sessions) == 1
-    lost_sid = lost_sessions[0]["id"]
-    with psycopg.connect(PAYMENTS_DSN) as conn, conn.cursor() as cur:
-        cur.execute("SELECT id FROM payment_attempts WHERE order_id = %s", (oid3,))
-        lost_attempt_id = cur.fetchone()[0]
+    lost_sid4 = next(
+        s["id"] for s in sessions_snap4 if s.get("client_reference_id") == str(oid4)
+    )
+    httpx.post(
+        f"{STRIPE_MOCK_URL}/_control/set_session",
+        json={"session_id": lost_sid4, "status": "complete", "payment_status": "paid"},
+        timeout=5.0,
+    ).raise_for_status()
 
-    r_recover_wh = sign_and_post_stripe_webhook(
-        {
-            "id": f"evt_lost_exp_recover_{uuid.uuid4().hex[:10]}",
-            "type": "checkout.session.completed",
-            "livemode": False,
-            "data": {
-                "object": {
-                    "id": lost_sid,
-                    "livemode": False,
-                    "payment_status": "paid",
-                    "amount_total": 5400,
-                    "currency": "eur",
-                    "client_reference_id": str(oid3),
-                    "metadata": {
-                        "order_id": str(oid3),
-                        "attempt_key": f"order_{oid3}_attempt_1",
-                        "payment_attempt_id": str(lost_attempt_id),
-                    },
-                }
-            },
-        }
+    with psycopg.connect(COMMERCE_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE orders SET expires_at = %s WHERE id = %s", (expired_ts, oid4)
+        )
+        conn.commit()
+    with psycopg.connect(PAYMENTS_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE payment_attempts SET order_expires_at = %s WHERE order_id = %s",
+            (expired_ts, oid4),
+        )
+        conn.commit()
+
+    rec_pay4 = compose_cmd(
+        "exec",
+        "-T",
+        "payments-e2e",
+        "python",
+        "scripts/reconcile_payments.py",
+        capture_output=True,
     )
-    assert r_recover_wh.status_code == 200
-    assert r_recover_wh.json()["status"] == "success"
+    assert "paid=1" in rec_pay4.stdout
+
     wait_until(
-        "Lost initiated response after reserve expiry still reaches paid via webhook",
-        lambda: True if get_order_detail(buyer3, oid3)["status"] == "paid" else None,
+        "Lost initiated session paid in Stripe reaches paid via reconcile_payments",
+        lambda: True if get_order_detail(buyer4, oid4)["status"] == "paid" else None,
     )
-    assert get_product_stock(pid) == 5
+    assert get_product_stock(pid) == 7
     wait_until(
-        "Lost expired recovery delivered 1 email",
-        lambda: m if len(m := get_mailpit_messages(email3)) == 1 else None,
+        "Lost paid recovery delivered 1 email",
+        lambda: m if len(m := get_mailpit_messages(email4)) == 1 else None,
     )
     wait_until(
-        "Lost expired recovery delivered 1 SMS",
-        lambda: s if len(s := get_sms_sent_for_phone(phone3)) == 1 else None,
+        "Lost paid recovery delivered 1 SMS",
+        lambda: s if len(s := get_sms_sent_for_phone(phone4)) == 1 else None,
     )
 
 

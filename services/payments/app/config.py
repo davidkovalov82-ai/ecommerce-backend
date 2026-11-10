@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     stripe_success_url: str = "http://localhost:8000/orders/{order_id}?payment=success"
     stripe_cancel_url: str = "http://localhost:8000/orders/{order_id}?payment=cancelled"
     stripe_timeout_seconds: float = 10.0
+    stripe_idempotency_window_seconds: int = 86400
 
     # RabbitMQ брокер за изпращане на платежни резултати към Commerce
     rabbitmq_host: str = "localhost"
@@ -66,6 +67,8 @@ class Settings(BaseSettings):
         """Валидира конфигурацията на Stripe спрямо избрания режим (test vs live)."""
         if self.stripe_timeout_seconds <= 0:
             raise ValueError("STRIPE_TIMEOUT_SECONDS must be positive")
+        if self.stripe_idempotency_window_seconds <= 0:
+            raise ValueError("STRIPE_IDEMPOTENCY_WINDOW_SECONDS must be positive")
 
         if self.stripe_mode == "live":
             if self.stripe_api_base:

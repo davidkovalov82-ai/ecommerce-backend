@@ -57,12 +57,13 @@ def test_payments_0002_closures_discrepancies_upgrade_and_safe_downgrade() -> No
 
         command.upgrade(cfg, "0001")
         command.upgrade(cfg, "0002")
+        command.upgrade(cfg, "0003")
 
         with Session(temp_engine) as session:
             session.execute(
                 text(
                     "INSERT INTO payment_order_closures (order_id, status, reason) "
-                    "VALUES (10, 'cancelled', 'cancel')"
+                    "VALUES (10, 'cancelling', 'cancel')"
                 )
             )
             session.execute(
@@ -73,6 +74,25 @@ def test_payments_0002_closures_discrepancies_upgrade_and_safe_downgrade() -> No
                 )
             )
             session.commit()
+
+        # Не може да се свали 0003 -> 0002 при наличен cancelling запис
+        try:
+            command.downgrade(cfg, "0002")
+            raise AssertionError(
+                "Expected RuntimeError when transient order closures exist"
+            )
+        except RuntimeError as exc:
+            assert "transient order closures" in str(exc)
+
+        with Session(temp_engine) as session:
+            session.execute(
+                text(
+                    "UPDATE payment_order_closures SET status = 'cancelled' WHERE order_id = 10"
+                )
+            )
+            session.commit()
+
+        command.downgrade(cfg, "0002")
 
         try:
             command.downgrade(cfg, "0001")
