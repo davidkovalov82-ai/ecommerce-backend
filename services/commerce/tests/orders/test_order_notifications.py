@@ -1,8 +1,7 @@
 import datetime
-import json
 import logging
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pika.exceptions
 import pytest
@@ -10,17 +9,21 @@ from fastapi.testclient import TestClient
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.config import settings
 from app.main import app
 from app.modules.accounts.repository import UserRepository
 from app.modules.cart.repository import CartRepository
 from app.modules.catalog.repository import ProductRepository
+from app.modules.orders.dependencies import get_payments_client
 from app.modules.orders.models import (
     Order,
     OrderOutboxEvent,
-    StripeCheckoutSession,
 )
 from app.modules.orders.outbox_processor import OutboxProcessor
+from app.modules.orders.payments_client import (
+    CancelPaymentResult,
+    PaymentsClient,
+    RemoteOrderAlreadyPaid,
+)
 from app.modules.orders.publisher import (
     BrokerUnavailableError,
     EventPublisher,
@@ -30,74 +33,42 @@ from app.modules.orders.publisher import (
 )
 from app.modules.orders.repository import OrderRepository
 from app.modules.orders.service import OrderService
-from app.modules.orders.stripe_client import StripeClient
 from tests.orders.helpers import (
     _create_order,
     _create_product,
     _create_user_and_token,
 )
-from tests.payments.helpers import (
-    TEST_WEBHOOK_SECRET,
-    _generate_stripe_signature,
-)
+from tests.payments.helpers import make_payment_event
 
 client = TestClient(app)
 
 
-def test_webhook_completed_creates_outbox_event(db_session: Session) -> None:
-    """Критерий: Незабавен webhook (completed + paid) записва събитие order.paid в outbox."""
+def test_payment_succeeded_event_creates_outbox_event(db_session: Session) -> None:
+    """Критерий: payment.succeeded от Payments записва събитие order.paid в outbox."""
     user, _ = _create_user_and_token(db_session, email="buyer_webhook@example.com")
     product = _create_product(db_session, "Outbox Item", price_minor=4500, stock=5)
     order = _create_order(db_session, user.id, product, quantity=1)  # 4500 EUR
 
-    session_rec = StripeCheckoutSession(
-        order_id=order.id,
-        status="open",
-        amount_minor=4500,
-        currency="EUR",
-        mode="test",
-        stripe_session_id="cs_outbox_paid_1",
-        checkout_url="https://checkout.stripe.com/pay/cs_outbox_paid_1",
-        idempotency_key="idemp_outbox_1",
+    svc = OrderService(
+        order_repository=OrderRepository(db_session),
+        cart_repository=CartRepository(db_session),
+        product_repository=ProductRepository(db_session),
+        user_repository=UserRepository(db_session),
+        session=db_session,
+        payments_client=MagicMock(spec=PaymentsClient),
     )
-    db_session.add(session_rec)
-    db_session.commit()
-
-    event_payload = {
-        "id": "evt_outbox_paid_1",
-        "type": "checkout.session.completed",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": "cs_outbox_paid_1",
-                "livemode": False,
-                "payment_status": "paid",
-                "amount_total": 4500,
-                "currency": "eur",
-                "client_reference_id": str(order.id),
-                "metadata": {
-                    "order_id": str(order.id),
-                    "attempt_id": str(session_rec.id),
-                },
-            }
-        },
-    }
-    payload_bytes = json.dumps(event_payload).encode()
-    sig = _generate_stripe_signature(payload_bytes, TEST_WEBHOOK_SECRET)
-
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=payload_bytes,
-            headers={"Stripe-Signature": sig},
+    outcome = svc.apply_payment_event(
+        make_payment_event(
+            event_type="payment.succeeded",
+            order_id=order.id,
+            amount_minor=4500,
         )
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "success"
+    )
+    assert outcome == "paid"
 
     db_session.refresh(order)
     assert order.status == "paid"
 
-    # Проверка на outbox записа в същата база
     repo = OrderRepository(db_session)
     outbox_ev = repo.get_outbox_event(order.id, "order.paid")
     assert outbox_ev is not None
@@ -112,57 +83,32 @@ def test_webhook_completed_creates_outbox_event(db_session: Session) -> None:
     assert outbox_ev.payload["currency"] == "EUR"
 
 
-def test_webhook_async_payment_succeeded_creates_outbox_event(
+def test_delayed_payment_succeeded_after_processing_creates_outbox_event(
     db_session: Session,
 ) -> None:
-    """Критерий: Отложено плащане (async_payment_succeeded) записва събитие order.paid в outbox."""
+    """Критерий: Отложено payment.succeeded след payment.processing записва order.paid в outbox."""
     user, _ = _create_user_and_token(db_session, email="buyer_async@example.com")
     product = _create_product(db_session, "Async Item", price_minor=3000, stock=5)
     order = _create_order(db_session, user.id, product, quantity=1)
     order.status = "payment_processing"
-
-    session_rec = StripeCheckoutSession(
-        order_id=order.id,
-        status="processing",
-        amount_minor=3000,
-        currency="EUR",
-        mode="test",
-        stripe_session_id="cs_outbox_async_1",
-        checkout_url="https://checkout.stripe.com/pay/cs_outbox_async_1",
-        idempotency_key="idemp_outbox_async_1",
-    )
-    db_session.add(session_rec)
     db_session.commit()
 
-    event_payload = {
-        "id": "evt_outbox_async_1",
-        "type": "checkout.session.async_payment_succeeded",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": "cs_outbox_async_1",
-                "livemode": False,
-                "payment_status": "paid",
-                "amount_total": 3000,
-                "currency": "eur",
-                "client_reference_id": str(order.id),
-                "metadata": {
-                    "order_id": str(order.id),
-                    "attempt_id": str(session_rec.id),
-                },
-            }
-        },
-    }
-    payload_bytes = json.dumps(event_payload).encode()
-    sig = _generate_stripe_signature(payload_bytes, TEST_WEBHOOK_SECRET)
-
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=payload_bytes,
-            headers={"Stripe-Signature": sig},
+    svc = OrderService(
+        order_repository=OrderRepository(db_session),
+        cart_repository=CartRepository(db_session),
+        product_repository=ProductRepository(db_session),
+        user_repository=UserRepository(db_session),
+        session=db_session,
+        payments_client=MagicMock(spec=PaymentsClient),
+    )
+    outcome = svc.apply_payment_event(
+        make_payment_event(
+            event_type="payment.succeeded",
+            order_id=order.id,
+            amount_minor=3000,
         )
-        assert resp.status_code == 200
+    )
+    assert outcome == "paid"
 
     db_session.refresh(order)
     assert order.status == "paid"
@@ -175,33 +121,22 @@ def test_webhook_async_payment_succeeded_creates_outbox_event(
     assert outbox_ev.payload["total_minor"] == 3000
 
 
-def test_reconciliation_creates_outbox_event(db_session: Session) -> None:
-    """Критерий: При преход в paid през периодична сверка се записва събитие order.paid в outbox."""
+def test_reconciliation_defers_when_payments_reports_paid_until_event_arrives(
+    db_session: Session,
+) -> None:
+    """Критерий: Когато Payments докладва already_paid при просрочка, Commerce пази резерва за payment.succeeded."""
     user, _ = _create_user_and_token(db_session, email="buyer_rec@example.com")
     product = _create_product(db_session, "Rec Item", price_minor=2000, stock=5)
     order = _create_order(db_session, user.id, product, quantity=1)
     order.expires_at = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
         minutes=10
     )
-
-    session_rec = StripeCheckoutSession(
-        order_id=order.id,
-        status="open",
-        amount_minor=2000,
-        currency="EUR",
-        mode="test",
-        stripe_session_id="cs_rec_paid_outbox",
-        checkout_url="https://checkout.stripe.com/pay/cs_rec_paid_outbox",
-        idempotency_key="idemp_rec_outbox",
-    )
-    db_session.add(session_rec)
     db_session.commit()
 
-    mock_stripe = MagicMock(spec=StripeClient)
-    m = MagicMock()
-    m.status = "complete"
-    m.payment_status = "paid"
-    mock_stripe.retrieve_checkout_session.return_value = m
+    mock_payments = MagicMock(spec=PaymentsClient)
+    mock_payments.cancel_order_payment.side_effect = RemoteOrderAlreadyPaid(
+        "Paid in Payments"
+    )
 
     service = OrderService(
         order_repository=OrderRepository(db_session),
@@ -209,14 +144,25 @@ def test_reconciliation_creates_outbox_event(db_session: Session) -> None:
         product_repository=ProductRepository(db_session),
         user_repository=UserRepository(db_session),
         session=db_session,
-        stripe_client=mock_stripe,
+        payments_client=mock_payments,
     )
-    stats = service.reconcile_unresolved_orders()
-    assert stats["paid"] == 1
+    stats = service.reconcile_expired_orders()
+    assert stats["deferred"] == 1
+    assert stats["expired"] == 0
 
     db_session.refresh(order)
-    assert order.status == "paid"
+    db_session.refresh(product)
+    assert order.status == "pending_payment"
+    assert product.stock == 4
 
+    outcome = service.apply_payment_event(
+        make_payment_event(
+            event_type="payment.succeeded",
+            order_id=order.id,
+            amount_minor=2000,
+        )
+    )
+    assert outcome == "paid"
     repo = OrderRepository(db_session)
     outbox_ev = repo.get_outbox_event(order.id, "order.paid")
     assert outbox_ev is not None
@@ -224,67 +170,31 @@ def test_reconciliation_creates_outbox_event(db_session: Session) -> None:
     assert outbox_ev.payload["order_id"] == order.id
 
 
-def test_duplicate_webhook_does_not_create_duplicate_outbox_event(
+def test_duplicate_payment_event_does_not_create_duplicate_outbox_event(
     db_session: Session,
 ) -> None:
-    """Критерий: Дублиран webhook не създава второ събитие в outbox таблицата."""
+    """Критерий: Дублирано платежно събитие не създава второ събитие в outbox таблицата."""
     user, _ = _create_user_and_token(db_session, email="dup@example.com")
     product = _create_product(db_session, "Dup Item", price_minor=1000)
     order = _create_order(db_session, user.id, product, quantity=1)
 
-    session_rec = StripeCheckoutSession(
-        order_id=order.id,
-        status="open",
-        amount_minor=1000,
-        currency="EUR",
-        mode="test",
-        stripe_session_id="cs_dup_outbox",
-        checkout_url="https://checkout.stripe.com/pay/cs_dup_outbox",
-        idempotency_key="idemp_dup_outbox",
+    svc = OrderService(
+        order_repository=OrderRepository(db_session),
+        cart_repository=CartRepository(db_session),
+        product_repository=ProductRepository(db_session),
+        user_repository=UserRepository(db_session),
+        session=db_session,
+        payments_client=MagicMock(spec=PaymentsClient),
     )
-    db_session.add(session_rec)
-    db_session.commit()
+    ev = make_payment_event(
+        event_type="payment.succeeded",
+        order_id=order.id,
+        amount_minor=1000,
+        event_id=str(uuid.uuid4()),
+    )
+    assert svc.apply_payment_event(ev) == "paid"
+    assert svc.apply_payment_event(ev) == "already_processed"
 
-    event_payload = {
-        "id": "evt_dup_1",
-        "type": "checkout.session.completed",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": "cs_dup_outbox",
-                "livemode": False,
-                "payment_status": "paid",
-                "amount_total": 1000,
-                "currency": "eur",
-                "client_reference_id": str(order.id),
-                "metadata": {
-                    "order_id": str(order.id),
-                    "attempt_id": str(session_rec.id),
-                },
-            }
-        },
-    }
-    payload_bytes = json.dumps(event_payload).encode()
-    sig = _generate_stripe_signature(payload_bytes, TEST_WEBHOOK_SECRET)
-
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        # 1. Първа доставка
-        r1 = client.post(
-            "/webhooks/stripe",
-            content=payload_bytes,
-            headers={"Stripe-Signature": sig},
-        )
-        assert r1.status_code == 200
-
-        # 2. Повторна доставка
-        r2 = client.post(
-            "/webhooks/stripe",
-            content=payload_bytes,
-            headers={"Stripe-Signature": sig},
-        )
-        assert r2.status_code == 200
-
-    # Проверка, че съществува ТОЧНО ЕДНО събитие в order_outbox_events
     events = (
         db_session.query(OrderOutboxEvent)
         .filter(OrderOutboxEvent.order_id == order.id)
@@ -296,47 +206,37 @@ def test_duplicate_webhook_does_not_create_duplicate_outbox_event(
 def test_duplicate_reconciliation_does_not_create_duplicate_outbox_event(
     db_session: Session,
 ) -> None:
-    """Критерий: Повторна сверка не създава второ събитие в outbox таблицата."""
+    """Критерий: Повторна сверка за просрочена поръчка не създава излишен outbox запис."""
     user, _ = _create_user_and_token(db_session, email="dup_rec@example.com")
     product = _create_product(db_session, "Dup Rec Item", price_minor=1000)
     order = _create_order(db_session, user.id, product, quantity=1)
     order.expires_at = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
         minutes=5
     )
-
-    session_rec = StripeCheckoutSession(
-        order_id=order.id,
-        status="completed",
-        amount_minor=1000,
-        currency="EUR",
-        mode="test",
-        stripe_session_id="cs_dup_rec_outbox",
-        checkout_url="https://checkout.stripe.com/pay/cs_dup_rec_outbox",
-        idempotency_key="idemp_dup_rec_outbox",
-    )
-    db_session.add(session_rec)
     db_session.commit()
 
+    mock_payments = MagicMock(spec=PaymentsClient)
+    mock_payments.cancel_order_payment.return_value = CancelPaymentResult(
+        status="can_cancel", action="no_session"
+    )
     service = OrderService(
         order_repository=OrderRepository(db_session),
         cart_repository=CartRepository(db_session),
         product_repository=ProductRepository(db_session),
         user_repository=UserRepository(db_session),
         session=db_session,
-        stripe_client=MagicMock(spec=StripeClient),
+        payments_client=mock_payments,
     )
 
-    # Първа сверка
-    service.reconcile_unresolved_orders()
-    # Втора сверка
-    service.reconcile_unresolved_orders()
+    service.reconcile_expired_orders()
+    service.reconcile_expired_orders()
 
     events = (
         db_session.query(OrderOutboxEvent)
         .filter(OrderOutboxEvent.order_id == order.id)
         .all()
     )
-    assert len(events) == 1
+    assert len(events) == 0
 
 
 def test_rollback_before_commit_does_not_leave_outbox_event(
@@ -349,40 +249,19 @@ def test_rollback_before_commit_does_not_leave_outbox_event(
     product = _create_product(db_session, "Rollback Item", price_minor=1500)
     order = _create_order(db_session, user.id, product, quantity=1)
 
-    session_rec = StripeCheckoutSession(
-        order_id=order.id,
-        status="open",
-        amount_minor=1500,
-        currency="EUR",
-        mode="test",
-        stripe_session_id="cs_rb_outbox",
-        checkout_url="https://checkout.stripe.com/pay/cs_rb_outbox",
-        idempotency_key="idemp_rb_outbox",
+    svc = OrderService(
+        order_repository=OrderRepository(db_session),
+        cart_repository=CartRepository(db_session),
+        product_repository=ProductRepository(db_session),
+        user_repository=UserRepository(db_session),
+        session=db_session,
+        payments_client=MagicMock(spec=PaymentsClient),
     )
-    db_session.add(session_rec)
-    db_session.commit()
-
-    event_payload = {
-        "id": "evt_rb_1",
-        "type": "checkout.session.completed",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": "cs_rb_outbox",
-                "livemode": False,
-                "payment_status": "paid",
-                "amount_total": 1500,
-                "currency": "eur",
-                "client_reference_id": str(order.id),
-                "metadata": {
-                    "order_id": str(order.id),
-                    "attempt_id": str(session_rec.id),
-                },
-            }
-        },
-    }
-    payload_bytes = json.dumps(event_payload).encode()
-    sig = _generate_stripe_signature(payload_bytes, TEST_WEBHOOK_SECRET)
+    ev = make_payment_event(
+        event_type="payment.succeeded",
+        order_id=order.id,
+        amount_minor=1500,
+    )
 
     original_commit = Session.commit
 
@@ -391,19 +270,11 @@ def test_rollback_before_commit_does_not_leave_outbox_event(
 
     monkeypatch.setattr(Session, "commit", _failing_commit)
 
-    with (
-        patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET),
-        pytest.raises(RuntimeError, match="Simulated DB failure"),
-    ):
-        client.post(
-            "/webhooks/stripe",
-            content=payload_bytes,
-            headers={"Stripe-Signature": sig},
-        )
+    with pytest.raises(RuntimeError, match="Simulated DB failure"):
+        svc.apply_payment_event(ev)
 
     monkeypatch.setattr(Session, "commit", original_commit)
 
-    # Проверка през независима чиста сесия: НИТО поръчката е paid, НИТО има outbox събитие!
     with session_factory() as verification_session:
         db_order = verification_session.get(Order, order.id)
         assert db_order is not None
@@ -432,10 +303,19 @@ def test_no_outbox_event_for_pending_cancelled_expired(db_session: Session) -> N
     assert len(events1) == 0
 
     # 2. Отказ от поръчка -> статус cancelled
-    client.post(
-        f"/orders/{order1.id}/cancel",
-        headers={"Authorization": f"Bearer {token}"},
+    mock_payments = MagicMock(spec=PaymentsClient)
+    mock_payments.cancel_order_payment.return_value = CancelPaymentResult(
+        status="can_cancel", action="no_session"
     )
+    app.dependency_overrides[get_payments_client] = lambda: mock_payments
+    try:
+        client.post(
+            f"/orders/{order1.id}/cancel",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_payments_client, None)
+
     db_session.refresh(order1)
     assert order1.status == "cancelled"
     events_cancelled = (
@@ -458,9 +338,9 @@ def test_no_outbox_event_for_pending_cancelled_expired(db_session: Session) -> N
         product_repository=ProductRepository(db_session),
         user_repository=UserRepository(db_session),
         session=db_session,
-        stripe_client=MagicMock(spec=StripeClient),
+        payments_client=mock_payments,
     )
-    service.reconcile_unresolved_orders()
+    service.reconcile_expired_orders()
     db_session.refresh(order2)
     assert order2.status == "expired"
     events_expired = (

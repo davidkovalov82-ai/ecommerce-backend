@@ -9,14 +9,14 @@ from app.modules.cart.dependencies import get_cart_repository
 from app.modules.cart.repository import CartRepository
 from app.modules.catalog.dependencies import get_product_repository
 from app.modules.catalog.repository import ProductRepository
+from app.modules.orders.payments_client import HttpPaymentsClient, PaymentsClient
 from app.modules.orders.repository import OrderRepository
 from app.modules.orders.service import OrderService
-from app.modules.orders.stripe_client import StripeClient
 
 
-def get_stripe_client() -> StripeClient:
-    """Фабрика за StripeClient."""
-    return StripeClient()
+def get_payments_client() -> PaymentsClient:
+    """Фабрика за вътрешния HTTP клиент към Payments сервиса."""
+    return HttpPaymentsClient()
 
 
 def get_order_repository(session: DbSession) -> OrderRepository:
@@ -30,7 +30,7 @@ def get_order_service(
     cart_repository: Annotated[CartRepository, Depends(get_cart_repository)],
     product_repository: Annotated[ProductRepository, Depends(get_product_repository)],
     user_repository: Annotated[UserRepository, Depends(get_user_repository)],
-    stripe_client: Annotated[StripeClient, Depends(get_stripe_client)],
+    payments_client: Annotated[PaymentsClient, Depends(get_payments_client)],
 ) -> OrderService:
     """Фабрика за OrderService, осигуряваща споделена сесия за всички участващи хранилища."""
     return OrderService(
@@ -39,7 +39,7 @@ def get_order_service(
         product_repository=product_repository,
         user_repository=user_repository,
         session=session,
-        stripe_client=stripe_client,
+        payments_client=payments_client,
     )
 
 

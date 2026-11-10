@@ -1,707 +1,403 @@
 import datetime
 import json
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
-from app.config import settings
 from app.main import app
-from app.modules.orders.dependencies import get_stripe_client
-from app.modules.orders.models import StripeCheckoutSession
-from app.modules.orders.stripe_client import StripeClient
+from app.modules.accounts.repository import UserRepository
+from app.modules.cart.repository import CartRepository
+from app.modules.catalog.models import Product
+from app.modules.catalog.repository import ProductRepository
+from app.modules.orders.models import (
+    Order,
+    OrderInboxEvent,
+    OrderOutboxEvent,
+    OrderPaymentDiscrepancy,
+)
+from app.modules.orders.payment_consumer import RabbitMQPaymentEventConsumer
+from app.modules.orders.payments_client import PaymentsClient
+from app.modules.orders.repository import OrderRepository
+from app.modules.orders.service import OrderService
 from tests.payments.helpers import (
-    TEST_WEBHOOK_SECRET,
     _create_order,
     _create_product,
     _create_user_and_token,
-    _generate_stripe_signature,
+    make_payment_event,
+    make_payment_event_envelope,
 )
 
 client = TestClient(app)
 
 
-def test_webhook_checkout_session_completed_success_and_stock_preserved(
+def _new_service(session: Session) -> OrderService:
+    return OrderService(
+        order_repository=OrderRepository(session),
+        cart_repository=CartRepository(session),
+        product_repository=ProductRepository(session),
+        user_repository=UserRepository(session),
+        session=session,
+        payments_client=MagicMock(spec=PaymentsClient),
+    )
+
+
+def test_payment_succeeded_marks_paid_preserves_stock_and_writes_single_outbox(
     db_session: Session,
 ) -> None:
-    """Критерий: Успешен webhook маркира paid, без повторно сваляне на stock."""
+    """payment.succeeded превежда поръчката в paid, пази stock и записва 1 order.paid и inbox."""
     user, _ = _create_user_and_token(db_session)
-    product = _create_product(db_session, "P1", price_minor=3000, stock=8)
-    order = _create_order(db_session, user.id, product, quantity=2)  # total: 6000
-    initial_stock = product.stock  # 8 - 2 = 6
+    product = _create_product(db_session, "Widget", price_minor=1500, stock=10)
+    order = _create_order(db_session, user.id, product, quantity=2)  # stock=8
+    assert order.total_minor == 3000
 
-    session_rec = StripeCheckoutSession(
+    svc = _new_service(db_session)
+    ev = make_payment_event(
+        event_type="payment.succeeded",
         order_id=order.id,
-        status="open",
-        amount_minor=6000,
-        currency="EUR",
-        stripe_session_id="cs_completed_123",
-        checkout_url="https://checkout.stripe.com/pay/cs_completed_123",
-        idempotency_key="idemp_123",
-    )
-    db_session.add(session_rec)
-    db_session.commit()
-
-    event_payload = {
-        "id": "evt_order_paid_123",
-        "type": "checkout.session.completed",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": "cs_completed_123",
-                "livemode": False,
-                "payment_status": "paid",
-                "amount_total": 6000,
-                "currency": "eur",
-                "client_reference_id": str(order.id),
-                "metadata": {
-                    "order_id": str(order.id),
-                    "attempt_id": str(session_rec.id),
-                },
-            }
-        },
-    }
-    payload_bytes = json.dumps(event_payload).encode()
-    sig = _generate_stripe_signature(payload_bytes, TEST_WEBHOOK_SECRET)
-
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=payload_bytes,
-            headers={"Stripe-Signature": sig},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "success"
-
-    db_session.refresh(order)
-    db_session.refresh(product)
-    db_session.refresh(session_rec)
-
-    assert order.status == "paid"
-    # Складовата наличност НЕ е намалявана повторно!
-    assert product.stock == initial_stock
-    assert session_rec.status == "completed"
-
-    event_exists = db_session.execute(
-        text(
-            "SELECT count(*) FROM stripe_processed_events "
-            "WHERE stripe_event_id = 'evt_order_paid_123'"
-        )
-    ).scalar()
-    assert event_exists == 1
-
-
-def test_webhook_before_stripe_create_response_links_attempt(
-    db_session: Session,
-) -> None:
-    """Критерий: Ако webhook пристигне преди завършване на create_checkout_session, сесията се свързва чрез записания опит."""
-    user, _ = _create_user_and_token(db_session)
-    product = _create_product(db_session, "P1", price_minor=2000, stock=5)
-    order = _create_order(db_session, user.id, product, quantity=1)
-
-    # Записваме опит в статус initiated БЕЗ stripe_session_id (Stripe create още не е върнал отговор в DB)
-    attempt = StripeCheckoutSession(
-        order_id=order.id,
-        status="initiated",
-        amount_minor=2000,
-        currency="EUR",
-        stripe_session_id=None,
-        checkout_url=None,
-        idempotency_key="idemp_early_1",
-    )
-    db_session.add(attempt)
-    db_session.commit()
-
-    # Webhook пристига преди create отговора!
-    event_payload = {
-        "id": "evt_early_arrival_1",
-        "type": "checkout.session.completed",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": "cs_early_stripe_id_999",
-                "livemode": False,
-                "payment_status": "paid",
-                "amount_total": 2000,
-                "currency": "eur",
-                "client_reference_id": str(order.id),
-                "metadata": {
-                    "order_id": str(order.id),
-                    "attempt_id": str(attempt.id),
-                },
-            }
-        },
-    }
-    payload_bytes = json.dumps(event_payload).encode()
-    sig = _generate_stripe_signature(payload_bytes, TEST_WEBHOOK_SECRET)
-
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=payload_bytes,
-            headers={"Stripe-Signature": sig},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "success"
-
-    db_session.refresh(order)
-    db_session.refresh(attempt)
-    assert order.status == "paid"
-    # Сесията е коректно свързана с полученото Stripe ID и е маркирана като completed
-    assert attempt.stripe_session_id == "cs_early_stripe_id_999"
-    assert attempt.status == "completed"
-
-
-def test_webhook_concurrent_deliveries_no_500_or_duplicate_mutation(
-    db_session: Session,
-) -> None:
-    """Критерий: Две едновременни доставки на едно event ID не дават 500 и не прилагат промяната два пъти."""
-    user, _ = _create_user_and_token(db_session)
-    product = _create_product(db_session, "P1", price_minor=2000, stock=10)
-    order = _create_order(db_session, user.id, product, quantity=1)
-
-    session_rec = StripeCheckoutSession(
-        order_id=order.id,
-        status="open",
-        amount_minor=2000,
-        currency="EUR",
-        stripe_session_id="cs_concurrent_123",
-        checkout_url="https://checkout.stripe.com/pay/cs_concurrent_123",
-        idempotency_key="idemp_conc_1",
-    )
-    db_session.add(session_rec)
-    db_session.commit()
-
-    event_payload = {
-        "id": "evt_concurrent_delivery_123",
-        "type": "checkout.session.completed",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": "cs_concurrent_123",
-                "livemode": False,
-                "payment_status": "paid",
-                "amount_total": 2000,
-                "currency": "eur",
-                "client_reference_id": str(order.id),
-                "metadata": {
-                    "order_id": str(order.id),
-                    "attempt_id": str(session_rec.id),
-                },
-            }
-        },
-    }
-    payload_bytes = json.dumps(event_payload).encode()
-    sig = _generate_stripe_signature(payload_bytes, TEST_WEBHOOK_SECRET)
-
-    def _send_webhook() -> tuple[int, dict[str, Any]]:
-        thread_client = TestClient(app)
-        with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-            r = thread_client.post(
-                "/webhooks/stripe",
-                content=payload_bytes,
-                headers={"Stripe-Signature": sig},
-            )
-            return r.status_code, r.json()
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        f1 = executor.submit(_send_webhook)
-        f2 = executor.submit(_send_webhook)
-        code1, data1 = f1.result()
-        code2, data2 = f2.result()
-
-    # И двете заявки връщат 200 OK (нито една не гърми с 500)
-    assert code1 == 200
-    assert code2 == 200
-    statuses = [data1["status"], data2["status"]]
-    assert "success" in statuses
-    assert "already_processed" in statuses or statuses == ["success", "success"]
-
-    # В базата има точно 1 запис за събитието
-    count = db_session.execute(
-        text(
-            "SELECT count(*) FROM stripe_processed_events "
-            "WHERE stripe_event_id = 'evt_concurrent_delivery_123'"
-        )
-    ).scalar()
-    assert count == 1
-
-
-def test_webhook_payment_unpaid_leaves_order_pending(db_session: Session) -> None:
-    """Неуспешно плащане (напр. отхвърлена карта) оставя поръчката pending_payment."""
-    user, _ = _create_user_and_token(db_session)
-    product = _create_product(db_session, "P1", price_minor=2000)
-    order = _create_order(db_session, user.id, product, quantity=1)
-
-    session_rec = StripeCheckoutSession(
-        order_id=order.id,
-        status="open",
-        amount_minor=2000,
-        currency="EUR",
-        stripe_session_id="cs_unpaid_456",
-        checkout_url="https://checkout.stripe.com/pay/cs_unpaid_456",
-        idempotency_key="idemp_unpaid_1",
-    )
-    db_session.add(session_rec)
-    db_session.commit()
-
-    event_payload = {
-        "id": "evt_order_unpaid_456",
-        "type": "checkout.session.completed",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": "cs_unpaid_456",
-                "livemode": False,
-                "payment_status": "unpaid",
-                "amount_total": 2000,
-                "currency": "eur",
-                "client_reference_id": str(order.id),
-                "metadata": {
-                    "order_id": str(order.id),
-                    "attempt_id": str(session_rec.id),
-                },
-            }
-        },
-    }
-    payload_bytes = json.dumps(event_payload).encode()
-    sig = _generate_stripe_signature(payload_bytes, TEST_WEBHOOK_SECRET)
-
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=payload_bytes,
-            headers={"Stripe-Signature": sig},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "processing"
-
-    db_session.refresh(order)
-    db_session.refresh(session_rec)
-    assert order.status == "payment_processing"
-    assert session_rec.status == "processing"
-
-
-def test_webhook_async_payment_succeeded_marks_paid_stock_unchanged(
-    db_session: Session,
-) -> None:
-    """Асинхронно потвърждение (async_payment_succeeded) превежда поръчката в paid, без промяна на stock."""
-    user, _ = _create_user_and_token(db_session)
-    product = _create_product(db_session, "SEPA Product", stock=10, price_minor=5000)
-    order = _create_order(db_session, user.id, product, quantity=2)  # stock става 8
-    order.status = "payment_processing"
-
-    session_rec = StripeCheckoutSession(
-        order_id=order.id,
-        status="processing",
-        amount_minor=10000,
-        currency="EUR",
-        mode="test",
-        stripe_session_id="cs_async_succ_123",
-        checkout_url="https://checkout.stripe.com/pay/cs_async_succ_123",
-        idempotency_key="idemp_async_succ_1",
-    )
-    db_session.add(session_rec)
-    db_session.commit()
-
-    event_payload = {
-        "id": "evt_async_succ_1",
-        "type": "checkout.session.async_payment_succeeded",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": "cs_async_succ_123",
-                "livemode": False,
-                "payment_status": "paid",
-                "amount_total": 10000,
-                "currency": "eur",
-                "client_reference_id": str(order.id),
-                "metadata": {
-                    "order_id": str(order.id),
-                    "attempt_id": str(session_rec.id),
-                },
-            }
-        },
-    }
-    payload_bytes = json.dumps(event_payload).encode()
-    sig = _generate_stripe_signature(payload_bytes, TEST_WEBHOOK_SECRET)
-
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=payload_bytes,
-            headers={"Stripe-Signature": sig},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "success"
-
-    db_session.refresh(order)
-    db_session.refresh(session_rec)
-    db_session.refresh(product)
-
-    assert order.status == "paid"
-    assert session_rec.status == "completed"
-    assert product.stock == 8  # Наличността не се намалява повторно!
-
-
-def test_webhook_async_payment_failed_resets_pending_if_not_expired(
-    db_session: Session,
-) -> None:
-    """Неуспешно отложено плащане преди изтичане на срока връща поръчката в pending_payment (клиентът може да опита пак)."""
-    user, token = _create_user_and_token(db_session)
-    product = _create_product(db_session, "SEPA Fail", stock=5, price_minor=4000)
-    order = _create_order(db_session, user.id, product, quantity=1)
-    order.status = "payment_processing"
-    order.expires_at = datetime.datetime.now(datetime.UTC) + datetime.timedelta(
-        minutes=20
-    )
-
-    session_rec = StripeCheckoutSession(
-        order_id=order.id,
-        status="processing",
-        amount_minor=4000,
-        currency="EUR",
-        mode="test",
-        stripe_session_id="cs_async_fail_123",
-        checkout_url="https://checkout.stripe.com/pay/cs_async_fail_123",
-        idempotency_key="idemp_async_fail_1",
-    )
-    db_session.add(session_rec)
-    db_session.commit()
-
-    event_payload = {
-        "id": "evt_async_fail_1",
-        "type": "checkout.session.async_payment_failed",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": "cs_async_fail_123",
-                "livemode": False,
-                "client_reference_id": str(order.id),
-                "metadata": {
-                    "order_id": str(order.id),
-                    "attempt_id": str(session_rec.id),
-                },
-            }
-        },
-    }
-    payload_bytes = json.dumps(event_payload).encode()
-    sig = _generate_stripe_signature(payload_bytes, TEST_WEBHOOK_SECRET)
-
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=payload_bytes,
-            headers={"Stripe-Signature": sig},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "failed"
-
-    db_session.refresh(order)
-    db_session.refresh(session_rec)
-    db_session.refresh(product)
-
-    assert session_rec.status == "failed"
-    assert order.status == "pending_payment"
-    assert product.stock == 4  # Резервацията се пази, защото срокът не е изтекъл
-
-    # Клиентът може да създаде нов платежен линк
-    mock_client = MagicMock(spec=StripeClient)
-    mock_session = MagicMock()
-    mock_session.id = "cs_retry_new_999"
-    mock_session.url = "https://checkout.stripe.com/pay/cs_retry_new_999"
-    mock_client.create_checkout_session.return_value = mock_session
-
-    app.dependency_overrides[get_stripe_client] = lambda: mock_client
-    try:
-        resp2 = client.post(
-            f"/orders/{order.id}/checkout-session",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert resp2.status_code == 200
-        assert resp2.json()["checkout_url"] == mock_session.url
-    finally:
-        app.dependency_overrides.pop(get_stripe_client, None)
-
-
-def test_webhook_async_payment_failed_expires_order_if_reserve_expired(
-    db_session: Session,
-) -> None:
-    """Неуспешно отложено плащане след изтичане на срока маркира поръчката като expired и връща stock."""
-    user, _ = _create_user_and_token(db_session)
-    product = _create_product(db_session, "SEPA Expired", stock=5, price_minor=4000)
-    order = _create_order(db_session, user.id, product, quantity=2)  # stock става 3
-    order.status = "payment_processing"
-    order.expires_at = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
-        minutes=5
-    )
-
-    session_rec = StripeCheckoutSession(
-        order_id=order.id,
-        status="processing",
-        amount_minor=8000,
-        currency="EUR",
-        mode="test",
-        stripe_session_id="cs_async_exp_456",
-        checkout_url="https://checkout.stripe.com/pay/cs_async_exp_456",
-        idempotency_key="idemp_async_exp_1",
-    )
-    db_session.add(session_rec)
-    db_session.commit()
-
-    event_payload = {
-        "id": "evt_async_exp_1",
-        "type": "checkout.session.async_payment_failed",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": "cs_async_exp_456",
-                "livemode": False,
-                "client_reference_id": str(order.id),
-                "metadata": {
-                    "order_id": str(order.id),
-                    "attempt_id": str(session_rec.id),
-                },
-            }
-        },
-    }
-    payload_bytes = json.dumps(event_payload).encode()
-    sig = _generate_stripe_signature(payload_bytes, TEST_WEBHOOK_SECRET)
-
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=payload_bytes,
-            headers={"Stripe-Signature": sig},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "failed"
-
-    db_session.refresh(order)
-    db_session.refresh(session_rec)
-    db_session.refresh(product)
-
-    assert session_rec.status == "failed"
-    assert order.status == "expired"
-    assert product.stock == 5  # Наличността е възстановена точно веднъж!
-
-
-def test_webhook_session_expired_event(db_session: Session) -> None:
-    """Събитие checkout.session.expired маркира опита expired и освобождава стоката, ако срокът на поръчката е минал."""
-    user, _ = _create_user_and_token(db_session)
-    product = _create_product(db_session, "Timeout Prod", stock=7, price_minor=2000)
-    order = _create_order(db_session, user.id, product, quantity=1)  # stock 6
-    order.expires_at = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
-        minutes=1
-    )
-
-    session_rec = StripeCheckoutSession(
-        order_id=order.id,
-        status="open",
-        amount_minor=2000,
-        currency="EUR",
-        mode="test",
-        stripe_session_id="cs_sess_exp_789",
-        checkout_url="https://checkout.stripe.com/pay/cs_sess_exp_789",
-        idempotency_key="idemp_sess_exp_1",
-    )
-    db_session.add(session_rec)
-    db_session.commit()
-
-    event_payload = {
-        "id": "evt_sess_exp_1",
-        "type": "checkout.session.expired",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": "cs_sess_exp_789",
-                "livemode": False,
-                "client_reference_id": str(order.id),
-                "metadata": {
-                    "order_id": str(order.id),
-                    "attempt_id": str(session_rec.id),
-                },
-            }
-        },
-    }
-    payload_bytes = json.dumps(event_payload).encode()
-    sig = _generate_stripe_signature(payload_bytes, TEST_WEBHOOK_SECRET)
-
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=payload_bytes,
-            headers={"Stripe-Signature": sig},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "expired"
-
-    db_session.refresh(order)
-    db_session.refresh(session_rec)
-    db_session.refresh(product)
-
-    assert session_rec.status == "expired"
-    assert order.status == "expired"
-    assert product.stock == 7
-
-
-def test_webhook_out_of_order_async_success_before_completed_unpaid(
-    db_session: Session,
-) -> None:
-    """Ако async_payment_succeeded пристигне преди completed(unpaid), поръчката не се връща обратно в payment_processing."""
-    user, _ = _create_user_and_token(db_session)
-    product = _create_product(db_session, "Out of Order", stock=5, price_minor=3000)
-    order = _create_order(db_session, user.id, product, quantity=1)
-
-    session_rec = StripeCheckoutSession(
-        order_id=order.id,
-        status="open",
         amount_minor=3000,
-        currency="EUR",
-        mode="test",
-        stripe_session_id="cs_ooo_1",
-        checkout_url="https://checkout.stripe.com/pay/cs_ooo_1",
-        idempotency_key="idemp_ooo_1",
     )
-    db_session.add(session_rec)
-    db_session.commit()
+    assert svc.apply_payment_event(ev) == "paid"
 
-    # 1. Пристига async_payment_succeeded първо
-    evt_succ = {
-        "id": "evt_ooo_succ",
-        "type": "checkout.session.async_payment_succeeded",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": "cs_ooo_1",
-                "livemode": False,
-                "payment_status": "paid",
-                "amount_total": 3000,
-                "currency": "eur",
-                "client_reference_id": str(order.id),
-                "metadata": {
-                    "order_id": str(order.id),
-                    "attempt_id": str(session_rec.id),
-                },
-            }
-        },
-    }
-    b_succ = json.dumps(evt_succ).encode()
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=b_succ,
-            headers={
-                "Stripe-Signature": _generate_stripe_signature(
-                    b_succ, TEST_WEBHOOK_SECRET
-                )
-            },
+    db_session.refresh(order)
+    db_session.refresh(product)
+    assert order.status == "paid"
+    assert product.stock == 8
+
+    outbox = (
+        db_session.query(OrderOutboxEvent)
+        .filter(OrderOutboxEvent.order_id == order.id)
+        .all()
+    )
+    assert len(outbox) == 1
+    assert outbox[0].event_type == "order.paid"
+
+    inbox = db_session.get(OrderInboxEvent, ev.event_id)
+    assert inbox is not None
+    assert inbox.outcome == "paid"
+
+
+def test_consumer_commits_before_ack_and_redelivery_is_idempotent(
+    db_session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Ако consumer падне след commit преди basic_ack, повторната доставка не дублира order.paid."""
+    user, _ = _create_user_and_token(db_session, email="ack_loss@example.com")
+    product = _create_product(db_session, "AckLossProd", price_minor=2000, stock=10)
+    order = _create_order(db_session, user.id, product, quantity=3)  # stock=7
+
+    envelope = make_payment_event_envelope(
+        event_type="payment.succeeded",
+        order_id=order.id,
+        amount_minor=6000,
+    )
+    raw_body = json.dumps(envelope).encode("utf-8")
+
+    # Първа доставка: симулираме срив точно преди basic_ack
+    def fail_before_ack(_ev, _ch, _method):  # type: ignore[no-untyped-def]
+        raise RuntimeError("Simulated crash before basic_ack")
+
+    consumer1 = RabbitMQPaymentEventConsumer(
+        session_factory=session_factory,
+        before_ack_hook=fail_before_ack,
+    )
+    ch1 = MagicMock()
+    with pytest.raises(RuntimeError, match="Simulated crash before basic_ack"):
+        consumer1._handle_message(
+            ch1, SimpleNamespace(delivery_tag=101), None, raw_body
         )
-        assert resp.status_code == 200
+    ch1.basic_ack.assert_not_called()
 
+    # Транзакцията вече е commit-ната в БД
+    with session_factory() as s:
+        assert s.get(Order, order.id).status == "paid"  # type: ignore[union-attr]
+        assert s.get(Product, product.id).stock == 7  # type: ignore[union-attr]
+        assert (
+            s.query(OrderOutboxEvent)
+            .filter(OrderOutboxEvent.order_id == order.id)
+            .count()
+            == 1
+        )
+
+    # Повторна доставка от RabbitMQ -> идемпотентно, basic_ack се вика
+    consumer2 = RabbitMQPaymentEventConsumer(session_factory=session_factory)
+    ch2 = MagicMock()
+    consumer2._handle_message(ch2, SimpleNamespace(delivery_tag=102), None, raw_body)
+    ch2.basic_ack.assert_called_once_with(delivery_tag=102)
+
+    with session_factory() as s:
+        assert s.get(Order, order.id).status == "paid"  # type: ignore[union-attr]
+        assert s.get(Product, product.id).stock == 7  # type: ignore[union-attr]
+        assert (
+            s.query(OrderOutboxEvent)
+            .filter(OrderOutboxEvent.order_id == order.id)
+            .count()
+            == 1
+        )
+
+
+def test_concurrent_payment_event_deliveries_no_duplicate_outbox(
+    db_session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Паралелно прилагане на едно и също event_id минава без срив и дубликат."""
+    user, _ = _create_user_and_token(db_session, email="concurrent_ev@example.com")
+    product = _create_product(db_session, "RaceProd", price_minor=1500, stock=10)
+    order = _create_order(db_session, user.id, product, quantity=1)
+
+    ev = make_payment_event(
+        event_type="payment.succeeded",
+        order_id=order.id,
+        amount_minor=1500,
+    )
+
+    def _run(_idx: int) -> str:
+        with session_factory() as s:
+            return _new_service(s).apply_payment_event(ev)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        outcomes = list(pool.map(_run, range(4)))
+
+    assert "paid" in outcomes
+    assert all(o in ("paid", "already_processed") for o in outcomes)
+
+    with session_factory() as s:
+        assert s.get(Order, order.id).status == "paid"  # type: ignore[union-attr]
+        assert (
+            s.query(OrderOutboxEvent)
+            .filter(OrderOutboxEvent.order_id == order.id)
+            .count()
+            == 1
+        )
+
+
+def test_processing_then_failed_rotates_attempt_key_and_ignores_stale_attempt(
+    db_session: Session,
+) -> None:
+    """payment.processing -> payment.failed връща в pending_payment и отваря attempt_2."""
+    user, _ = _create_user_and_token(db_session, email="rotate@example.com")
+    product = _create_product(db_session, "AsyncFailProd", price_minor=2500, stock=10)
+    future = datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=25)
+    order = _create_order(
+        db_session, user.id, product, quantity=2, expires_at=future
+    )  # 5000, stock=8
+
+    svc = _new_service(db_session)
+    assert (
+        svc.apply_payment_event(
+            make_payment_event(
+                event_type="payment.processing",
+                order_id=order.id,
+                attempt_key=f"order_{order.id}_attempt_1",
+                amount_minor=5000,
+            )
+        )
+        == "processing"
+    )
+    db_session.refresh(order)
+    assert order.status == "payment_processing"
+
+    assert (
+        svc.apply_payment_event(
+            make_payment_event(
+                event_type="payment.failed",
+                order_id=order.id,
+                attempt_key=f"order_{order.id}_attempt_1",
+                amount_minor=5000,
+            )
+        )
+        == "failed"
+    )
+    db_session.refresh(order)
+    db_session.refresh(product)
+    assert order.status == "pending_payment"
+    assert order.payment_attempt_seq == 2
+    assert order.current_attempt_key == f"order_{order.id}_attempt_2"
+    assert product.stock == 8
+
+    # Закъсняло payment.processing / payment.expired за стария attempt_1 се игнорира!
+    assert (
+        svc.apply_payment_event(
+            make_payment_event(
+                event_type="payment.processing",
+                order_id=order.id,
+                attempt_key=f"order_{order.id}_attempt_1",
+                amount_minor=5000,
+            )
+        )
+        == "ignored_stale_attempt"
+    )
+    db_session.refresh(order)
+    assert order.status == "pending_payment"
+    assert order.current_attempt_key == f"order_{order.id}_attempt_2"
+
+
+def test_failed_or_expired_after_reserve_deadline_expires_order_and_restores_stock(
+    db_session: Session,
+) -> None:
+    """Терминален неуспех/изтичане след expires_at превежда поръчката в expired и връща stock."""
+    user, _ = _create_user_and_token(db_session, email="exp_after@example.com")
+    product = _create_product(db_session, "ExpAfterProd", price_minor=1500, stock=10)
+    past = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=5)
+    order = _create_order(
+        db_session,
+        user.id,
+        product,
+        quantity=3,
+        status="payment_processing",
+        expires_at=past,
+    )  # stock=7
+
+    svc = _new_service(db_session)
+    assert (
+        svc.apply_payment_event(
+            make_payment_event(
+                event_type="payment.expired",
+                order_id=order.id,
+                attempt_key=f"order_{order.id}_attempt_1",
+                amount_minor=4500,
+            )
+        )
+        == "expired"
+    )
+    db_session.refresh(order)
+    db_session.refresh(product)
+    assert order.status == "expired"
+    assert product.stock == 10
+
+
+def test_out_of_order_succeeded_before_stale_processing_stays_paid(
+    db_session: Session,
+) -> None:
+    """Закъсняло payment.processing след payment.succeeded не връща поръчката назад от paid."""
+    user, _ = _create_user_and_token(db_session, email="ooo@example.com")
+    product = _create_product(db_session, "OOOProd", price_minor=1200, stock=5)
+    order = _create_order(db_session, user.id, product, quantity=1)
+
+    svc = _new_service(db_session)
+    assert (
+        svc.apply_payment_event(
+            make_payment_event(
+                event_type="payment.succeeded",
+                order_id=order.id,
+                amount_minor=1200,
+            )
+        )
+        == "paid"
+    )
+    assert (
+        svc.apply_payment_event(
+            make_payment_event(
+                event_type="payment.processing",
+                order_id=order.id,
+                amount_minor=1200,
+            )
+        )
+        == "ignored"
+    )
     db_session.refresh(order)
     assert order.status == "paid"
 
-    # 2. Закъсняло събитие completed с payment_status=unpaid
-    evt_compl = {
-        "id": "evt_ooo_compl",
-        "type": "checkout.session.completed",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": "cs_ooo_1",
-                "livemode": False,
-                "payment_status": "unpaid",
-                "amount_total": 3000,
-                "currency": "eur",
-                "client_reference_id": str(order.id),
-                "metadata": {
-                    "order_id": str(order.id),
-                    "attempt_id": str(session_rec.id),
-                },
-            }
-        },
-    }
-    b_compl = json.dumps(evt_compl).encode()
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=b_compl,
-            headers={
-                "Stripe-Signature": _generate_stripe_signature(
-                    b_compl, TEST_WEBHOOK_SECRET
-                )
-            },
-        )
-        assert resp.status_code == 200
 
-    db_session.refresh(order)
-    assert order.status == "paid"  # Не е върната в payment_processing!
-
-
-def test_webhook_discrepancy_payment_on_cancelled_or_expired_order(
+def test_late_payment_succeeded_on_cancelled_and_expired_orders_creates_visible_discrepancy(
     db_session: Session,
 ) -> None:
-    """Плащане върху отказана поръчка връща status='discrepancy' и НЕ променя наличностите тихомълком."""
-    user, _ = _create_user_and_token(db_session)
-    product = _create_product(db_session, "Discrepancy Prod", stock=5, price_minor=2500)
-    order = _create_order(db_session, user.id, product, quantity=1)  # stock 4
-    # Потребителят е отказал поръчката: наличността е възстановена на 5
-    order.status = "cancelled"
-    product.stock = 5
+    """Късно payment.succeeded върху cancelled/expired НЕ променя статуса/stock/outbox, а записва видимо разхождение."""
+    user, token = _create_user_and_token(db_session, email="disc_buyer@example.com")
+    product = _create_product(db_session, "DiscProd", price_minor=2000, stock=10)
 
-    session_rec = StripeCheckoutSession(
-        order_id=order.id,
-        status="open",
-        amount_minor=2500,
-        currency="EUR",
-        mode="test",
-        stripe_session_id="cs_discrep_1",
-        checkout_url="https://checkout.stripe.com/pay/cs_discrep_1",
-        idempotency_key="idemp_discrep_1",
-    )
-    db_session.add(session_rec)
+    cancelled_order = _create_order(
+        db_session, user.id, product, quantity=2, status="cancelled"
+    )  # 4000
+    expired_order = _create_order(
+        db_session, user.id, product, quantity=1, status="expired"
+    )  # 2000
+    # Симулираме вече върнат stock при отмяна/изтичане -> 10
+    product.stock = 10
     db_session.commit()
 
-    event_payload = {
-        "id": "evt_discrep_1",
-        "type": "checkout.session.completed",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": "cs_discrep_1",
-                "livemode": False,
-                "payment_status": "paid",
-                "amount_total": 2500,
-                "currency": "eur",
-                "client_reference_id": str(order.id),
-                "metadata": {
-                    "order_id": str(order.id),
-                    "attempt_id": str(session_rec.id),
-                },
-            }
-        },
-    }
-    payload_bytes = json.dumps(event_payload).encode()
-    sig = _generate_stripe_signature(payload_bytes, TEST_WEBHOOK_SECRET)
+    svc = _new_service(db_session)
+    ev1 = make_payment_event(
+        event_type="payment.succeeded",
+        order_id=cancelled_order.id,
+        amount_minor=4000,
+        stripe_session_id="cs_disc_cancelled",
+    )
+    ev2 = make_payment_event(
+        event_type="payment.succeeded",
+        order_id=expired_order.id,
+        amount_minor=2000,
+        stripe_session_id="cs_disc_expired",
+    )
 
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=payload_bytes,
-            headers={"Stripe-Signature": sig},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "discrepancy"
-        assert resp.json()["reason"] == "payment_on_cancelled_order"
+    assert svc.apply_payment_event(ev1) == "discrepancy"
+    assert svc.apply_payment_event(ev2) == "discrepancy"
 
-    db_session.refresh(order)
-    db_session.refresh(session_rec)
+    db_session.refresh(cancelled_order)
+    db_session.refresh(expired_order)
     db_session.refresh(product)
+    assert cancelled_order.status == "cancelled"
+    assert expired_order.status == "expired"
+    assert product.stock == 10
+    assert (
+        db_session.query(OrderOutboxEvent)
+        .filter(OrderOutboxEvent.order_id.in_([cancelled_order.id, expired_order.id]))
+        .count()
+        == 0
+    )
 
-    assert order.status == "cancelled"
-    assert session_rec.status == "completed"
-    assert product.stock == 5  # Не е пипнат!
+    d1 = (
+        db_session.query(OrderPaymentDiscrepancy)
+        .filter(OrderPaymentDiscrepancy.order_id == cancelled_order.id)
+        .one()
+    )
+    assert d1.reason == "payment_on_cancelled_order"
+    assert d1.amount_minor == 4000
+    assert d1.status == "open"
+
+    # Проверка през API на поръчката: видими has_payment_discrepancy и payment_discrepancies
+    resp = client.get(
+        f"/orders/{cancelled_order.id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "cancelled"
+    assert body["has_payment_discrepancy"] is True
+    assert len(body["payment_discrepancies"]) == 1
+    assert body["payment_discrepancies"][0]["reason"] == "payment_on_cancelled_order"
+    assert body["payment_discrepancies"][0]["amount_minor"] == 4000
+
+
+def test_amount_mismatch_and_missing_order_are_safe(db_session: Session) -> None:
+    """Несъответстваща сума или липсваща поръчка не променят статус и се записват в inbox."""
+    user, _ = _create_user_and_token(db_session, email="mismatch@example.com")
+    product = _create_product(db_session, "MismatchProd", price_minor=1500, stock=5)
+    order = _create_order(db_session, user.id, product, quantity=1)
+
+    svc = _new_service(db_session)
+    assert (
+        svc.apply_payment_event(
+            make_payment_event(
+                event_type="payment.succeeded",
+                order_id=order.id,
+                amount_minor=9999,
+            )
+        )
+        == "mismatched"
+    )
+    db_session.refresh(order)
+    assert order.status == "pending_payment"
+
+    missing_ev = make_payment_event(
+        event_type="payment.succeeded",
+        order_id=999_999_999,
+        amount_minor=1500,
+    )
+    assert svc.apply_payment_event(missing_ev) == "order_not_found"
+    inbox = db_session.get(OrderInboxEvent, missing_ev.event_id)
+    assert inbox is not None
+    assert inbox.outcome == "order_not_found"

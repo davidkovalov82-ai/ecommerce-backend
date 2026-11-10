@@ -1,0 +1,1261 @@
+"""Изолирана E2E проверка на К5 върху реални контейнери (Commerce, Payments, Notifications, Stripe Mock, PostgreSQL, RabbitMQ)."""
+
+from __future__ import annotations
+
+import datetime
+import hashlib
+import hmac
+import json
+import subprocess
+import sys
+import time
+import uuid
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pika
+import psycopg
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+COMPOSE_PROJECT = "commerce-k5-e2e"
+COMPOSE_FILE = str(ROOT_DIR / "compose.e2e.yaml")
+
+COMMERCE_API_URL = "http://127.0.0.1:58000"
+PAYMENTS_API_URL = "http://127.0.0.1:58001"
+MAILPIT_API_URL = "http://127.0.0.1:58025"
+SMS_MOCK_URL = "http://127.0.0.1:58080"
+STRIPE_MOCK_URL = "http://127.0.0.1:58081"
+RABBITMQ_MGMT_URL = "http://127.0.0.1:55673"
+
+INTERNAL_TOKEN = "k5-e2e-internal-payments-token-32b!"
+STRIPE_WEBHOOK_SECRET = "whsec_k4_e2e_secret_stripe_commerce_32_bytes_ok"
+
+COMMERCE_DSN = "postgresql://commerce_app:commerce_app@127.0.0.1:55432/commerce"
+PAYMENTS_DSN = "postgresql://payments_app:payments_app@127.0.0.1:55432/payments"
+NOTIFICATIONS_DSN = (
+    "postgresql://notifications_app:notifications_app@127.0.0.1:55432/notifications"
+)
+ADMIN_COMMERCE_DSN = "postgresql://pgadmin:pgadmin_e2e_password@db-e2e:5432/commerce"
+CONTAINER_PAYMENTS_DSN = "postgresql://payments_app:payments_app@db-e2e:5432/payments"
+
+DEFAULT_ADDRESS = {
+    "recipient_name": "Мария Георгиева",
+    "phone": "+359889123456",
+    "country_code": "BG",
+    "city": "Sofia",
+    "postal_code": "1000",
+    "address_line1": "bul. Vitosha 42",
+}
+
+
+def wait_until[T](
+    description: str,
+    predicate: Callable[[], T | None],
+    *,
+    timeout_seconds: float = 40.0,
+    poll_interval: float = 0.25,
+) -> T:
+    """Изчаква условие с краен таймаут."""
+    deadline = time.monotonic() + timeout_seconds
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            result = predicate()
+            if result:
+                return result
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+        time.sleep(poll_interval)
+    suffix = f" (last error: {last_error})" if last_error else ""
+    raise AssertionError(f"Timeout waiting for: {description}{suffix}")
+
+
+def compose_cmd(
+    *args: str, capture_output: bool = False
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["docker", "compose", "-p", COMPOSE_PROJECT, "-f", COMPOSE_FILE, *args],
+        cwd=ROOT_DIR,
+        capture_output=capture_output,
+        text=True,
+        check=True,
+    )
+
+
+def register_and_login(
+    email: str, password: str = "VeryStrongPassword123!"
+) -> tuple[int, str]:
+    reg = httpx.post(
+        f"{COMMERCE_API_URL}/users",
+        json={"email": email, "password": password},
+        timeout=5.0,
+    )
+    assert reg.status_code == 201, f"Register failed: {reg.text}"
+    user_id = reg.json()["id"]
+
+    login = httpx.post(
+        f"{COMMERCE_API_URL}/auth/login",
+        json={"email": email, "password": password},
+        timeout=5.0,
+    )
+    assert login.status_code == 200, f"Login failed: {login.text}"
+    return int(user_id), login.json()["access_token"]
+
+
+def create_product(token: str, *, title: str, price_minor: int, stock: int = 10) -> int:
+    resp = httpx.post(
+        f"{COMMERCE_API_URL}/products",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "title": title,
+            "price_minor": price_minor,
+            "currency": "EUR",
+            "stock": stock,
+            "active": True,
+        },
+        timeout=5.0,
+    )
+    assert resp.status_code == 201, f"Product create failed: {resp.text}"
+    return int(resp.json()["id"])
+
+
+def get_product_stock(product_id: int) -> int:
+    resp = httpx.get(f"{COMMERCE_API_URL}/products/{product_id}", timeout=5.0)
+    assert resp.status_code == 200, f"Get product failed: {resp.text}"
+    return int(resp.json()["stock"])
+
+
+def add_to_cart(token: str, product_id: int, quantity: int) -> None:
+    resp = httpx.put(
+        f"{COMMERCE_API_URL}/cart/items/{product_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"quantity": quantity},
+        timeout=5.0,
+    )
+    assert resp.status_code == 200, f"Add to cart failed: {resp.text}"
+
+
+def create_order(token: str, *, phone: str | None = None) -> dict[str, Any]:
+    address = dict(DEFAULT_ADDRESS)
+    if phone is not None:
+        address["phone"] = phone
+    resp = httpx.post(
+        f"{COMMERCE_API_URL}/orders",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Idempotency-Key": str(uuid.uuid4()),
+        },
+        json={"shipping_address": address},
+        timeout=5.0,
+    )
+    assert resp.status_code == 201, f"Order create failed: {resp.text}"
+    return dict(resp.json())
+
+
+def get_order_detail(token: str, order_id: int) -> dict[str, Any]:
+    resp = httpx.get(
+        f"{COMMERCE_API_URL}/orders/{order_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=5.0,
+    )
+    assert resp.status_code == 200, f"Get order failed: {resp.text}"
+    return dict(resp.json())
+
+
+def sign_and_post_stripe_webhook(event_payload: dict[str, Any]) -> httpx.Response:
+    payload_bytes = json.dumps(event_payload).encode("utf-8")
+    ts = int(time.time())
+    signed = f"{ts}.".encode() + payload_bytes
+    sig = hmac.new(
+        STRIPE_WEBHOOK_SECRET.encode("utf-8"),
+        signed,
+        hashlib.sha256,
+    ).hexdigest()
+    return httpx.post(
+        f"{PAYMENTS_API_URL}/webhooks/stripe",
+        content=payload_bytes,
+        headers={"Stripe-Signature": f"t={ts},v1={sig}"},
+        timeout=5.0,
+    )
+
+
+def get_mailpit_messages(recipient_email: str) -> list[dict[str, Any]]:
+    resp = httpx.get(f"{MAILPIT_API_URL}/api/v1/messages", timeout=3.0)
+    resp.raise_for_status()
+    return [
+        m
+        for m in resp.json().get("messages", [])
+        if any(r.get("Address") == recipient_email for r in m.get("To", []))
+    ]
+
+
+def get_sms_sent_for_phone(phone: str) -> list[dict[str, Any]]:
+    resp = httpx.get(f"{SMS_MOCK_URL}/_sent", timeout=3.0)
+    resp.raise_for_status()
+    return [m for m in resp.json().get("messages", []) if m.get("to") == phone]
+
+
+def get_commerce_outbox_rows(order_id: int) -> list[dict[str, Any]]:
+    with psycopg.connect(COMMERCE_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT event_id, event_type, status, retry_count FROM order_outbox_events WHERE order_id = %s ORDER BY id",
+            (order_id,),
+        )
+        return [
+            {
+                "event_id": r[0],
+                "event_type": r[1],
+                "status": r[2],
+                "retry_count": r[3],
+            }
+            for r in cur.fetchall()
+        ]
+
+
+def get_payment_outbox_rows(order_id: int) -> list[dict[str, Any]]:
+    with psycopg.connect(PAYMENTS_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT event_id, event_type, status, retry_count FROM payment_outbox_events WHERE order_id = %s ORDER BY id",
+            (order_id,),
+        )
+        return [
+            {
+                "event_id": r[0],
+                "event_type": r[1],
+                "status": r[2],
+                "retry_count": r[3],
+            }
+            for r in cur.fetchall()
+        ]
+
+
+def get_commerce_inbox_rows(order_id: int) -> list[dict[str, Any]]:
+    with psycopg.connect(COMMERCE_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT event_id, event_type, outcome FROM order_inbox_events WHERE order_id = %s",
+            (order_id,),
+        )
+        return [
+            {"event_id": r[0], "event_type": r[1], "outcome": r[2]}
+            for r in cur.fetchall()
+        ]
+
+
+def get_rabbitmq_queue_count(queue_name: str) -> int:
+    resp = httpx.get(
+        f"{RABBITMQ_MGMT_URL}/api/queues/%2F/{queue_name}",
+        auth=("guest", "guest"),
+        timeout=3.0,
+    )
+    if resp.status_code == 404:
+        return 0
+    resp.raise_for_status()
+    return int(resp.json().get("messages", 0))
+
+
+def _assert_db_access_denied(dsn: str) -> None:
+    try:
+        with psycopg.connect(dsn, connect_timeout=3):
+            raise AssertionError(f"Expected permission denied for {dsn}, connected!")
+    except psycopg.OperationalError as exc:
+        msg = str(exc).lower()
+        sqlstate = getattr(exc, "sqlstate", None)
+        assert sqlstate == "42501" or "permission denied for database" in msg, (
+            f"Expected PostgreSQL permission denied (42501), got: {exc!r}"
+        )
+
+
+def _get_container_state(service_name: str) -> dict[str, Any]:
+    cid = compose_cmd("ps", "-q", service_name, capture_output=True).stdout.strip()
+    assert cid, f"Container not found for {service_name}"
+    insp = subprocess.run(
+        [
+            "docker",
+            "inspect",
+            "-f",
+            "{{.Id}}|{{.State.Pid}}|{{.RestartCount}}|{{json .Config.Env}}",
+            cid,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    cid_full, pid, restart_count, env_json = insp.stdout.strip().split("|", 3)
+    return {
+        "id": cid_full,
+        "pid": int(pid),
+        "restart_count": int(restart_count),
+        "env": list(json.loads(env_json)),
+    }
+
+
+def verify_boundaries_and_isolation() -> None:
+    print("-> [K5-1] 3-way DB isolation, secret separation & internal auth boundary")
+    # 1. PostgreSQL role isolation across all 3 services
+    for dsn, table in (
+        (COMMERCE_DSN, "order_outbox_events"),
+        (PAYMENTS_DSN, "payment_attempts"),
+        (NOTIFICATIONS_DSN, "inbox_events"),
+    ):
+        with psycopg.connect(dsn, connect_timeout=3) as conn, conn.cursor() as cur:
+            cur.execute("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+            assert cur.fetchone()[0] is False
+            cur.execute(f"SELECT COUNT(*) FROM {table}")
+            assert cur.fetchone() is not None
+
+    for role_user, target_db in (
+        ("payments_app", "commerce"),
+        ("payments_app", "notifications"),
+        ("commerce_app", "payments"),
+        ("commerce_app", "notifications"),
+        ("notifications_app", "payments"),
+        ("notifications_app", "commerce"),
+    ):
+        _assert_db_access_denied(
+            f"postgresql://{role_user}:{role_user}@127.0.0.1:55432/{target_db}"
+        )
+
+    # 2. Zero STRIPE_* variables in Commerce containers
+    for svc in (
+        "commerce-api-e2e",
+        "commerce-outbox-e2e",
+        "commerce-payment-consumer-e2e",
+    ):
+        state = _get_container_state(svc)
+        stripe_vars = [e for e in state["env"] if e.startswith("STRIPE_")]
+        assert not stripe_vars, (
+            f"Commerce service {svc} leaked STRIPE env: {stripe_vars}"
+        )
+
+    # 3. Commerce no longer exposes /webhooks/stripe
+    r_old_wh = httpx.post(
+        f"{COMMERCE_API_URL}/webhooks/stripe", content=b"{}", timeout=5.0
+    )
+    assert r_old_wh.status_code == 404
+
+    # 4. Payments internal endpoints reject unauthenticated / wrong token calls
+    for url, body in (
+        (
+            f"{PAYMENTS_API_URL}/internal/payments/checkout-sessions",
+            {
+                "order_id": 1,
+                "attempt_key": "k",
+                "amount_minor": 1000,
+                "currency": "EUR",
+                "line_items": [],
+            },
+        ),
+        (
+            f"{PAYMENTS_API_URL}/internal/payments/orders/1/cancel",
+            {"reason": "cancel"},
+        ),
+    ):
+        assert httpx.post(url, json=body, timeout=5.0).status_code == 401
+        assert (
+            httpx.post(
+                url,
+                json=body,
+                headers={"X-Internal-Token": "wrong-token"},
+                timeout=5.0,
+            ).status_code
+            == 401
+        )
+
+
+def verify_concurrent_and_lost_stripe_response(seller_token: str) -> None:
+    print("-> [K5-2] Concurrent checkout sessions & lost Stripe response recovery")
+    httpx.post(f"{STRIPE_MOCK_URL}/_reset", timeout=5.0).raise_for_status()
+
+    _, buyer_token = register_and_login(f"k5_race_{uuid.uuid4().hex[:8]}@example.com")
+    pid = create_product(
+        seller_token, title="K5 Race Product", price_minor=2500, stock=10
+    )
+    add_to_cart(buyer_token, pid, 2)  # 5000 minor
+    order = create_order(buyer_token)
+    oid = int(order["id"])
+
+    def _call_checkout() -> tuple[int, dict[str, Any]]:
+        r = httpx.post(
+            f"{COMMERCE_API_URL}/orders/{oid}/checkout-session",
+            headers={"Authorization": f"Bearer {buyer_token}"},
+            timeout=10.0,
+        )
+        return r.status_code, r.json()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: _call_checkout(), range(2)))
+
+    assert all(code == 200 for code, _ in results), f"Expected 200s, got {results}"
+    assert results[0][1]["session_id"] == results[1][1]["session_id"]
+    mock_state = httpx.get(f"{STRIPE_MOCK_URL}/_sessions", timeout=5.0).json()
+    assert len(mock_state["sessions"]) == 1
+    assert mock_state["sessions"][0]["amount_total"] == 5000
+
+    # Загубен отговор след създаване в Stripe -> повторен опит възстановява същата сесия
+    add_to_cart(buyer_token, pid, 1)
+    order2 = create_order(buyer_token)
+    oid2 = int(order2["id"])
+
+    httpx.post(
+        f"{STRIPE_MOCK_URL}/_control",
+        json={"drop_next_create_after_commit": True},
+        timeout=5.0,
+    ).raise_for_status()
+
+    first_fail = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid2}/checkout-session",
+        headers={"Authorization": f"Bearer {buyer_token}"},
+        timeout=10.0,
+    )
+    assert first_fail.status_code == 502, (
+        f"Expected 502 on lost response, got {first_fail.text}"
+    )
+
+    sessions_after_drop = httpx.get(f"{STRIPE_MOCK_URL}/_sessions", timeout=5.0).json()[
+        "sessions"
+    ]
+    created_for_o2 = [
+        s for s in sessions_after_drop if s["client_reference_id"] == str(oid2)
+    ]
+    assert len(created_for_o2) == 1
+    expected_recovered_id = created_for_o2[0]["id"]
+
+    recovered = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid2}/checkout-session",
+        headers={"Authorization": f"Bearer {buyer_token}"},
+        timeout=10.0,
+    )
+    assert recovered.status_code == 200, f"Recovery failed: {recovered.text}"
+    assert recovered.json()["session_id"] == expected_recovered_id
+    sessions_after_retry = httpx.get(
+        f"{STRIPE_MOCK_URL}/_sessions", timeout=5.0
+    ).json()["sessions"]
+    assert (
+        len([s for s in sessions_after_retry if s["client_reference_id"] == str(oid2)])
+        == 1
+    )
+
+
+def verify_commerce_offline_during_webhook_then_recovery(seller_token: str) -> None:
+    print(
+        "-> [K5-3] Commerce stopped -> Stripe webhook accepted by Payments -> Commerce recovers -> paid once & 1 notification"
+    )
+    email = f"k5_offline_{uuid.uuid4().hex[:8]}@example.com"
+    phone = f"+359887{uuid.uuid4().int % 1000000:06d}"
+    _, buyer_token = register_and_login(email)
+    pid = create_product(
+        seller_token, title="K5 Offline Product", price_minor=3000, stock=10
+    )
+    add_to_cart(buyer_token, pid, 2)  # stock=8, total=6000
+    order = create_order(buyer_token, phone=phone)
+    oid = int(order["id"])
+
+    co = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid}/checkout-session",
+        headers={"Authorization": f"Bearer {buyer_token}"},
+        timeout=5.0,
+    )
+    assert co.status_code == 200
+    session_id = co.json()["session_id"]
+
+    # Спираме всички Commerce контейнери по време на плащането!
+    compose_cmd(
+        "stop",
+        "commerce-api-e2e",
+        "commerce-outbox-e2e",
+        "commerce-payment-consumer-e2e",
+    )
+    try:
+        wh_payload = {
+            "id": f"evt_offline_{uuid.uuid4().hex[:14]}",
+            "type": "checkout.session.completed",
+            "livemode": False,
+            "data": {
+                "object": {
+                    "id": session_id,
+                    "livemode": False,
+                    "payment_status": "paid",
+                    "amount_total": 6000,
+                    "currency": "eur",
+                    "client_reference_id": str(oid),
+                    "metadata": {
+                        "order_id": str(oid),
+                        "attempt_key": f"order_{oid}_attempt_1",
+                    },
+                }
+            },
+        }
+        r_wh1 = sign_and_post_stripe_webhook(wh_payload)
+        assert r_wh1.status_code == 200, f"Offline webhook failed: {r_wh1.text}"
+        assert r_wh1.json()["status"] == "success"
+
+        # Идемпотентен повторен webhook + второ event ID -> без повторно списание / излишно outbox събитие
+        r_wh_dup = sign_and_post_stripe_webhook(wh_payload)
+        assert r_wh_dup.status_code == 200
+        assert r_wh_dup.json()["status"] == "already_processed"
+
+        wh_payload2 = dict(wh_payload, id=f"evt_offline_second_{uuid.uuid4().hex[:10]}")
+        r_wh2 = sign_and_post_stripe_webhook(wh_payload2)
+        assert r_wh2.status_code == 200
+
+        with psycopg.connect(PAYMENTS_DSN) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT status FROM payment_attempts WHERE order_id = %s",
+                (oid,),
+            )
+            assert cur.fetchall() == [("succeeded",)]
+
+        wait_until(
+            "Payments outbox published payment.succeeded while Commerce down",
+            lambda: (
+                rows
+                if (rows := get_payment_outbox_rows(oid))
+                and len(rows) == 1
+                and rows[0]["status"] == "published"
+                else None
+            ),
+        )
+    finally:
+        compose_cmd(
+            "start",
+            "commerce-api-e2e",
+            "commerce-outbox-e2e",
+            "commerce-payment-consumer-e2e",
+        )
+
+    wait_until(
+        "Commerce API recovered",
+        lambda: (
+            True
+            if httpx.get(f"{COMMERCE_API_URL}/openapi.json", timeout=2.0).status_code
+            == 200
+            else None
+        ),
+    )
+
+    wait_until(
+        "Commerce order became paid after recovery",
+        lambda: (
+            True if get_order_detail(buyer_token, oid)["status"] == "paid" else None
+        ),
+    )
+    assert get_product_stock(pid) == 8
+
+    outbox_rows = wait_until(
+        "Commerce order.paid outbox published once",
+        lambda: (
+            rows
+            if (rows := get_commerce_outbox_rows(oid))
+            and len(rows) == 1
+            and rows[0]["status"] == "published"
+            else None
+        ),
+    )
+    assert len(outbox_rows) == 1
+
+    wait_until(
+        "Offline recovery delivered exactly 1 email",
+        lambda: m if len(m := get_mailpit_messages(email)) == 1 else None,
+    )
+    wait_until(
+        "Offline recovery delivered exactly 1 SMS",
+        lambda: s if len(s := get_sms_sent_for_phone(phone)) == 1 else None,
+    )
+
+
+def verify_rabbitmq_down_during_payment_recovery(seller_token: str) -> None:
+    print(
+        "-> [K5-4] RabbitMQ down during webhook -> stays pending in Payments Outbox -> recovers -> paid & notified"
+    )
+    email = f"k5_rmq_{uuid.uuid4().hex[:8]}@example.com"
+    phone = f"+359886{uuid.uuid4().int % 1000000:06d}"
+    _, buyer_token = register_and_login(email)
+    pid = create_product(seller_token, title="K5 RMQ Item", price_minor=1800, stock=5)
+    add_to_cart(buyer_token, pid, 1)
+    order = create_order(buyer_token, phone=phone)
+    oid = int(order["id"])
+
+    co = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid}/checkout-session",
+        headers={"Authorization": f"Bearer {buyer_token}"},
+        timeout=5.0,
+    )
+    assert co.status_code == 200
+    session_id = co.json()["session_id"]
+
+    compose_cmd("stop", "rabbitmq-e2e")
+    try:
+        wh = sign_and_post_stripe_webhook(
+            {
+                "id": f"evt_rmq_{uuid.uuid4().hex[:14]}",
+                "type": "checkout.session.completed",
+                "livemode": False,
+                "data": {
+                    "object": {
+                        "id": session_id,
+                        "livemode": False,
+                        "payment_status": "paid",
+                        "amount_total": 1800,
+                        "currency": "eur",
+                        "client_reference_id": str(oid),
+                        "metadata": {
+                            "order_id": str(oid),
+                            "attempt_key": f"order_{oid}_attempt_1",
+                        },
+                    }
+                },
+            }
+        )
+        assert wh.status_code == 200
+        wait_until(
+            "Payments outbox retry_count >= 1 while RabbitMQ down",
+            lambda: (
+                rows[0]
+                if (rows := get_payment_outbox_rows(oid))
+                and rows[0]["status"] == "pending"
+                and rows[0]["retry_count"] >= 1
+                else None
+            ),
+        )
+        assert get_order_detail(buyer_token, oid)["status"] == "pending_payment"
+    finally:
+        compose_cmd("start", "rabbitmq-e2e")
+
+    wait_until(
+        "Order paid after RabbitMQ recovery",
+        lambda: (
+            True if get_order_detail(buyer_token, oid)["status"] == "paid" else None
+        ),
+    )
+    wait_until(
+        "Email delivered after RabbitMQ recovery",
+        lambda: m if len(m := get_mailpit_messages(email)) == 1 else None,
+    )
+    wait_until(
+        "SMS delivered after RabbitMQ recovery",
+        lambda: s if len(s := get_sms_sent_for_phone(phone)) == 1 else None,
+    )
+
+
+def verify_async_failure_retry_and_success(seller_token: str) -> None:
+    print(
+        "-> [K5-5] Delayed async payment: processing -> async_payment_failed -> retry new attempt -> async_payment_succeeded"
+    )
+    email = f"k5_async_{uuid.uuid4().hex[:8]}@example.com"
+    phone = f"+359885{uuid.uuid4().int % 1000000:06d}"
+    _, buyer_token = register_and_login(email)
+    pid = create_product(
+        seller_token, title="K5 Async Product", price_minor=3200, stock=5
+    )
+    add_to_cart(buyer_token, pid, 1)
+    order = create_order(buyer_token, phone=phone)
+    oid = int(order["id"])
+
+    co1 = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid}/checkout-session",
+        headers={"Authorization": f"Bearer {buyer_token}"},
+        timeout=5.0,
+    )
+    assert co1.status_code == 200
+    session1 = co1.json()["session_id"]
+
+    # 1. Асинхронното плащане стартира (unpaid completed) -> payment_processing
+    r_proc = sign_and_post_stripe_webhook(
+        {
+            "id": f"evt_async_proc_{uuid.uuid4().hex[:12]}",
+            "type": "checkout.session.completed",
+            "livemode": False,
+            "data": {
+                "object": {
+                    "id": session1,
+                    "livemode": False,
+                    "payment_status": "unpaid",
+                    "amount_total": 3200,
+                    "currency": "eur",
+                    "client_reference_id": str(oid),
+                    "metadata": {
+                        "order_id": str(oid),
+                        "attempt_key": f"order_{oid}_attempt_1",
+                    },
+                }
+            },
+        }
+    )
+    assert r_proc.status_code == 200
+    wait_until(
+        "Order transitioned to payment_processing",
+        lambda: (
+            True
+            if get_order_detail(buyer_token, oid)["status"] == "payment_processing"
+            else None
+        ),
+    )
+
+    assert (
+        httpx.post(
+            f"{COMMERCE_API_URL}/orders/{oid}/cancel",
+            headers={"Authorization": f"Bearer {buyer_token}"},
+            timeout=5.0,
+        ).status_code
+        == 409
+    )
+    assert (
+        httpx.post(
+            f"{COMMERCE_API_URL}/orders/{oid}/checkout-session",
+            headers={"Authorization": f"Bearer {buyer_token}"},
+            timeout=5.0,
+        ).status_code
+        == 409
+    )
+
+    # 2. Асинхронният превод се проваля -> pending_payment + attempt_2
+    r_fail = sign_and_post_stripe_webhook(
+        {
+            "id": f"evt_async_fail_{uuid.uuid4().hex[:12]}",
+            "type": "checkout.session.async_payment_failed",
+            "livemode": False,
+            "data": {
+                "object": {
+                    "id": session1,
+                    "livemode": False,
+                    "payment_status": "unpaid",
+                    "amount_total": 3200,
+                    "currency": "eur",
+                    "client_reference_id": str(oid),
+                    "metadata": {
+                        "order_id": str(oid),
+                        "attempt_key": f"order_{oid}_attempt_1",
+                    },
+                }
+            },
+        }
+    )
+    assert r_fail.status_code == 200
+
+    def _has_rotated_to_attempt_2() -> bool | None:
+        if get_order_detail(buyer_token, oid)["status"] != "pending_payment":
+            return None
+        with psycopg.connect(COMMERCE_DSN) as conn, conn.cursor() as cur:
+            cur.execute("SELECT active_attempt_key FROM orders WHERE id = %s", (oid,))
+            row = cur.fetchone()
+            return True if row == (f"order_{oid}_attempt_2",) else None
+
+    wait_until(
+        "Order returned to pending_payment with rotated attempt_2",
+        _has_rotated_to_attempt_2,
+    )
+
+    # Старият терминален ключ не може да отвори нова сесия в Payments
+    r_stale = httpx.post(
+        f"{PAYMENTS_API_URL}/internal/payments/checkout-sessions",
+        headers={"X-Internal-Token": INTERNAL_TOKEN},
+        json={
+            "order_id": oid,
+            "attempt_key": f"order_{oid}_attempt_1",
+            "amount_minor": 3200,
+            "currency": "EUR",
+            "line_items": [
+                {
+                    "name": "K5 Async Product",
+                    "unit_amount": 3200,
+                    "quantity": 1,
+                    "currency": "eur",
+                }
+            ],
+        },
+        timeout=5.0,
+    )
+    assert r_stale.status_code == 409
+
+    # 3. Нов checkout с attempt_2 + async_payment_succeeded -> paid + notification
+    co2 = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid}/checkout-session",
+        headers={"Authorization": f"Bearer {buyer_token}"},
+        timeout=5.0,
+    )
+    assert co2.status_code == 200
+    session2 = co2.json()["session_id"]
+    assert session2 != session1
+
+    r_ok = sign_and_post_stripe_webhook(
+        {
+            "id": f"evt_async_ok_{uuid.uuid4().hex[:12]}",
+            "type": "checkout.session.async_payment_succeeded",
+            "livemode": False,
+            "data": {
+                "object": {
+                    "id": session2,
+                    "livemode": False,
+                    "payment_status": "paid",
+                    "amount_total": 3200,
+                    "currency": "eur",
+                    "client_reference_id": str(oid),
+                    "metadata": {
+                        "order_id": str(oid),
+                        "attempt_key": f"order_{oid}_attempt_2",
+                    },
+                }
+            },
+        }
+    )
+    assert r_ok.status_code == 200
+
+    wait_until(
+        "Order paid after retry attempt_2",
+        lambda: (
+            True if get_order_detail(buyer_token, oid)["status"] == "paid" else None
+        ),
+    )
+    assert get_product_stock(pid) == 4
+    wait_until(
+        "Retry delivered 1 email",
+        lambda: m if len(m := get_mailpit_messages(email)) == 1 else None,
+    )
+    wait_until(
+        "Retry delivered 1 SMS",
+        lambda: s if len(s := get_sms_sent_for_phone(phone)) == 1 else None,
+    )
+
+
+def verify_cancel_and_late_payment_discrepancy(seller_token: str) -> None:
+    print(
+        "-> [K5-6] Cancel expires Stripe session + late payment.succeeded creates visible discrepancy without changing status/stock/outbox"
+    )
+    email = f"k5_disc_{uuid.uuid4().hex[:8]}@example.com"
+    phone = f"+359884{uuid.uuid4().int % 1000000:06d}"
+    _, buyer_token = register_and_login(email)
+    pid = create_product(
+        seller_token, title="K5 Disc Product", price_minor=2000, stock=10
+    )
+    add_to_cart(buyer_token, pid, 2)  # stock=8
+    order = create_order(buyer_token, phone=phone)
+    oid = int(order["id"])
+
+    co = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid}/checkout-session",
+        headers={"Authorization": f"Bearer {buyer_token}"},
+        timeout=5.0,
+    )
+    assert co.status_code == 200
+    session_id = co.json()["session_id"]
+
+    cancel_resp = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid}/cancel",
+        headers={"Authorization": f"Bearer {buyer_token}"},
+        timeout=5.0,
+    )
+    assert cancel_resp.status_code == 200
+    assert cancel_resp.json()["status"] == "cancelled"
+    assert get_product_stock(pid) == 10
+
+    mock_sess = httpx.get(
+        f"{STRIPE_MOCK_URL}/v1/checkout/sessions/{session_id}", timeout=5.0
+    ).json()
+    assert mock_sess["status"] == "expired"
+
+    # Късно плащане след отмяната
+    r_late = sign_and_post_stripe_webhook(
+        {
+            "id": f"evt_late_disc_{uuid.uuid4().hex[:12]}",
+            "type": "checkout.session.completed",
+            "livemode": False,
+            "data": {
+                "object": {
+                    "id": session_id,
+                    "livemode": False,
+                    "payment_status": "paid",
+                    "amount_total": 4000,
+                    "currency": "eur",
+                    "client_reference_id": str(oid),
+                    "metadata": {
+                        "order_id": str(oid),
+                        "attempt_key": f"order_{oid}_attempt_1",
+                    },
+                }
+            },
+        }
+    )
+    assert r_late.status_code == 200
+
+    wait_until(
+        "Discrepancy recorded in Commerce inbox",
+        lambda: (
+            rows
+            if (rows := get_commerce_inbox_rows(oid))
+            and any(r["outcome"] == "discrepancy" for r in rows)
+            else None
+        ),
+    )
+
+    detail = get_order_detail(buyer_token, oid)
+    assert detail["status"] == "cancelled"
+    assert detail["has_payment_discrepancy"] is True
+    assert len(detail["payment_discrepancies"]) == 1
+    assert detail["payment_discrepancies"][0]["reason"] == "payment_on_cancelled_order"
+    assert get_product_stock(pid) == 10
+    assert get_commerce_outbox_rows(oid) == []
+    assert get_mailpit_messages(email) == []
+    assert get_sms_sent_for_phone(phone) == []
+
+
+def verify_reconciliation_scripts(seller_token: str) -> None:
+    print(
+        "-> [K5-7] Scheduled reconciliation scripts: Commerce expires reserve & Payments discovers missed paid session"
+    )
+    # A) Просрочена поръчка -> Commerce reconcile_orders.py извиква Payments, прекратява Stripe и връща stock
+    _, buyer1 = register_and_login(f"k5_rec1_{uuid.uuid4().hex[:8]}@example.com")
+    pid = create_product(
+        seller_token, title="K5 Rec Product", price_minor=1800, stock=10
+    )
+    add_to_cart(buyer1, pid, 3)  # stock=7
+    o1 = create_order(buyer1)
+    oid1 = int(o1["id"])
+    co1 = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid1}/checkout-session",
+        headers={"Authorization": f"Bearer {buyer1}"},
+        timeout=5.0,
+    )
+    assert co1.status_code == 200
+
+    with psycopg.connect(COMMERCE_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE orders SET expires_at = %s WHERE id = %s",
+            (
+                datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=30),
+                oid1,
+            ),
+        )
+        conn.commit()
+
+    rec_commerce = compose_cmd(
+        "exec",
+        "-T",
+        "commerce-api-e2e",
+        "python",
+        "scripts/reconcile_orders.py",
+        capture_output=True,
+    )
+    assert "expired=1" in rec_commerce.stdout
+    assert get_order_detail(buyer1, oid1)["status"] == "expired"
+    assert get_product_stock(pid) == 10
+
+    # B) Пропуснат webhook в Stripe -> Payments reconcile_payments.py открива payment_status='paid' -> Commerce=paid
+    email2 = f"k5_rec2_{uuid.uuid4().hex[:8]}@example.com"
+    phone2 = f"+359883{uuid.uuid4().int % 1000000:06d}"
+    _, buyer2 = register_and_login(email2)
+    add_to_cart(buyer2, pid, 2)  # stock=8
+    o2 = create_order(buyer2, phone=phone2)
+    oid2 = int(o2["id"])
+    co2 = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid2}/checkout-session",
+        headers={"Authorization": f"Bearer {buyer2}"},
+        timeout=5.0,
+    )
+    assert co2.status_code == 200
+    s2_id = co2.json()["session_id"]
+
+    httpx.post(
+        f"{STRIPE_MOCK_URL}/_control/set_session",
+        json={"session_id": s2_id, "status": "complete", "payment_status": "paid"},
+        timeout=5.0,
+    ).raise_for_status()
+
+    rec_pay = compose_cmd(
+        "exec",
+        "-T",
+        "payments-e2e",
+        "python",
+        "scripts/reconcile_payments.py",
+        capture_output=True,
+    )
+    assert "paid=1" in rec_pay.stdout
+
+    wait_until(
+        "Order paid via reconcile_payments -> Outbox -> RabbitMQ -> Commerce",
+        lambda: True if get_order_detail(buyer2, oid2)["status"] == "paid" else None,
+    )
+    assert get_product_stock(pid) == 8
+    wait_until(
+        "Reconcile delivered 1 email",
+        lambda: m if len(m := get_mailpit_messages(email2)) == 1 else None,
+    )
+    wait_until(
+        "Reconcile delivered 1 SMS",
+        lambda: s if len(s := get_sms_sent_for_phone(phone2)) == 1 else None,
+    )
+
+
+def verify_payment_dlq_and_consumer_resilience(seller_token: str) -> None:
+    print(
+        "-> [K5-8] Poison / 5000-digit payment event goes to DLQ without leaking secrets or crashing consumer"
+    )
+    state_before = _get_container_state("commerce-payment-consumer-e2e")
+    secret_marker = f"k5_dlq_marker_{uuid.uuid4().hex[:8]}"
+    huge_digits = "9" * (getattr(sys, "get_int_max_str_digits", lambda: 4300)() + 700)
+
+    conn = pika.BlockingConnection(
+        pika.ConnectionParameters(
+            host="127.0.0.1",
+            port=55672,
+            credentials=pika.PlainCredentials("guest", "guest"),
+        )
+    )
+    try:
+        ch = conn.channel()
+        ch.confirm_delivery()
+        poison_obj = json.dumps(
+            {
+                "event_id": f"bad-{secret_marker}",
+                "event_type": f"payment.succeeded.{secret_marker}",
+                "event_version": {"contact": secret_marker},
+                "occurred_at": datetime.datetime.now(datetime.UTC).isoformat(),
+                "producer": "payments",
+                "data": {"order_id": 1},
+            }
+        ).encode("utf-8")
+        poison_5k = (
+            f'{{"event_id": "{uuid.uuid4()}", "event_type": "payment.succeeded", '
+            f'"event_version": {huge_digits}, "occurred_at": "{datetime.datetime.now(datetime.UTC).isoformat()}", '
+            f'"producer": "payments", "data": {{"secret": "{secret_marker}"}}}}'
+        ).encode()
+        for body in (poison_obj, poison_5k):
+            ch.basic_publish(
+                exchange="payments.events",
+                routing_key="payment.succeeded",
+                body=body,
+                properties=pika.BasicProperties(delivery_mode=2),
+                mandatory=True,
+            )
+    finally:
+        conn.close()
+
+    wait_until(
+        "Poison payment events moved to commerce.payment_events.dlq",
+        lambda: (
+            True
+            if get_rabbitmq_queue_count("commerce.payment_events.dlq") >= 2
+            else None
+        ),
+    )
+
+    logs = compose_cmd(
+        "logs", "--no-color", "commerce-payment-consumer-e2e", capture_output=True
+    ).stdout
+    assert secret_marker not in logs
+    assert "9" * 64 not in logs
+
+    state_after = _get_container_state("commerce-payment-consumer-e2e")
+    assert state_after["id"] == state_before["id"]
+    assert state_after["pid"] == state_before["pid"]
+    assert state_after["restart_count"] == state_before["restart_count"] == 0
+
+    # Потвърждаваме, че същият consumer обработва следващо нормално плащане
+    email = f"k5_after_dlq_{uuid.uuid4().hex[:8]}@example.com"
+    _, buyer = register_and_login(email)
+    pid = create_product(seller_token, title="After DLQ", price_minor=1100, stock=5)
+    add_to_cart(buyer, pid, 1)
+    order = create_order(buyer)
+    oid = int(order["id"])
+    co = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{oid}/checkout-session",
+        headers={"Authorization": f"Bearer {buyer}"},
+        timeout=5.0,
+    )
+    assert co.status_code == 200
+    r_wh = sign_and_post_stripe_webhook(
+        {
+            "id": f"evt_after_dlq_{uuid.uuid4().hex[:12]}",
+            "type": "checkout.session.completed",
+            "livemode": False,
+            "data": {
+                "object": {
+                    "id": co.json()["session_id"],
+                    "livemode": False,
+                    "payment_status": "paid",
+                    "amount_total": 1100,
+                    "currency": "eur",
+                    "client_reference_id": str(oid),
+                    "metadata": {
+                        "order_id": str(oid),
+                        "attempt_key": f"order_{oid}_attempt_1",
+                    },
+                }
+            },
+        }
+    )
+    assert r_wh.status_code == 200
+    wait_until(
+        "Consumer still processes valid payment after DLQ poison batch",
+        lambda: True if get_order_detail(buyer, oid)["status"] == "paid" else None,
+    )
+
+
+def verify_repeatable_cutover_migration(seller_token: str) -> None:
+    print(
+        "-> [K5-9] Repeatable cutover migration migrate_from_commerce.py + legacy open session webhook"
+    )
+    email = f"k5_cutover_{uuid.uuid4().hex[:8]}@example.com"
+    phone = f"+359882{uuid.uuid4().int % 1000000:06d}"
+    _, buyer = register_and_login(email)
+    pid = create_product(
+        seller_token, title="Legacy Session Prod", price_minor=4500, stock=5
+    )
+    add_to_cart(buyer, pid, 1)
+    order = create_order(buyer, phone=phone)
+    oid = int(order["id"])
+
+    legacy_sess_id = f"cs_legacy_cutover_{uuid.uuid4().hex[:10]}"
+    legacy_attempt_key = f"order_{oid}_attempt_1"
+    with psycopg.connect(COMMERCE_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO stripe_checkout_sessions
+                (order_id, status, amount_minor, currency, mode, stripe_session_id, checkout_url, idempotency_key)
+            VALUES (%s, 'open', 4500, 'EUR', 'test', %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                oid,
+                legacy_sess_id,
+                f"https://checkout.stripe.mock/pay/{legacy_sess_id}",
+                legacy_attempt_key,
+            ),
+        )
+        legacy_row_id = cur.fetchone()[0]
+        cur.execute(
+            """
+            INSERT INTO stripe_processed_events (stripe_event_id, event_type, order_id)
+            VALUES (%s, 'checkout.session.created', %s)
+            """,
+            (f"evt_legacy_seen_{uuid.uuid4().hex[:10]}", oid),
+        )
+        conn.commit()
+
+    # Стартираме миграцията ДВА пъти подред за проверка на идемпотентността
+    for run_no in (1, 2):
+        mig = compose_cmd(
+            "exec",
+            "-T",
+            "payments-e2e",
+            "python",
+            "scripts/migrate_from_commerce.py",
+            "--commerce-url",
+            ADMIN_COMMERCE_DSN,
+            "--payments-url",
+            CONTAINER_PAYMENTS_DSN,
+            capture_output=True,
+        )
+        assert mig.returncode == 0, f"Migration run {run_no} failed: {mig.stderr}"
+
+    # Старите таблици в Commerce остават непокътнати
+    with psycopg.connect(COMMERCE_DSN) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM stripe_checkout_sessions WHERE id = %s",
+            (legacy_row_id,),
+        )
+        assert cur.fetchone()[0] == 1
+
+    # Webhook за мигрираната стара отворена сесия минава през Payments и плаща поръчката в Commerce
+    r_wh = sign_and_post_stripe_webhook(
+        {
+            "id": f"evt_legacy_wh_{uuid.uuid4().hex[:10]}",
+            "type": "checkout.session.completed",
+            "livemode": False,
+            "data": {
+                "object": {
+                    "id": legacy_sess_id,
+                    "livemode": False,
+                    "payment_status": "paid",
+                    "amount_total": 4500,
+                    "currency": "eur",
+                    "client_reference_id": str(oid),
+                    "metadata": {
+                        "order_id": str(oid),
+                        "attempt_id": str(legacy_row_id),
+                    },
+                }
+            },
+        }
+    )
+    assert r_wh.status_code == 200
+    assert r_wh.json()["status"] == "success"
+
+    wait_until(
+        "Legacy migrated session turned Commerce order paid",
+        lambda: True if get_order_detail(buyer, oid)["status"] == "paid" else None,
+    )
+    wait_until(
+        "Legacy cutover delivered 1 email",
+        lambda: m if len(m := get_mailpit_messages(email)) == 1 else None,
+    )
+    wait_until(
+        "Legacy cutover delivered 1 SMS",
+        lambda: s if len(s := get_sms_sent_for_phone(phone)) == 1 else None,
+    )
+
+
+def main() -> None:
+    wait_until(
+        "Commerce API ready",
+        lambda: (
+            True
+            if httpx.get(f"{COMMERCE_API_URL}/openapi.json", timeout=2.0).status_code
+            == 200
+            else None
+        ),
+    )
+    wait_until(
+        "Payments API ready",
+        lambda: (
+            True
+            if httpx.get(f"{PAYMENTS_API_URL}/health", timeout=2.0).status_code == 200
+            else None
+        ),
+    )
+    wait_until(
+        "Mailpit ready",
+        lambda: (
+            True
+            if httpx.get(f"{MAILPIT_API_URL}/api/v1/messages", timeout=2.0).status_code
+            == 200
+            else None
+        ),
+    )
+    wait_until(
+        "SMS mock ready",
+        lambda: (
+            True
+            if httpx.get(f"{SMS_MOCK_URL}/health", timeout=2.0).status_code == 200
+            else None
+        ),
+    )
+    wait_until(
+        "Stripe mock ready",
+        lambda: (
+            True
+            if httpx.get(f"{STRIPE_MOCK_URL}/health", timeout=2.0).status_code == 200
+            else None
+        ),
+    )
+
+    verify_boundaries_and_isolation()
+    _, seller_token = register_and_login(
+        f"k5_seller_{uuid.uuid4().hex[:8]}@example.com"
+    )
+
+    verify_concurrent_and_lost_stripe_response(seller_token)
+    verify_commerce_offline_during_webhook_then_recovery(seller_token)
+    verify_rabbitmq_down_during_payment_recovery(seller_token)
+    verify_async_failure_retry_and_success(seller_token)
+    verify_cancel_and_late_payment_discrepancy(seller_token)
+    verify_reconciliation_scripts(seller_token)
+    verify_payment_dlq_and_consumer_resilience(seller_token)
+    verify_repeatable_cutover_migration(seller_token)
+    print("✅ All K5 isolated E2E scenarios passed!")
+
+
+if __name__ == "__main__":
+    main()

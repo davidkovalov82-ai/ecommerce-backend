@@ -1,296 +1,154 @@
 import json
-from unittest.mock import patch
+import logging
+import sys
+import uuid
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
-from fastapi.testclient import TestClient
-from sqlalchemy.orm import Session
+import pytest
+from sqlalchemy.exc import DataError, OperationalError
+from sqlalchemy.orm import sessionmaker
 
-from app.config import settings
-from app.main import app
-from app.modules.orders.models import StripeCheckoutSession
-from tests.payments.helpers import (
-    TEST_WEBHOOK_SECRET,
-    _create_order,
-    _create_product,
-    _create_user_and_token,
-    _generate_stripe_signature,
+from app.modules.orders.payment_consumer import RabbitMQPaymentEventConsumer
+from app.modules.orders.payment_contracts import (
+    InvalidPaymentContract,
+    UnsupportedPaymentEventType,
+    UnsupportedPaymentEventVersion,
+    parse_and_validate_payment_event,
 )
-
-client = TestClient(app)
-
-
-def test_webhook_no_jwt_required(db_session: Session) -> None:
-    """Уебхукът не изисква JWT автентикация."""
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp = client.post("/webhooks/stripe", content=b"")
-        assert resp.status_code == 400
-        assert resp.json()["detail"]["code"] == "INVALID_STRIPE_SIGNATURE"
+from tests.payments.helpers import make_payment_event_envelope
 
 
-def test_webhook_invalid_signature_returns_400(db_session: Session) -> None:
-    """Подправен или грешен подпис връща 400 без промени в базата."""
-    payload = json.dumps(
-        {"id": "evt_123", "type": "checkout.session.completed"}
-    ).encode()
-    bad_sig = "t=1234567,v1=bad_hex_signature"
-
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=payload,
-            headers={"Stripe-Signature": bad_sig},
-        )
-        assert resp.status_code == 400
-        assert resp.json()["detail"]["code"] == "INVALID_STRIPE_SIGNATURE"
-
-
-def test_webhook_stripe_not_configured_returns_503(db_session: Session) -> None:
-    """Липса на STRIPE_WEBHOOK_SECRET връща 503."""
-    payload = b'{"id": "evt_123"}'
-    with patch.object(settings, "stripe_webhook_secret", None):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=payload,
-            headers={"Stripe-Signature": "t=1,v1=dummy"},
-        )
-        assert resp.status_code == 503
-        assert resp.json()["detail"]["code"] == "STRIPE_NOT_CONFIGURED"
-
-
-def test_webhook_livemode_ignored_in_sandbox(db_session: Session) -> None:
-    """Критерий: В sandbox режим уебхуци с livemode=True се игнорират и не маркират поръчката като платена."""
-    user, _ = _create_user_and_token(db_session)
-    product = _create_product(db_session, "P1", price_minor=3000)
-    order = _create_order(db_session, user.id, product, quantity=1)
-
-    event_payload = {
-        "id": "evt_live_123",
-        "type": "checkout.session.completed",
-        "livemode": True,
-        "data": {
-            "object": {
-                "id": "cs_live_123",
-                "payment_status": "paid",
-                "amount_total": 3000,
-                "currency": "eur",
-                "client_reference_id": str(order.id),
-                "metadata": {"order_id": str(order.id), "attempt_id": "1"},
-            }
-        },
-    }
-    payload_bytes = json.dumps(event_payload).encode()
-    sig = _generate_stripe_signature(payload_bytes, TEST_WEBHOOK_SECRET)
-
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=payload_bytes,
-            headers={"Stripe-Signature": sig},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "ignored"
-
-    db_session.refresh(order)
-    assert order.status == "pending_payment"
-
-
-def test_webhook_mismatched_attempt_id(db_session: Session) -> None:
-    """Критерий: Не е достатъчно да съвпадат само order_id и сумата; при несъвпадащ attempt_id поръчката не се маркира paid."""
-    user, _ = _create_user_and_token(db_session)
-    product = _create_product(db_session, "P1", price_minor=2000)
-    order = _create_order(db_session, user.id, product, quantity=1)
-
-    # Подаваме несъществуващ attempt_id
-    event_payload = {
-        "id": "evt_bad_attempt_1",
-        "type": "checkout.session.completed",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": "cs_bad_attempt_1",
-                "livemode": False,
-                "payment_status": "paid",
-                "amount_total": 2000,
-                "currency": "eur",
-                "client_reference_id": str(order.id),
-                "metadata": {
-                    "order_id": str(order.id),
-                    "attempt_id": "999999",
-                },
-            }
-        },
-    }
-    payload_bytes = json.dumps(event_payload).encode()
-    sig = _generate_stripe_signature(payload_bytes, TEST_WEBHOOK_SECRET)
-
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=payload_bytes,
-            headers={"Stripe-Signature": sig},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "mismatched"
-
-    db_session.refresh(order)
-    assert order.status == "pending_payment"
-
-
-def test_webhook_mismatched_amount_or_currency(db_session: Session) -> None:
-    """Несъответствие в сума или валута не променя поръчката."""
-    user, _ = _create_user_and_token(db_session)
-    product = _create_product(db_session, "P1", price_minor=3000)
-    order = _create_order(db_session, user.id, product, quantity=1)  # 3000 EUR
-
-    session_rec = StripeCheckoutSession(
-        order_id=order.id,
-        status="open",
-        amount_minor=3000,
-        currency="EUR",
-        stripe_session_id="cs_mismatch_123",
-        checkout_url="https://checkout.stripe.com/pay/cs_mismatch_123",
-        idempotency_key="idemp_mismatch_1",
+def test_parse_valid_payment_event_contract() -> None:
+    """Валидно събитие преминава контракта с точни типове и нормализирана валута."""
+    envelope = make_payment_event_envelope(
+        event_type="payment.succeeded",
+        order_id=10,
+        amount_minor=2500,
+        currency="eur",
     )
-    db_session.add(session_rec)
-    db_session.commit()
-
-    # 1. Грешна сума (1000 вместо 3000)
-    event_bad_amount = {
-        "id": "evt_bad_amt_789",
-        "type": "checkout.session.completed",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": "cs_mismatch_123",
-                "livemode": False,
-                "payment_status": "paid",
-                "amount_total": 1000,
-                "currency": "eur",
-                "metadata": {
-                    "order_id": str(order.id),
-                    "attempt_id": str(session_rec.id),
-                },
-            }
-        },
-    }
-    p_bytes = json.dumps(event_bad_amount).encode()
-    sig = _generate_stripe_signature(p_bytes, TEST_WEBHOOK_SECRET)
-
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=p_bytes,
-            headers={"Stripe-Signature": sig},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "mismatched"
-
-    db_session.refresh(order)
-    assert order.status == "pending_payment"
-
-    # 2. Грешна валута (USD вместо EUR)
-    event_bad_curr = {
-        "id": "evt_bad_curr_789",
-        "type": "checkout.session.completed",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": "cs_mismatch_123",
-                "livemode": False,
-                "payment_status": "paid",
-                "amount_total": 3000,
-                "currency": "usd",
-                "metadata": {
-                    "order_id": str(order.id),
-                    "attempt_id": str(session_rec.id),
-                },
-            }
-        },
-    }
-    p_bytes_curr = json.dumps(event_bad_curr).encode()
-    sig_curr = _generate_stripe_signature(p_bytes_curr, TEST_WEBHOOK_SECRET)
-
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp_c = client.post(
-            "/webhooks/stripe",
-            content=p_bytes_curr,
-            headers={"Stripe-Signature": sig_curr},
-        )
-        assert resp_c.status_code == 200
-        assert resp_c.json()["status"] == "mismatched"
-
-    db_session.refresh(order)
-    assert order.status == "pending_payment"
+    parsed = parse_and_validate_payment_event(json.dumps(envelope).encode("utf-8"))
+    assert parsed.event_id == envelope["event_id"]
+    assert parsed.event_type == "payment.succeeded"
+    assert parsed.order_id == 10
+    assert parsed.currency == "EUR"
+    assert parsed.amount_minor == 2500
 
 
-def test_webhook_non_existent_order_and_other_events(db_session: Session) -> None:
-    """Несъществуваща поръчка и други събития се обработват безопасно."""
-    evt_ghost = {
-        "id": "evt_ghost_999",
-        "type": "checkout.session.completed",
-        "livemode": False,
-        "data": {
-            "object": {
-                "id": "cs_ghost_999",
-                "livemode": False,
-                "payment_status": "paid",
-                "amount_total": 5000,
-                "currency": "eur",
-                "metadata": {"order_id": "888888", "attempt_id": "1"},
-            }
-        },
-    }
-    p_ghost = json.dumps(evt_ghost).encode()
-    sig_ghost = _generate_stripe_signature(p_ghost, TEST_WEBHOOK_SECRET)
+def test_parse_rejects_invalid_json_5000_digits_and_constants() -> None:
+    """Невалиден JSON, NaN/Infinity и число с 5000 цифри се превръщат в InvalidPaymentContract."""
+    for bad in (b"{broken json", b"[]", b"\xff\xfe", b'{"x": NaN}'):
+        with pytest.raises(InvalidPaymentContract):
+            parse_and_validate_payment_event(bad)
 
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=p_ghost,
-            headers={"Stripe-Signature": sig_ghost},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "order_not_found"
-
-    # Друг тип събитие (напр. charge.updated)
-    evt_other = {
-        "id": "evt_other_555",
-        "type": "charge.updated",
-        "livemode": False,
-        "data": {"object": {"id": "ch_123"}},
-    }
-    p_other = json.dumps(evt_other).encode()
-    sig_other = _generate_stripe_signature(p_other, TEST_WEBHOOK_SECRET)
-
-    with patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET):
-        resp_o = client.post(
-            "/webhooks/stripe",
-            content=p_other,
-            headers={"Stripe-Signature": sig_other},
-        )
-        assert resp_o.status_code == 200
-        assert resp_o.json()["status"] == "ignored"
+    huge_digits = "9" * (getattr(sys, "get_int_max_str_digits", lambda: 4300)() + 700)
+    bomb_payload = (
+        f'{{"event_id": "{uuid.uuid4()}", "event_type": "payment.succeeded", '
+        f'"event_version": {huge_digits}, "occurred_at": "2026-01-01T00:00:00Z", '
+        f'"producer": "payments", "data": {{"order_id": 1}}}}'
+    ).encode()
+    with pytest.raises(InvalidPaymentContract):
+        parse_and_validate_payment_event(bomb_payload)
 
 
-def test_webhook_mode_mismatch_rejection(db_session: Session) -> None:
-    """Събития от live в test режим или обратно се отхвърлят с reason='mode_mismatch'."""
-    event_payload = {
-        "id": "evt_livemode_mismatch_1",
-        "type": "checkout.session.completed",
-        "livemode": True,  # Livemode събитие при тест режим
-        "data": {"object": {"id": "cs_live_123", "livemode": True}},
-    }
-    payload_bytes = json.dumps(event_payload).encode()
-    sig = _generate_stripe_signature(payload_bytes, TEST_WEBHOOK_SECRET)
+def test_parse_rejects_pg_int_overflow_bool_version_and_unsupported_types() -> None:
+    """Граничните стойности 2**63, bool версия и непознати версии/типове отиват в DLQ."""
+    # order_id = 2**63 (препълва PG BIGINT)
+    env_overflow = make_payment_event_envelope(
+        event_type="payment.succeeded",
+        order_id=2**63,
+    )
+    with pytest.raises(InvalidPaymentContract):
+        parse_and_validate_payment_event(json.dumps(env_overflow).encode("utf-8"))
 
-    with (
-        patch.object(settings, "stripe_mode", "test"),
-        patch.object(settings, "stripe_webhook_secret", TEST_WEBHOOK_SECRET),
-    ):
-        resp = client.post(
-            "/webhooks/stripe",
-            content=payload_bytes,
-            headers={"Stripe-Signature": sig},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "ignored"
-        assert resp.json()["reason"] == "mode_mismatch"
+    # bool като event_version
+    env_bool_ver = make_payment_event_envelope(
+        event_type="payment.succeeded",
+        order_id=1,
+    )
+    env_bool_ver["event_version"] = True
+    with pytest.raises(InvalidPaymentContract):
+        parse_and_validate_payment_event(json.dumps(env_bool_ver).encode("utf-8"))
+
+    # Неподдържана версия
+    env_ver2 = make_payment_event_envelope(
+        event_type="payment.succeeded",
+        order_id=1,
+        event_version=99,
+    )
+    with pytest.raises(UnsupportedPaymentEventVersion):
+        parse_and_validate_payment_event(json.dumps(env_ver2).encode("utf-8"))
+
+    # Неподдържан тип
+    env_bad_type = make_payment_event_envelope(
+        event_type="payment.refunded",
+        order_id=1,
+    )
+    with pytest.raises(UnsupportedPaymentEventType):
+        parse_and_validate_payment_event(json.dumps(env_bad_type).encode("utf-8"))
+
+
+def test_consumer_dead_letters_bad_message_without_logging_raw_secrets(
+    session_factory: sessionmaker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Невалидното съобщение получава basic_nack(requeue=False) без изтичане на сурови данни в лога."""
+    consumer = RabbitMQPaymentEventConsumer(session_factory=session_factory)
+    channel = MagicMock()
+    method = SimpleNamespace(delivery_tag=17)
+
+    secret_marker = "pii_secret_contact_marker@example.com"
+    bad_payload = json.dumps(
+        {
+            "event_id": "not-a-uuid",
+            "event_type": secret_marker,
+            "event_version": 1,
+            "occurred_at": "2026-01-01T00:00:00Z",
+            "producer": "payments",
+            "data": {"secret_tag": secret_marker},
+        }
+    ).encode("utf-8")
+
+    with caplog.at_level(logging.WARNING):
+        consumer._handle_message(channel, method, None, bad_payload)
+
+    channel.basic_nack.assert_called_once_with(delivery_tag=17, requeue=False)
+    channel.basic_ack.assert_not_called()
+    assert secret_marker not in caplog.text
+
+
+def test_consumer_distinguishes_transient_db_error_vs_data_error(
+    session_factory: sessionmaker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OperationalError -> requeue=True, DataError -> DLQ (requeue=False)."""
+    consumer = RabbitMQPaymentEventConsumer(session_factory=session_factory)
+    payload = json.dumps(
+        make_payment_event_envelope(event_type="payment.succeeded", order_id=1)
+    ).encode("utf-8")
+
+    # 1. Временна DB грешка -> requeue=True
+    def raise_operational(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise OperationalError("stmt", {}, Exception("pg temporarily unavailable"))
+
+    monkeypatch.setattr(
+        "app.modules.orders.service.OrderService.apply_payment_event",
+        raise_operational,
+    )
+    ch1 = MagicMock()
+    consumer._handle_message(ch1, SimpleNamespace(delivery_tag=1), None, payload)
+    ch1.basic_nack.assert_called_once_with(delivery_tag=1, requeue=True)
+    ch1.basic_ack.assert_not_called()
+
+    # 2. Трайна DataError -> DLQ (requeue=False)
+    def raise_data_error(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise DataError("stmt", {}, Exception("value out of range"))
+
+    monkeypatch.setattr(
+        "app.modules.orders.service.OrderService.apply_payment_event",
+        raise_data_error,
+    )
+    ch2 = MagicMock()
+    consumer._handle_message(ch2, SimpleNamespace(delivery_tag=2), None, payload)
+    ch2.basic_nack.assert_called_once_with(delivery_tag=2, requeue=False)
+    ch2.basic_ack.assert_not_called()

@@ -9,9 +9,10 @@
 
 ## Архитектура на проекта
 
-Проектът се състои от два независими сервиса в `services/`:
-- **`services/commerce`** – основният домейн бекенд (модулен монолит с модули `accounts`, `catalog`, `cart`, `orders`) и фоновият `commerce-outbox` издател към RabbitMQ.
-- **`services/notifications`** – независим консуматор на събития и worker за доставка по отделни канали (**Email** през SMTP/Mailpit и **SMS** през адаптер на провайдър), със собствена PostgreSQL база и роля (`notifications`), собствени Alembic миграции и независим процес на стартиране.
+Проектът се състои от три независими сервиса в `services/`:
+- **`services/commerce`** – основният домейн бекенд (`accounts`, `catalog`, `cart`, `orders`, управление на складови резерви), издателят `commerce-outbox` (`order.paid`, `shipment.shipped` -> RabbitMQ) и консуматорът `commerce-payment-consumer` (`payment.*` -> `orders` + `order_payment_discrepancies`).
+- **`services/payments`** – независим платежен сервис (`http://localhost:8001`) със собствена PostgreSQL база и роля (`payments`), собствени Alembic миграции, Stripe SDK интеграция, вътрешно HTTP API защитено с `X-Internal-Token`, публичен `/webhooks/stripe`, фонов издател `payments-outbox` и сверка `scripts/reconcile_payments.py`. Единствено `services/payments` получава `STRIPE_SECRET_KEY` и `STRIPE_WEBHOOK_SECRET`.
+- **`services/notifications`** – независим консуматор на събития (`order.paid`, `shipment.shipped`) и worker за доставка по отделни канали (**Email** през SMTP/Mailpit и **SMS** през адаптер на провайдър), със собствена PostgreSQL база и роля (`notifications`).
 
 В `services/commerce/app/modules/` са обособени следните домейни:
 
@@ -52,28 +53,25 @@
 > [!IMPORTANT]
 > Всички Docker Compose команди трябва да се изпълняват от **корена на хранилището**.
 
-### 1. Подготовка на средата и генериране на JWT_SECRET
+### 1. Подготовка на средата и генериране на тайни ключове (`JWT_SECRET`, `PAYMENTS_INTERNAL_AUTH_TOKEN`)
 
-Преди първоначалното стартиране на контейнерите е необходимо да подготвите `.env` файла (ако все още не съществува) и да генерирате сигурен таен ключ за JWT токените.
+Преди първоначалното стартиране на контейнерите подгответе `.env` файловете (ако все още не съществуват) и генерирайте сигурни тайни:
 
-Копирайте примерната конфигурация **без да презаписвате** съществуващ `.env` файл:
+Копирайте примерните конфигурации **без да презаписвате** съществуващи `.env` файлове:
 ```bash
 test -f services/commerce/.env || cp services/commerce/.env.example services/commerce/.env
+test -f services/payments/.env || cp services/payments/.env.example services/payments/.env
 ```
 
-Генерирайте сигурен таен ключ (поне 32 байта):
+Генерирайте сигурни тайни (поне 32 байта):
 ```bash
-# Пример чрез Python secrets:
 python3 -c "import secrets; print(secrets.token_urlsafe(32))"
-# или чрез openssl:
-openssl rand -hex 32
 ```
 
-Отворете `services/commerce/.env` и попълнете генерирания ключ срещу `JWT_SECRET`:
-```env
-JWT_SECRET=вашият_генериран_ключ_поне_32_байта
-```
-*(Забележка: няма работеща стойност по подразбиране – задаването на непразен ключ от поне 32 байта е задължително).*
+Задайте в `services/commerce/.env` и в средата (или root `.env` при `docker compose`):
+- `JWT_SECRET` – тайна за подписване на JWT токени (поне 32 байта)
+- `PAYMENTS_INTERNAL_AUTH_TOKEN` – споделен вътрешен токен между `commerce` и `payments` (задължителен, поне 16 байта)
+- В `services/payments/.env` задайте `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` и същия `PAYMENTS_INTERNAL_AUTH_TOKEN`. *(Commerce не съхранява Stripe ключове).*
 
 ### 2. Стартиране на контейнерите (от корена на хранилището)
 
@@ -82,11 +80,9 @@ docker compose --env-file services/commerce/.env up --build
 ```
 
 Compose автоматично:
-1. Стартира PostgreSQL контейнер и изчаква готовността му (healthcheck).
-2. Стартира **Mailpit** (локален SMTP сървър на порт `1025` и Web пощенска кутия на `http://localhost:8025`).
-3. Построява контейнера на Commerce API чрез `Dockerfile`.
-4. Прилага автоматично последните Alembic миграции (`alembic upgrade head`).
-5. Стартира API сървъра на адрес `http://localhost:8000`.
+1. Стартира PostgreSQL контейнер и инициализира три изолирани БД и роли (`commerce_app`, `payments`, `notifications`).
+2. Стартира **RabbitMQ** (портове `5672` и `15672`) и **Mailpit** (SMTP `1025`, Web UI `http://localhost:8025`).
+3. Построява и пуска **`api`** (`http://localhost:8000`), **`commerce-outbox`**, **`commerce-payment-consumer`**, **`payments`** (`http://localhost:8001`), **`payments-outbox`** и **`notifications`**.
 
 ### Преминаване от предишния запуск (`services/commerce`)
 
@@ -192,93 +188,113 @@ uv run python scripts/seed_products.py
 uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### 7. Известия чрез RabbitMQ и независимия сервис `services/notifications` (К4)
+### 7. Независими сервиси `services/payments` и `services/notifications` през RabbitMQ (К4 / К5)
 
-При преминаване на поръчка в статус `paid` (през Stripe webhook или сверка) или при изпращане на пратка от продавач (`POST /seller/shipments/{id}/ship`), Commerce записва събитие (`order.paid` / `shipment.shipped` със стабилен `event_id` и `event_version=1`) в `order_outbox_events` **в същата PostgreSQL транзакция**, без да чака RabbitMQ, SMTP или SMS.
+В К5 платежният домейн е напълно изнесен в `services/payments`. При `POST /orders/{order_id}/checkout-session` Commerce изчислява сумата от БД, освобождава DB блокировката и изпраща вътрешна HTTP заявка към Payments (`X-Internal-Token`), а Payments говори със Stripe API с детерминистичен `attempt_key` (идемпотентност при паралелни или изгубени заявки).
 
-Отделният процес `commerce-outbox` (`services/commerce/scripts/process_outbox.py`) чете чакащите редове и публикува в RabbitMQ exchange `commerce.events` с `delivery_mode=2`, `mandatory=True` и publisher confirms. Независимият сервис `services/notifications` приема събитията от опашката `notifications.events` (с DLQ `notifications.events.dlq` при невалиден формат или непозната версия), записва входящото събитие и заданията за Email/SMS в своята собствена БД (`notifications`) в една транзакция и **изпраща `basic_ack` към RabbitMQ едва след успешен `commit`**.
+Входящите Stripe webhook събития се приемат **единствено от Payments** (`POST http://localhost:8001/webhooks/stripe`): Payments проверява криптографския подпис, записва опита и пише събитие (`payment.succeeded`, `payment.processing`, `payment.failed`, `payment.expired`) в своята таблица `payment_outbox_events`. Дори ако Commerce е спрян по време на плащането, Payments приема webhook-а, запазва резултата и го публикува в RabbitMQ exchange `payments.events` (`payments-outbox`). След възстановяване на Commerce `commerce-payment-consumer` валидира контракта, отбелязва поръчката като `paid` (през `order_inbox_events`) и атомарно записва `order.paid` в `order_outbox_events`, откъдето `commerce-outbox` и `notifications` изпращат точно по едно Email и SMS известие.
 
 ```mermaid
-flowchart LR
-    API["Commerce API (Stripe Webhook / Ship)"] -->|"1 DB Tx"| OUTBOX["order_outbox_events (pending)"]
-    OUTBOX --> PUB["commerce-outbox (publish + confirm)"]
-    PUB -->|"commerce.events (durable)"| RMQ["RabbitMQ notifications.events"]
-    RMQ -->|"bad JSON / unknown version"| DLQ["notifications.events.dlq"]
-    RMQ -->|"deliver"| CONS["Notifications Consumer"]
-    CONS -->|"DB Tx (inbox + email/sms) -> commit -> basic_ack"| NDB["notifications DB"]
-    NDB --> EMAIL["Email Worker -> Mailpit SMTP"]
-    NDB --> SMS["SMS Worker -> Twilio Adapter (test/contract)"]
+sequenceDiagram
+    participant B as Покупка (Buyer)
+    participant C as Commerce API (8000)
+    participant P as Payments API (8001)
+    participant S as Stripe
+    participant RMQ as RabbitMQ
+    participant CC as commerce-payment-consumer
+    participant N as Notifications
+
+    B->>C: POST /orders/{id}/checkout-session
+    C->>C: Проверка под FOR UPDATE + commit
+    C->>P: POST /internal/payments/checkout-sessions (X-Internal-Token)
+    P->>S: Checkout Session Create (Idempotency-Key)
+    S-->>P: session_id + checkout_url
+    P-->>C: session_id + checkout_url
+    C-->>B: checkout_url
+
+    Note over S,P: Дори при спрян Commerce, Payments приема webhook-а
+    S->>P: POST /webhooks/stripe (Stripe-Signature)
+    P->>P: DB Tx: succeeded + payment_outbox_events (pending)
+    P->>RMQ: payments-outbox publish payment.succeeded (payments.events)
+    RMQ->>CC: deliver commerce.payment_events (DLQ при невалиден контракт)
+    CC->>CC: DB Tx: order=paid + order_inbox_events + order_outbox_events (order.paid)
+    CC->>RMQ: basic_ack след commit
+    RMQ->>N: commerce-outbox -> commerce.events -> notifications.events
+    N->>N: Email (Mailpit) & SMS (Twilio адаптер)
 ```
 
-Стартиране на пълното демо (от корена на хранилището):
+Стартиране на пълния стек (от корена на хранилището):
 ```bash
 test -f services/commerce/.env || cp services/commerce/.env.example services/commerce/.env
+test -f services/payments/.env || cp services/payments/.env.example services/payments/.env
 docker compose --env-file services/commerce/.env up --build -d
 ```
 
 - **Commerce API / Swagger UI**: [http://localhost:8000/docs](http://localhost:8000/docs)
+- **Payments API / Swagger UI**: [http://localhost:8001/docs](http://localhost:8001/docs)
 - **Mailpit Web UI**: [http://localhost:8025](http://localhost:8025)
 - **RabbitMQ Management UI**: [http://localhost:15672](http://localhost:15672) (`guest` / `guest`)
 
 > [!NOTE]
-> **SMS адаптер**: Използва се `TwilioSmsProvider` (`services/notifications/app/sms_sender.py`), който в конфигурацията по подразбиране (`SMS_MODE=test`) работи без реални платени заявки към външен провайдър.
+> **Изолация на три PostgreSQL роли и секрети**: В `compose.yaml` административната роля (`POSTGRES_ADMIN_USER`, по подразбиране `commerce` за запазване на `commerce_postgres_data`) инициализира 3 отделни бази и роли без суперпотребителски права: `commerce_app` (`commerce`), `payments` (`payments`) и `notifications` (`notifications`). Commerce няма `STRIPE_*` променливи и не може да чете таблиците на Payments или Notifications.
 >
-> **Изолация на PostgreSQL роли и sequential lease**: В `compose.yaml` административната роля (`POSTGRES_ADMIN_USER`, по подразбиране `commerce` за съвместимост със съществуващия volume) само инициализира БД; `api`/`commerce-outbox` работят като не-superuser `commerce_app`, а `notifications` — като `notifications`, без достъп до чуждата БД. `DeliveryWorker` захваща по 1 задача непосредствено преди изпращане (`DELIVERY_LEASE_SECONDS >= 3 * max(SMTP_TIMEOUT_SECONDS, SMS_TIMEOUT_SECONDS)`). Ако SMTP приеме писмото миг преди падане на worker-а, lease-ът на задачата (`processing`) изтича и друг worker ще я повтори след `DELIVERY_LEASE_SECONDS`, поради което строго еднократна доставка до крайната пощенска кутия не се обещава.
+> **Разхождения (`order_payment_discrepancies`)**: Ако `payment.succeeded` пристигне след вече отказана (`cancelled`) или изтекла (`expired`) поръчка, Commerce не променя статуса, не пипа наличността и не публикува `order.paid`, а записва видимо разхождение в `order_payment_discrepancies` (достъпно в `GET /orders/{id}` чрез `has_payment_discrepancy` и `payment_discrepancies`).
 
-#### Ръчно публикуване на Outbox и пускане на Notifications локално
+#### Ръчно публикуване на Outbox, консумиране и пускане на трите сервиса локално
 
 ```bash
-# Публикуване на чакащите събития от Commerce към RabbitMQ:
-cd services/commerce && uv run python scripts/process_outbox.py --limit 50
-# или непрекъснат режим:
+# Payments: миграции, API (8001) и outbox към RabbitMQ
+cd services/payments && uv run alembic upgrade head && uv run uvicorn app.main:app --port 8001
+cd services/payments && uv run python scripts/process_outbox.py --daemon
+
+# Commerce: консуматор на payment.* и outbox издател за order.paid / shipment.shipped
+cd services/commerce && uv run python scripts/consume_payment_events.py --daemon
 cd services/commerce && uv run python scripts/process_outbox.py --daemon
 
-# Стартиране на независимия Notifications worker:
+# Notifications: Email/SMS worker
 cd services/notifications && uv run alembic upgrade head && uv run python -m app.main
 ```
 
-#### Безопасен ред за преминаване от стария Commerce SMTP Outbox към К4
-1. Спрете стария Commerce SMTP outbox процес и изчакайте активната партида да приключи (за да няма паралелно изпращане).
-2. Приложете Alembic миграциите в `services/commerce` (`uv run alembic upgrade head`): историческите `'sent'` записи се преобразуват в `'legacy_sent'` (никога не се изпращат повторно), а `'pending'` остават чакащи. Забележка: `alembic downgrade` на К4 миграцията `f7a8b9c0d1e2` отказва преди промяна на схемата, ако съществуват `'published'` събития (доставката им в `notifications` не може да се докаже от Commerce БД).
-3. Инициализирайте изолираните роли/БД (`commerce_app` / `notifications`), приложете миграциите в `services/notifications` и стартирайте `rabbitmq` и `notifications`.
-4. Обновете Commerce API и стартирайте новия `commerce-outbox` издател към RabbitMQ (той обработва само `'pending'`).
+#### Безопасно преминаване (Cutover) от монолитен Commerce Stripe към К5 (`services/payments`)
+1. Приложете миграцията в `services/commerce` (`uv run alembic upgrade head` до `g1b2c3d4e5f6` — добавя `active_attempt_key`, `order_inbox_events`, `order_payment_discrepancies` без да трие старите платежни таблици в Commerce).
+2. Инициализирайте базата и ролята `payments` (`scripts/postgres_db_init.sh`, без изтриване на `commerce_postgres_data`) и приложете миграциите в `services/payments` (`uv run alembic upgrade head`).
+3. Изпълнете повторяемия скрипт за пренос на старите отворени сесии, опити и обработени Stripe събития (може да се пусне многократно без дублиране):
+   ```bash
+   cd services/payments
+   uv run python scripts/migrate_from_commerce.py \
+     --commerce-url "postgresql+psycopg://postgres_or_reader:...@host:5432/commerce" \
+     --payments-url "postgresql+psycopg://payments:...@host:5432/payments"
+   ```
+4. Стартирайте `payments`, `payments-outbox` и `commerce-payment-consumer`, след което пренасочете `stripe listen --forward-to http://localhost:8001/webhooks/stripe` към Payments (8001) и стартирайте обновения Commerce с конфигуриран `PAYMENTS_BASE_URL` и `PAYMENTS_INTERNAL_AUTH_TOKEN`.
 
 ---
 
 ## Тестване и проверка на кода
 
-Проектът разполага с автоматизирани тестове в двата независими сервиса (`commerce_test` и `notifications_test`), както и с изолиран интеграционен E2E пакет:
+Проектът разполага с автоматизирани тестове в три независими сервиса (`commerce_test`, `payments_test` и `notifications_test`), както и с изолирани E2E пакети (`make test-k4-e2e` и `make test-k5-e2e`):
 
 ### Изпълнение на тестовете по сервиси
 
 ```bash
 # 1. Commerce (lint, format, миграции и тестове):
-cd services/commerce
-uv run --locked ruff check .
-uv run --locked ruff format --check .
-uv run --locked pytest -q
+cd services/commerce && uv run --locked ruff check . && uv run --locked ruff format --check . && uv run --locked pytest -q
 
-# 2. Notifications (lint, format, тестове за контракти, DLQ, commit-преди-ack, канали, SMS контракт):
-cd services/notifications
-uv run --locked ruff check .
-uv run --locked ruff format --check .
-uv run --locked pytest -q
+# 2. Payments (lint, format, изолация на БД, конкурентност, webhooks, миграция от Commerce):
+cd services/payments && uv run --locked ruff check . && uv run --locked ruff format --check . && uv run --locked pytest -q
+
+# 3. Notifications (lint, format, контракти, DLQ, commit-преди-ack, Email/SMS):
+cd services/notifications && uv run --locked ruff check . && uv run --locked ruff format --check . && uv run --locked pytest -q
 ```
 
-### Изолирана E2E проверка с една команда от корена (`make test-k4-e2e`)
+### Изолирани E2E проверки от корена (`make test-k4-e2e`, `make test-k5-e2e`)
 
-Командата стартира отделен Docker Compose проект (`commerce-k4-e2e` по `compose.e2e.yaml` на изолирани портове `55432`, `55672`, `58000`, `58025`, `58080`), **без да спира работния Compose стек и без да трие неговите данни/volumes**:
+И двете команди вдигат отделен Docker Compose стек по `compose.e2e.yaml` на изолирани портове (`55432`, `55672`, `58000`, `58001`, `58025`, `58080`, `58081`), **без да спират работния Compose стек и без да трият неговите данни/volumes**:
 
 ```bash
-make test-k4-e2e
+make test-k4-e2e   # Сквозни K4 сценарии за Notifications (DLQ, broker outage, redelivery, multi-seller)
+make test-k5-e2e   # Пълни K5 сценарии: Commerce спрян по време на webhook, срив на RabbitMQ, загубен Stripe отговор,
+                   # паралелен checkout, async failed -> attempt_2 retry, cancel/discrepancy, сверки и migrate_from_commerce.py
 ```
-
-Проверява автоматично с крайни таймаути:
-1. Notifications спрян → плащане през Stripe webhook минава → след пускане писмото и SMS пристигат без второ плащане или webhook.
-2. RabbitMQ спрян → поръчката става `paid`, събитието остава `pending` в Outbox → след възстановяване уведомлението пристига със същия `event_id`.
-3. Прекъсване на връзката в Notifications след DB `commit` и **преди** RabbitMQ `basic_ack` → реалният RabbitMQ доставя повторно (`redelivered`) → в БД остава по 1 задача на канал `(event_id, channel)`.
-4. Mailpit SMTP недостъпен → SMS се обработва независимо → след възстановяване се повтаря само имейлът.
-5. Двама продавачи изпращат две пратки на една поръчка → две отделни събития и два имейла, всеки само със стоките на съответната пратка, плюс проверка за DLQ при непозната версия и пропуск на SMS без телефон.
 
 ### Проверка за форматиране и статичен анализ (Ruff)
 
@@ -772,31 +788,26 @@ curl -s http://localhost:8000/products/1 | grep stock
 
 #### 2. Архитектура на транзакциите и блокировките
 
-- **Ред на заключване**: За пълна защита от мъртви хватки (deadlocks), редът е строго:  
-  `Order` (`FOR UPDATE`) → `StripeCheckoutSession` (`FOR UPDATE`) → `Product` (сортирани възходящо по `id ASC`, `FOR UPDATE`).
-- **Изолирани мрежови повиквания**: DB транзакцията винаги се комитва преди мрежово повикване към Stripe API и се отваря нова транзакция със заключване след получаване на резултата.
-- **Идемпотентност и селективен IntegrityError**: Всяко webhook събитие се записва атомарно в `stripe_processed_events`. При паралелна доставка, `IntegrityError` се лови само при потвърден конфликт по `stripe_event_id`, като чужди грешки за цялост водят до rollback и 500.
+- **Разделена собственост**: Payments заключва в своята БД (`payments`) реда чрез PostgreSQL advisory lock (`pg_advisory_xact_lock(order_id)`) → `PaymentAttempt` / `StripeCheckoutSession`, а Commerce заключва в своята БД (`commerce`) само `Order` (`FOR UPDATE`) → `Product` (възходящо по `id`).
+- **Без отворени DB транзакции по време на мрежови заявки**: И двата сервиса комитват DB транзакцията преди HTTP обръщения (Commerce → Payments и Payments → Stripe API).
+- **Идемпотентност**: Payments използва `stripe_processed_events`, стабилен `attempt_key` и `payment_outbox_events`; Commerce използва `order_inbox_events`, `order_outbox_events` и `order_payment_discrepancies`.
 
-#### 3. Периодична сверка и управление на резервите (`scripts/reconcile_orders.py`)
+#### 3. Периодична сверка и управление на резервите
 
 Всяка поръчка има срок на валидност на резерва (`expires_at`, конфигуриран чрез `ORDER_RESERVE_TIMEOUT_MINUTES`, по подразбиране 30 минути).
-Правило: **Истичането на срока е повод за проверка, а не повод за директно освобождаване на стока.**
-- Ако няма сесия в Stripe: резервът се освобождава локално (`expired`).
-- Ако сесията е `open` в Stripe: първо се извиква Stripe API за потвърдено прекратяване (`expire`), и едва след това стоката се освобождава.
-- Ако плащането е `paid`: поръчката преминава в `paid`.
-- Ако плащането все още се обработва асинхронно (`processing`) или Stripe API е недостъпен: **резервът се запазва**.
+- **Сверка на просрочени резерви в Commerce (`services/commerce/scripts/reconcile_orders.py`)**: изтичането на срока е повод Commerce да попита Payments (`/internal/payments/orders/{id}/cancel` с `reason="reserve_expired"`). Резервът се освобождава единствено ако Payments потвърди липса на активно/обработващо се плащане.
+- **Сверка с провайдера в Payments (`services/payments/scripts/reconcile_payments.py`)**: проверява незавършени опити директно в Stripe API и при пропуснат webhook публикува `payment.succeeded` / `payment.expired` през `payment_outbox_events`.
 
-Команда за ръчно или cron изпълнение:
 ```bash
-cd services/commerce
-uv run python scripts/reconcile_orders.py
+cd services/commerce && uv run python scripts/reconcile_orders.py
+cd services/payments && uv run python scripts/reconcile_payments.py
 ```
 
 #### 4. Stripe CLI команди за 4-те webhook събития
 
-Стартирайте препредаване на всички 4 събития:
+Стартирайте локално препредаване на всички 4 събития директно към **Payments** (`localhost:8001`):
 ```bash
-stripe listen --events checkout.session.completed,checkout.session.async_payment_succeeded,checkout.session.async_payment_failed,checkout.session.expired --forward-to http://localhost:8000/webhooks/stripe
+stripe listen --events checkout.session.completed,checkout.session.async_payment_succeeded,checkout.session.async_payment_failed,checkout.session.expired --forward-to http://localhost:8001/webhooks/stripe
 ```
 
 Симулиране на всяко от събитията чрез Stripe CLI (за бърз диспечерски тест):
@@ -819,15 +830,16 @@ stripe listen --events checkout.session.completed,checkout.session.async_payment
 
 #### 5. Ръчна демонстрация в Swagger на отложено плащане (SEPA / Deferred)
 
-1. **Конфигурация на средата (`services/commerce/.env`)**:
+1. **Конфигурация на средата (`services/payments/.env`)**:
    ```env
    STRIPE_MODE=test
    STRIPE_SECRET_KEY=sk_test_...
    STRIPE_WEBHOOK_SECRET=whsec_...
+   PAYMENTS_INTERNAL_AUTH_TOKEN=...
    ```
-2. **Стартирайте Stripe CLI слушалтеля**:
+2. **Стартирайте Stripe CLI слушалтеля към Payments (`8001`)**:
    ```bash
-   stripe listen --events checkout.session.completed,checkout.session.async_payment_succeeded,checkout.session.async_payment_failed,checkout.session.expired --forward-to http://localhost:8000/webhooks/stripe
+   stripe listen --events checkout.session.completed,checkout.session.async_payment_succeeded,checkout.session.async_payment_failed,checkout.session.expired --forward-to http://localhost:8001/webhooks/stripe
    ```
 3. **Оформете поръчка**:
    - Влезте в `http://localhost:8000/docs`, автентикирайте се с клиентски JWT токен.
@@ -870,11 +882,11 @@ stripe listen --events checkout.session.completed,checkout.session.async_payment
    - Всички създавани опити се маркират автоматично с `mode = 'live'` в колоната `mode` на `stripe_checkout_sessions`.
 5. **Миграции**:
    - Уверете се, че базата данни е обновена до последната миграция: `uv run alembic upgrade head`.
-Стартирайте локално препредаване на уебхуци чрез Stripe CLI:
+Стартирайте локално препредаване на уебхуци чрез Stripe CLI към Payments:
 ```bash
-stripe listen --events checkout.session.completed --forward-to http://localhost:8000/webhooks/stripe
+stripe listen --events checkout.session.completed --forward-to http://localhost:8001/webhooks/stripe
 ```
-Копирайте изписания webhook secret (напр. `whsec_...`) и го въведете в `services/commerce/.env`:
+Копирайте изписания webhook secret (напр. `whsec_...`) и го въведете в `services/payments/.env`:
 ```env
 STRIPE_WEBHOOK_SECRET=whsec_...
 ```
@@ -895,26 +907,12 @@ STRIPE_WEBHOOK_SECRET=whsec_...
    - **CVC**: три произволни цифри (напр. `123`)
    - **Име и държава**: произволни
 6. Натиснете **Pay**. Stripe обработва транзакцията и ви пренасочва към success URL.
-7. В терминала със `stripe listen` ще видите входящото събитие:
+7. В терминала със `stripe listen` ще видите входящото събитие към Payments (`8001`):
    ```text
    --> checkout.session.completed [evt_...]
-   <-- [200] POST http://localhost:8000/webhooks/stripe
+   <-- [200] POST http://localhost:8001/webhooks/stripe
    ```
-8. В Swagger проверете `GET /orders/{order_id}`:
-   - Статусът на поръчката вече е **`paid`**.
-   - В каталога (`GET /products/{id}`) складовата наличност не е намалявана втори път.
-   - В същата база данни транзакция е записано събитие `order.paid` със статус `pending` в таблицата `order_outbox_events`.
-9. Стартирайте скрипта за обработка на Outbox събития:
-   ```bash
-   # В работещ Docker контейнер (от корена на хранилището):
-   docker compose --env-file services/commerce/.env exec api python scripts/process_outbox.py
-
-   # Или локално:
-   cd services/commerce && uv run python scripts/process_outbox.py
-   ```
-10. Отворете пощенската кутия в браузъра: **[http://localhost:8025](http://localhost:8025)**:
-   - Ще видите полученото имейл потвърждение с номер на поръчката, обща сума и валута.
-   - В базата данни събитието вече е маркирано със статус `sent`.
+8. `payments-outbox` публикува `payment.succeeded` към RabbitMQ, `commerce-payment-consumer` отбелязва поръчката като `paid` и записва `order.paid` в `order_outbox_events`, а `commerce-outbox` + `notifications` доставят имейла в Mailpit (`http://localhost:8025`) и SMS (в `test` режим).
 
 ##### 4. Сценарий B: Отхвърлена карта (Declined Card)
 1. Оформете нова поръчка (`POST /orders`) и генерирайте платежен линк (`POST /orders/{order_id}/checkout-session`).

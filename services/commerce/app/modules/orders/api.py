@@ -1,12 +1,14 @@
 import uuid
-from typing import Annotated, Any
+from typing import Annotated
 
-import stripe
-from fastapi import APIRouter, Header, HTTPException, Query, Request, status
-from starlette.concurrency import run_in_threadpool
+from fastapi import APIRouter, Header, HTTPException, Query, status
 
 from app.modules.accounts.dependencies import CurrentUserDep
 from app.modules.orders.dependencies import OrderServiceDep
+from app.modules.orders.payments_client import (
+    PaymentGatewayError,
+    PaymentsNotConfigured,
+)
 from app.modules.orders.schemas import (
     CreateOrderRequest,
     OrderDetailResponse,
@@ -29,15 +31,12 @@ from app.modules.orders.service import (
     OrderNotPaid,
     OrderStateConflict,
     ShipmentNotFound,
-    StripeNotConfigured,
-    StripeServiceError,
 )
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 seller_shipments_router = APIRouter(
     prefix="/seller/shipments", tags=["seller-shipments"]
 )
-webhook_router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
 
 @router.post(
@@ -171,17 +170,17 @@ def create_checkout_session(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "INVALID_ORDER_AMOUNT", "message": str(e)},
         )
-    except StripeNotConfigured as e:
+    except PaymentsNotConfigured as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"code": "STRIPE_NOT_CONFIGURED", "message": str(e)},
+            detail={"code": "PAYMENTS_NOT_CONFIGURED", "message": str(e)},
         )
-    except StripeServiceError:
+    except PaymentGatewayError:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={
-                "code": "STRIPE_ERROR",
-                "message": "Failed to communicate with Stripe API",
+                "code": "PAYMENT_GATEWAY_ERROR",
+                "message": "Failed to communicate with Payments service",
             },
         )
 
@@ -224,42 +223,18 @@ def cancel_order(
                 "message": f"Cannot cancel order with status '{e.current_status}'",
             },
         )
-    except StripeNotConfigured as e:
+    except PaymentsNotConfigured as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"code": "STRIPE_NOT_CONFIGURED", "message": str(e)},
+            detail={"code": "PAYMENTS_NOT_CONFIGURED", "message": str(e)},
         )
-    except StripeServiceError:
+    except PaymentGatewayError:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={
-                "code": "STRIPE_ERROR",
-                "message": "Failed to communicate with Stripe API",
+                "code": "PAYMENT_GATEWAY_ERROR",
+                "message": "Failed to communicate with Payments service",
             },
-        )
-
-
-@webhook_router.post("/stripe")
-async def stripe_webhook(
-    request: Request,
-    order_service: OrderServiceDep,
-) -> dict[str, Any]:
-    """HTTP обработчик за входящи Stripe webhook събития с валидация на криптографски подпис."""
-    payload = await request.body()
-    sig_header = request.headers.get("Stripe-Signature")
-    try:
-        return await run_in_threadpool(
-            order_service.process_stripe_webhook, payload, sig_header
-        )
-    except (ValueError, stripe.SignatureVerificationError) as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": "INVALID_STRIPE_SIGNATURE", "message": str(e)},
-        )
-    except StripeNotConfigured as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"code": "STRIPE_NOT_CONFIGURED", "message": str(e)},
         )
 
 

@@ -43,11 +43,13 @@ COMPOSE_PROJECT = "commerce-k4-e2e"
 COMPOSE_FILE = str(ROOT_DIR / "compose.e2e.yaml")
 
 COMMERCE_API_URL = "http://127.0.0.1:58000"
+PAYMENTS_API_URL = "http://127.0.0.1:58001"
 MAILPIT_API_URL = "http://127.0.0.1:58025"
 SMS_MOCK_URL = "http://127.0.0.1:58080"
 STRIPE_WEBHOOK_SECRET = "whsec_k4_e2e_secret_stripe_commerce_32_bytes_ok"
 
 COMMERCE_DSN = "postgresql://commerce_app:commerce_app@127.0.0.1:55432/commerce"
+PAYMENTS_DSN = "postgresql://payments_app:payments_app@127.0.0.1:55432/payments"
 NOTIFICATIONS_DSN = (
     "postgresql://notifications_app:notifications_app@127.0.0.1:55432/notifications"
 )
@@ -161,27 +163,14 @@ def create_order_and_pay_via_stripe_webhook(
     order_id = int(order_data["id"])
     total_minor = int(order_data["total_minor"])
 
-    # Създаваме отворен StripeCheckoutSession запис (без директно писане на paid в orders!)
-    stripe_session_id = f"cs_e2e_{uuid.uuid4().hex[:16]}"
-    with psycopg.connect(COMMERCE_DSN) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO stripe_checkout_sessions
-                    (order_id, status, amount_minor, currency, mode, stripe_session_id, checkout_url, idempotency_key)
-                VALUES (%s, 'open', %s, 'EUR', 'test', %s, %s, %s)
-                RETURNING id
-                """,
-                (
-                    order_id,
-                    total_minor,
-                    stripe_session_id,
-                    f"https://checkout.stripe.com/pay/{stripe_session_id}",
-                    f"idemp_{stripe_session_id}",
-                ),
-            )
-            attempt_id = cur.fetchone()[0]
-        conn.commit()
+    # Създаваме реална Checkout Session чрез Commerce -> Payments -> Mock Stripe
+    co_resp = httpx.post(
+        f"{COMMERCE_API_URL}/orders/{order_id}/checkout-session",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=5.0,
+    )
+    assert co_resp.status_code == 200, f"Checkout session failed: {co_resp.text}"
+    stripe_session_id = co_resp.json()["session_id"]
 
     webhook_event = {
         "id": f"evt_e2e_{uuid.uuid4().hex[:16]}",
@@ -197,7 +186,7 @@ def create_order_and_pay_via_stripe_webhook(
                 "client_reference_id": str(order_id),
                 "metadata": {
                     "order_id": str(order_id),
-                    "attempt_id": str(attempt_id),
+                    "attempt_key": f"order_{order_id}_attempt_1",
                 },
             }
         },
@@ -212,7 +201,7 @@ def create_order_and_pay_via_stripe_webhook(
     ).hexdigest()
 
     wh_resp = httpx.post(
-        f"{COMMERCE_API_URL}/webhooks/stripe",
+        f"{PAYMENTS_API_URL}/webhooks/stripe",
         content=payload_bytes,
         headers={"Stripe-Signature": f"t={ts},v1={sig}"},
         timeout=5.0,
@@ -220,13 +209,18 @@ def create_order_and_pay_via_stripe_webhook(
     assert wh_resp.status_code == 200, f"Webhook failed: {wh_resp.text}"
     assert wh_resp.json()["status"] == "success"
 
-    check_order = httpx.get(
-        f"{COMMERCE_API_URL}/orders/{order_id}",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=5.0,
+    def _order_is_paid() -> bool | None:
+        check_order = httpx.get(
+            f"{COMMERCE_API_URL}/orders/{order_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=5.0,
+        )
+        assert check_order.status_code == 200
+        return True if check_order.json()["status"] == "paid" else None
+
+    wait_until(
+        f"Order {order_id} status became paid via Payments->RabbitMQ", _order_is_paid
     )
-    assert check_order.status_code == 200
-    assert check_order.json()["status"] == "paid"
     return order_id, total_minor
 
 
@@ -319,11 +313,23 @@ def verify_db_isolation() -> None:
         cur.execute("SELECT COUNT(*) FROM inbox_events")
         assert cur.fetchone() is not None
 
+    with psycopg.connect(PAYMENTS_DSN, connect_timeout=3) as conn, conn.cursor() as cur:
+        cur.execute("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+        assert cur.fetchone()[0] is False
+        cur.execute("SELECT COUNT(*) FROM payment_attempts")
+        assert cur.fetchone() is not None
+
     _assert_db_access_denied(
         "postgresql://notifications_app:notifications_app@127.0.0.1:55432/commerce"
     )
     _assert_db_access_denied(
         "postgresql://commerce_app:commerce_app@127.0.0.1:55432/notifications"
+    )
+    _assert_db_access_denied(
+        "postgresql://payments_app:payments_app@127.0.0.1:55432/commerce"
+    )
+    _assert_db_access_denied(
+        "postgresql://commerce_app:commerce_app@127.0.0.1:55432/payments"
     )
     try:
         _assert_db_access_denied(
@@ -382,15 +388,19 @@ def verify_scenario_2(seller_token: str) -> None:
     print(
         "-> [Scenario 2] RabbitMQ stopped -> order becomes paid, stays in Outbox -> recovers -> notification arrives"
     )
-    compose_cmd("stop", "rabbitmq-e2e")
-
     email = f"s2_{uuid.uuid4().hex[:8]}@example.com"
     phone = f"+359882{uuid.uuid4().int % 1000000:06d}"
     _, buyer_token = register_and_login(email)
     pid = create_product(seller_token, title="E2E Item S2", price_minor=4200)
     add_to_cart(buyer_token, pid, 1)
 
-    order_id, _ = create_order_and_pay_via_stripe_webhook(buyer_token, phone=phone)
+    # Спираме commerce-outbox-e2e, за да заплатим поръчката и да спрем RabbitMQ преди публикуване
+    compose_cmd("stop", "commerce-outbox-e2e")
+    try:
+        order_id, _ = create_order_and_pay_via_stripe_webhook(buyer_token, phone=phone)
+        compose_cmd("stop", "rabbitmq-e2e")
+    finally:
+        compose_cmd("start", "commerce-outbox-e2e")
 
     # Изчакваме outbox daemon-ът да направи поне 1 неуспешен опит при спрян брокер
     row_pending = wait_until(
@@ -1028,6 +1038,14 @@ def main() -> None:
             True
             if httpx.get(f"{COMMERCE_API_URL}/openapi.json", timeout=2.0).status_code
             == 200
+            else None
+        ),
+    )
+    wait_until(
+        "Payments API ready",
+        lambda: (
+            True
+            if httpx.get(f"{PAYMENTS_API_URL}/health", timeout=2.0).status_code == 200
             else None
         ),
     )

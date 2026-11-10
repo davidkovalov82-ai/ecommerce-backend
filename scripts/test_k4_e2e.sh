@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export PATH="${HOME}/.local/bin:${PATH}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_NAME="commerce-k4-e2e"
 COMPOSE_FILE="${ROOT_DIR}/compose.e2e.yaml"

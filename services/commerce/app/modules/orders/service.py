@@ -1,9 +1,7 @@
 import datetime
 import uuid
 from collections.abc import Sequence
-from typing import Any
 
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -15,12 +13,17 @@ from app.modules.orders.models import (
     OrderItem,
     OrderOutboxEvent,
     Shipment,
-    StripeCheckoutSession,
-    StripeProcessedEvent,
+)
+from app.modules.orders.payment_contracts import ValidatedPaymentEvent
+from app.modules.orders.payments_client import (
+    HttpPaymentsClient,
+    PaymentsClient,
+    RemoteOrderAlreadyPaid,
+    RemoteOrderAmountInvalid,
+    RemotePaymentConflict,
 )
 from app.modules.orders.repository import OrderRepository
 from app.modules.orders.schemas import ShippingAddress
-from app.modules.orders.stripe_client import StripeClient, StripeNotConfigured
 
 
 class CartEmpty(Exception):
@@ -85,10 +88,6 @@ class InvalidOrderAmount(Exception):
     """Сигнализира за сума на поръчката извън допустимите граници за Stripe."""
 
 
-class StripeServiceError(Exception):
-    """Сигнализира за грешка при мрежова комуникация със Stripe API."""
-
-
 class OrderService:
     """Услуга за управление на жизнения цикъл на поръчките."""
 
@@ -99,14 +98,14 @@ class OrderService:
         product_repository: ProductRepository,
         user_repository: UserRepository,
         session: Session,
-        stripe_client: StripeClient | None = None,
+        payments_client: PaymentsClient | None = None,
     ) -> None:
         self._order_repository = order_repository
         self._cart_repository = cart_repository
         self._product_repository = product_repository
         self._user_repository = user_repository
         self._session = session
-        self._stripe_client = stripe_client or StripeClient()
+        self._payments_client = payments_client or HttpPaymentsClient()
 
     def create_order(
         self,
@@ -230,6 +229,8 @@ class OrderService:
             )
             self._order_repository.add(order)
             self._session.flush()
+            order.payment_attempt_seq = 1
+            order.active_attempt_key = f"order_{order.id}_attempt_1"
 
             # 7. Създаване на отделна пратка (Shipment) за всеки уникален продавач
             unique_seller_ids = sorted({p.seller_id for p in locked_products})
@@ -494,22 +495,20 @@ class OrderService:
         order_id: int,
         user_id: int,
     ) -> tuple[str, str]:
-        """Сценарий: създаване или извличане на активна Stripe Checkout сесия за собствена поръчка.
+        """Сценарий: създаване или извличане на активна Stripe Checkout сесия чрез Payments сервиса.
 
         Транзакционен протокол:
         1. Заключване на поръчката с FOR UPDATE.
-        2. Проверка за собственост, съществуване и статус pending_payment.
-        3. Проверка на сумата срещу лимитите на Stripe (мин. 50 цента EUR).
-        4. Проверка на съществуващи сесии:
-           - open с checkout_url -> връщаме съществуващата сесия без ново повикване към Stripe.
-           - cancelling -> конфликт (409): отказът е в ход, нов checkout не може да заобиколи защитата.
-           - initiated -> резултатът още не е известен: преизползваме същия attempt и idempotency_key.
-           - expired -> предишната е изтекла, създаваме нов опит.
-        5. Записване/актуализиране на attempt в статус 'initiated' и commit преди мрежовото обръщение към Stripe.
-        6. Извикване на Stripe API без отворена DB транзакция.
-        7. В нова транзакция със заключване FOR UPDATE отразяваме резултата: закъснял отговор никога не връща completed или expired/cancelling сесия в open!
+        2. Проверка за собственост, съществуване, статус pending_payment и лимити на сумата.
+        3. Проверка за изтекъл резерв: ако поръчката вече е просрочена, първо освобождаваме DB
+           заключването и координираме прекратяване с Payments, едва след което освобождаваме резерва.
+        4. Фиксиране на текущия attempt_key и commit Преди HTTP заявката към Payments.
+        5. Извикване на Payments internal HTTP API без отворена DB транзакция.
         """
-        # Фаза 1: Проверка и иницииране в БД
+        expired_order_snapshot: datetime.datetime | None = None
+        is_reserve_expired = False
+
+        # Фаза 1: Проверка на поръчката и подготовка на параметрите под FOR UPDATE
         try:
             order = self._order_repository.get_by_id_and_user_id_for_update(
                 order_id=order_id,
@@ -540,610 +539,220 @@ class OrderService:
                     "Order total exceeds Stripe's maximum allowed amount"
                 )
 
-            # Проверка за съществуваща сесия с FOR UPDATE
-            existing_session = (
-                self._order_repository.get_latest_stripe_session_by_order_id_for_update(
-                    order.id
-                )
-            )
-
             now = datetime.datetime.now(datetime.UTC)
             if order.expires_at and order.expires_at <= now:
-                if (
-                    existing_session
-                    and existing_session.status == "open"
-                    and existing_session.stripe_session_id
-                ):
-                    session_to_expire = existing_session.stripe_session_id
-                    existing_session.status = "cancelling"
-                    self._session.commit()
-                    try:
-                        self._stripe_client.expire_checkout_session(session_to_expire)
-                    except Exception:  # noqa: BLE001, S110
-                        pass
-                    order_rec = self._order_repository.get_by_id_for_update(order.id)
-                    s_rec = self._order_repository.get_stripe_session_by_id_for_update(
-                        existing_session.id
-                    )
-                    if order_rec and order_rec.status not in (
-                        "cancelled",
-                        "expired",
-                        "paid",
-                    ):
-                        order_rec.status = "expired"
-                        if s_rec:
-                            s_rec.status = "expired"
-                        self._restore_order_stock(order_rec)
-                    self._session.commit()
-                else:
-                    order.status = "expired"
-                    if existing_session and existing_session.status != "expired":
-                        existing_session.status = "expired"
-                    self._restore_order_stock(order)
-                    self._session.commit()
-                raise OrderStateConflict(
-                    current_status="expired",
-                    message="Order reserve has expired",
-                )
-            if existing_session is not None:
-                if (
-                    existing_session.status == "open"
-                    and existing_session.checkout_url
-                    and existing_session.stripe_session_id
-                ):
-                    self._session.commit()
-                    return (
-                        existing_session.checkout_url,
-                        existing_session.stripe_session_id,
-                    )
-
-                if existing_session.status in ("cancelling", "processing"):
-                    self._session.commit()
-                    raise OrderStateConflict(
-                        current_status=existing_session.status,
-                        message=f"Cannot create checkout session while session is in status '{existing_session.status}'",
-                    )
-
-                if existing_session.status == "completed":
-                    self._session.commit()
-                    raise OrderStateConflict(
-                        current_status="paid",
-                        message="Cannot create checkout session for paid order",
-                    )
-
-                if existing_session.status == "initiated":
-                    # Резултатът още не е известен: преизползваме записа и същия idempotency_key
-                    attempt = existing_session
-                else:
-                    # status in ('expired', 'failed'): създаваме нов опит
-                    attempt = StripeCheckoutSession(
-                        order_id=order.id,
-                        status="initiated",
-                        amount_minor=order.total_minor,
-                        currency=order.currency,
-                        mode=settings.stripe_mode,
-                        idempotency_key=f"order_{order.id}_pending_{uuid.uuid4().hex[:12]}",
-                    )
-                    self._order_repository.add_stripe_session(attempt)
-                    self._session.flush()
-                    attempt.idempotency_key = f"order_{order.id}_attempt_{attempt.id}"
+                is_reserve_expired = True
+                expired_order_snapshot = order.expires_at
+                self._session.commit()
             else:
-                attempt = StripeCheckoutSession(
-                    order_id=order.id,
-                    status="initiated",
-                    amount_minor=order.total_minor,
-                    currency=order.currency,
-                    mode=settings.stripe_mode,
-                    idempotency_key=f"order_{order.id}_pending_{uuid.uuid4().hex[:12]}",
-                )
-                self._order_repository.add_stripe_session(attempt)
-                self._session.flush()
-                attempt.idempotency_key = f"order_{order.id}_attempt_{attempt.id}"
+                if not order.active_attempt_key:
+                    seq = max(1, int(order.payment_attempt_seq or 1))
+                    order.payment_attempt_seq = seq
+                    order.active_attempt_key = f"order_{order.id}_attempt_{seq}"
 
-            attempt_id = attempt.id
-            idempotency_key = attempt.idempotency_key
-            line_items = [
-                {
-                    "price_data": {
-                        "currency": order.currency.lower(),
+                attempt_key = order.current_attempt_key
+                amount_minor = order.total_minor
+                currency = order.currency
+                order_expires_at = order.expires_at
+                line_items = [
+                    {
+                        "name": item.product_title,
                         "unit_amount": item.unit_price_minor,
-                        "product_data": {
-                            "name": item.product_title,
-                        },
-                    },
-                    "quantity": item.quantity,
-                }
-                for item in order.items
-            ]
-            self._session.commit()
-        except Exception:
-            self._session.rollback()
-            raise
-
-        # Фаза 2: Мрежова заявка към Stripe БЕЗ отворена DB транзакция
-        success_url = settings.stripe_success_url.format(order_id=order_id)
-        cancel_url = settings.stripe_cancel_url.format(order_id=order_id)
-        try:
-            stripe_session = self._stripe_client.create_checkout_session(
-                line_items=line_items,
-                success_url=success_url,
-                cancel_url=cancel_url,
-                metadata={
-                    "order_id": str(order_id),
-                    "attempt_id": str(attempt_id),
-                },
-                client_reference_id=str(order_id),
-                idempotency_key=idempotency_key,
-            )
-        except StripeNotConfigured:
-            raise
-        except Exception as e:
-            raise StripeServiceError(f"Stripe session creation failed: {e}") from e
-
-        # Фаза 3: Запис на Stripe резултата в БД със заключване FOR UPDATE в ред: заказ -> попытка
-        try:
-            order_record = self._order_repository.get_by_id_for_update(order_id)
-            attempt_record = self._order_repository.get_stripe_session_by_id_for_update(
-                attempt_id
-            )
-
-            if attempt_record is not None:
-                attempt_record.stripe_session_id = stripe_session.id
-                attempt_record.checkout_url = stripe_session.url
-
-                # Закъснял отговор не трябва да върне completed или expired/cancelling сесия в open!
-                if attempt_record.status == "completed" or (
-                    order_record and order_record.status == "paid"
-                ):
-                    attempt_record.status = "completed"
-                    self._session.commit()
-                    return stripe_session.url, stripe_session.id
-
-                if attempt_record.status in ("cancelling", "expired") or (
-                    order_record and order_record.status in ("cancelled", "expired")
-                ):
-                    # Отказът или изтичането са настъпили, докато чакахме Stripe.
-                    # Не записваме expired преди реално потвърждение от Stripe!
-                    attempt_record.status = "cancelling"
-                    self._session.commit()
-
-                    # Прекратяваме сесията в Stripe БЕЗ задържане на DB заключване и БЕЗ заглушаване на грешки
-                    try:
-                        self._stripe_client.expire_checkout_session(stripe_session.id)
-                    except Exception as e:
-                        raise StripeServiceError(
-                            f"Failed to confirm termination of late session in Stripe: {e}"
-                        ) from e
-
-                    # След като прекратяването е потвърдено в Stripe, отразяваме в БД
-                    order_record = self._order_repository.get_by_id_for_update(order_id)
-                    attempt_record = (
-                        self._order_repository.get_stripe_session_by_id_for_update(
-                            attempt_id
-                        )
-                    )
-                    if attempt_record is not None:
-                        attempt_record.status = "expired"
-                    self._session.commit()
-
-                    raise OrderStateConflict(
-                        current_status=order_record.status
-                        if order_record
-                        else "cancelled",
-                        message="Order was cancelled while creating checkout session",
-                    )
-
-                if (
-                    attempt_record.status == "initiated"
-                    and order_record
-                    and order_record.status == "pending_payment"
-                ):
-                    attempt_record.status = "open"
-                    self._session.commit()
-                    return stripe_session.url, stripe_session.id
-
-            self._session.commit()
-            return stripe_session.url, stripe_session.id
-        except Exception:
-            self._session.rollback()
-            raise
-
-    def process_stripe_webhook(
-        self, payload: bytes, sig_header: str | None
-    ) -> dict[str, Any]:
-        """Обработва входящо Stripe webhook събитие с валидация на подпис, режим и точен опит."""
-        # 1. Валидация на подписа на събитието
-        event_raw = self._stripe_client.construct_webhook_event(payload, sig_header)
-        event: dict[str, Any] = (
-            event_raw.to_dict() if hasattr(event_raw, "to_dict") else dict(event_raw)
-        )
-        event_id = event["id"]
-        event_type = event["type"]
-
-        # 2. Идемпотентност: ако събитието вече е обработено, връщаме успех без повторни промени
-        if self._order_repository.is_stripe_event_processed(event_id):
-            return {"status": "already_processed", "event_id": event_id}
-
-        # 3. Режим на работа (sandbox vs live)
-        expected_livemode = settings.stripe_mode == "live"
-        if event.get("livemode") != expected_livemode:
-            try:
-                self._order_repository.record_stripe_event(
-                    StripeProcessedEvent(
-                        stripe_event_id=event_id,
-                        event_type=event_type,
-                    )
-                )
-                self._session.commit()
-            except IntegrityError:
-                self._session.rollback()
-                if self._order_repository.is_stripe_event_processed(event_id):
-                    return {"status": "already_processed", "event_id": event_id}
-                raise
-            return {"status": "ignored", "reason": "mode_mismatch"}
-
-        # 4. Филтриране само на поддържаните 4 типа събития
-        supported_events = {
-            "checkout.session.completed",
-            "checkout.session.async_payment_succeeded",
-            "checkout.session.async_payment_failed",
-            "checkout.session.expired",
-        }
-        if event_type not in supported_events:
-            try:
-                self._order_repository.record_stripe_event(
-                    StripeProcessedEvent(
-                        stripe_event_id=event_id,
-                        event_type=event_type,
-                    )
-                )
-                self._session.commit()
-            except IntegrityError:
-                self._session.rollback()
-                if self._order_repository.is_stripe_event_processed(event_id):
-                    return {"status": "already_processed", "event_id": event_id}
-                raise
-            return {"status": "ignored", "event_id": event_id}
-
-        raw_obj = event.get("data", {}).get("object", {})
-        session_data: dict[str, Any] = (
-            raw_obj.to_dict() if hasattr(raw_obj, "to_dict") else dict(raw_obj)
-        )
-        if "livemode" in session_data and session_data["livemode"] != expected_livemode:
-            try:
-                self._order_repository.record_stripe_event(
-                    StripeProcessedEvent(
-                        stripe_event_id=event_id,
-                        event_type=event_type,
-                    )
-                )
-                self._session.commit()
-            except IntegrityError:
-                self._session.rollback()
-                if self._order_repository.is_stripe_event_processed(event_id):
-                    return {"status": "already_processed", "event_id": event_id}
-                raise
-            return {"status": "ignored", "reason": "mode_mismatch"}
-
-        # 5. Извличане на идентификатори
-        stripe_session_id = session_data.get("id")
-        metadata = session_data.get("metadata") or {}
-        order_id_raw = metadata.get("order_id") or session_data.get(
-            "client_reference_id"
-        )
-        attempt_id_raw = metadata.get("attempt_id")
-
-        order_id: int | None = None
-        if order_id_raw is not None:
-            try:
-                order_id = int(order_id_raw)
-            except ValueError:
-                pass
-
-        attempt_id: int | None = None
-        if attempt_id_raw is not None:
-            try:
-                attempt_id = int(attempt_id_raw)
-            except ValueError:
-                pass
-
-        if order_id is None and stripe_session_id:
-            temp_attempt = self._order_repository.get_stripe_session_by_stripe_id(
-                stripe_session_id
-            )
-            if temp_attempt:
-                order_id = temp_attempt.order_id
-                if attempt_id is None:
-                    attempt_id = temp_attempt.id
-
-        if order_id is None or not stripe_session_id:
-            try:
-                self._order_repository.record_stripe_event(
-                    StripeProcessedEvent(
-                        stripe_event_id=event_id,
-                        event_type=event_type,
-                    )
-                )
-                self._session.commit()
-            except IntegrityError:
-                self._session.rollback()
-                if self._order_repository.is_stripe_event_processed(event_id):
-                    return {"status": "already_processed", "event_id": event_id}
-                raise
-            return {"status": "ignored", "reason": "missing_identifiers"}
-
-        # 6. Заключване на поръчката и опита в базата данни
-        try:
-            order = self._order_repository.get_by_id_for_update(order_id)
-            if order is None:
-                self._order_repository.record_stripe_event(
-                    StripeProcessedEvent(
-                        stripe_event_id=event_id,
-                        event_type=event_type,
-                        order_id=None,
-                    )
-                )
-                self._session.commit()
-                return {"status": "order_not_found"}
-
-            attempt_record: StripeCheckoutSession | None = None
-            if attempt_id is not None:
-                attempt_record = (
-                    self._order_repository.get_stripe_session_by_id_for_update(
-                        attempt_id
-                    )
-                )
-            elif stripe_session_id is not None:
-                attempt_record = (
-                    self._order_repository.get_stripe_session_by_stripe_id_for_update(
-                        stripe_session_id
-                    )
-                )
-
-            if attempt_record is None:
-                attempt_record = self._order_repository.get_latest_stripe_session_by_order_id_for_update(
-                    order.id
-                )
-
-            if attempt_record is None or attempt_record.order_id != order.id:
-                self._order_repository.record_stripe_event(
-                    StripeProcessedEvent(
-                        stripe_event_id=event_id,
-                        event_type=event_type,
-                        order_id=order.id,
-                    )
-                )
-                self._session.commit()
-                return {"status": "mismatched", "reason": "invalid_attempt"}
-
-            # Ранен webhook: свързваме сесията, ако още не е записан stripe_session_id
-            if attempt_record.stripe_session_id is not None:
-                if attempt_record.stripe_session_id != stripe_session_id:
-                    self._order_repository.record_stripe_event(
-                        StripeProcessedEvent(
-                            stripe_event_id=event_id,
-                            event_type=event_type,
-                            order_id=order.id,
-                        )
-                    )
-                    self._session.commit()
-                    return {"status": "mismatched", "reason": "session_id_mismatch"}
-            else:
-                attempt_record.stripe_session_id = stripe_session_id
-
-            # Проверка за mode на опита
-            if attempt_record.mode != settings.stripe_mode:
-                self._order_repository.record_stripe_event(
-                    StripeProcessedEvent(
-                        stripe_event_id=event_id,
-                        event_type=event_type,
-                        order_id=order.id,
-                    )
-                )
-                self._session.commit()
-                return {"status": "mismatched", "reason": "attempt_mode_mismatch"}
-
-            # 7. Обработка според типа на събитието
-            if event_type == "checkout.session.completed":
-                payment_status = session_data.get("payment_status")
-                if payment_status == "paid":
-                    amount_total = session_data.get("amount_total")
-                    currency = (session_data.get("currency") or "").upper()
-                    if (
-                        amount_total != order.total_minor
-                        or amount_total != attempt_record.amount_minor
-                    ):
-                        self._order_repository.record_stripe_event(
-                            StripeProcessedEvent(
-                                stripe_event_id=event_id,
-                                event_type=event_type,
-                                order_id=order.id,
-                            )
-                        )
-                        self._session.commit()
-                        return {"status": "mismatched", "reason": "amount_mismatch"}
-
-                    if (
-                        currency != order.currency.upper()
-                        or currency != attempt_record.currency.upper()
-                    ):
-                        self._order_repository.record_stripe_event(
-                            StripeProcessedEvent(
-                                stripe_event_id=event_id,
-                                event_type=event_type,
-                                order_id=order.id,
-                            )
-                        )
-                        self._session.commit()
-                        return {"status": "mismatched", "reason": "currency_mismatch"}
-
-                    attempt_record.status = "completed"
-
-                    if order.status in ("cancelled", "expired"):
-                        self._order_repository.record_stripe_event(
-                            StripeProcessedEvent(
-                                stripe_event_id=event_id,
-                                event_type=event_type,
-                                order_id=order.id,
-                            )
-                        )
-                        self._session.commit()
-                        return {
-                            "status": "discrepancy",
-                            "reason": "payment_on_cancelled_order",
-                            "event_id": event_id,
-                        }
-
-                    self._transition_order_to_paid(order)
-                    self._order_repository.record_stripe_event(
-                        StripeProcessedEvent(
-                            stripe_event_id=event_id,
-                            event_type=event_type,
-                            order_id=order.id,
-                        )
-                    )
-                    self._session.commit()
-                    return {"status": "success", "event_id": event_id}
-                else:
-                    if order.status == "pending_payment":
-                        order.status = "payment_processing"
-                        attempt_record.status = "processing"
-                    elif order.status == "payment_processing":
-                        attempt_record.status = "processing"
-
-                    self._order_repository.record_stripe_event(
-                        StripeProcessedEvent(
-                            stripe_event_id=event_id,
-                            event_type=event_type,
-                            order_id=order.id,
-                        )
-                    )
-                    self._session.commit()
-                    return {"status": "processing", "event_id": event_id}
-
-            elif event_type == "checkout.session.async_payment_succeeded":
-                amount_total = session_data.get("amount_total")
-                currency = (session_data.get("currency") or "").upper()
-                if amount_total is not None and (
-                    amount_total != order.total_minor
-                    or amount_total != attempt_record.amount_minor
-                ):
-                    self._order_repository.record_stripe_event(
-                        StripeProcessedEvent(
-                            stripe_event_id=event_id,
-                            event_type=event_type,
-                            order_id=order.id,
-                        )
-                    )
-                    self._session.commit()
-                    return {"status": "mismatched", "reason": "amount_mismatch"}
-
-                if currency and (
-                    currency != order.currency.upper()
-                    or currency != attempt_record.currency.upper()
-                ):
-                    self._order_repository.record_stripe_event(
-                        StripeProcessedEvent(
-                            stripe_event_id=event_id,
-                            event_type=event_type,
-                            order_id=order.id,
-                        )
-                    )
-                    self._session.commit()
-                    return {"status": "mismatched", "reason": "currency_mismatch"}
-
-                attempt_record.status = "completed"
-
-                if order.status in ("cancelled", "expired"):
-                    self._order_repository.record_stripe_event(
-                        StripeProcessedEvent(
-                            stripe_event_id=event_id,
-                            event_type=event_type,
-                            order_id=order.id,
-                        )
-                    )
-                    self._session.commit()
-                    return {
-                        "status": "discrepancy",
-                        "reason": "payment_on_cancelled_order",
-                        "event_id": event_id,
+                        "quantity": item.quantity,
+                        "currency": order.currency.lower(),
                     }
-
-                self._transition_order_to_paid(order)
-                self._order_repository.record_stripe_event(
-                    StripeProcessedEvent(
-                        stripe_event_id=event_id,
-                        event_type=event_type,
-                        order_id=order.id,
-                    )
-                )
+                    for item in order.items
+                ]
                 self._session.commit()
-                return {"status": "success", "event_id": event_id}
-
-            elif event_type == "checkout.session.async_payment_failed":
-                attempt_record.status = "failed"
-                current_time = datetime.datetime.now(datetime.UTC)
-                is_expired = (
-                    order.expires_at is not None and order.expires_at <= current_time
-                )
-                if is_expired and order.status not in ("cancelled", "expired", "paid"):
-                    order.status = "expired"
-                    self._restore_order_stock(order)
-                elif not is_expired and order.status == "payment_processing":
-                    order.status = "pending_payment"
-
-                self._order_repository.record_stripe_event(
-                    StripeProcessedEvent(
-                        stripe_event_id=event_id,
-                        event_type=event_type,
-                        order_id=order.id,
-                    )
-                )
-                self._session.commit()
-                return {"status": "failed", "event_id": event_id}
-
-            elif event_type == "checkout.session.expired":
-                attempt_record.status = "expired"
-                current_time = datetime.datetime.now(datetime.UTC)
-                is_expired = (
-                    order.expires_at is not None and order.expires_at <= current_time
-                )
-                if is_expired and order.status not in ("cancelled", "expired", "paid"):
-                    order.status = "expired"
-                    self._restore_order_stock(order)
-
-                self._order_repository.record_stripe_event(
-                    StripeProcessedEvent(
-                        stripe_event_id=event_id,
-                        event_type=event_type,
-                        order_id=order.id,
-                    )
-                )
-                self._session.commit()
-                return {"status": "expired", "event_id": event_id}
-
-            self._order_repository.record_stripe_event(
-                StripeProcessedEvent(
-                    stripe_event_id=event_id,
-                    event_type=event_type,
-                    order_id=order.id,
-                )
-            )
-            self._session.commit()
-            return {"status": "ignored", "event_id": event_id}
-
-        except IntegrityError:
+        except Exception:
             self._session.rollback()
-            if self._order_repository.is_stripe_event_processed(event_id):
-                return {"status": "already_processed", "event_id": event_id}
             raise
+
+        # Просрочен резерв -> съгласувано прекратяване в Payments преди връщане на наличност
+        if is_reserve_expired:
+            try:
+                self._payments_client.cancel_order_payment(
+                    order_id=order_id,
+                    reason="reserve_expired",
+                    order_expires_at=expired_order_snapshot,
+                )
+            except RemoteOrderAlreadyPaid as exc:
+                raise OrderStateConflict(
+                    current_status="paid",
+                    message="Cannot expire or pay order: payment already completed",
+                ) from exc
+            except RemotePaymentConflict as exc:
+                raise OrderStateConflict(
+                    current_status=exc.current_status,
+                    message=str(exc),
+                ) from exc
+
+            try:
+                order_rec = self._order_repository.get_by_id_for_update(order_id)
+                if order_rec and order_rec.status not in (
+                    "cancelled",
+                    "expired",
+                    "paid",
+                ):
+                    order_rec.status = "expired"
+                    self._restore_order_stock(order_rec)
+                self._session.commit()
+            except Exception:
+                self._session.rollback()
+                raise
+
+            raise OrderStateConflict(
+                current_status="expired",
+                message="Order reserve has expired",
+            )
+
+        # Фаза 2: Вътрешен HTTP разговор към Payments без отворена DB транзакция
+        try:
+            session_result = self._payments_client.create_checkout_session(
+                order_id=order_id,
+                attempt_key=attempt_key,
+                amount_minor=amount_minor,
+                currency=currency,
+                line_items=line_items,
+                order_expires_at=order_expires_at,
+            )
+        except RemoteOrderAmountInvalid as exc:
+            raise InvalidOrderAmount(str(exc)) from exc
+        except RemoteOrderAlreadyPaid as exc:
+            raise OrderStateConflict(
+                current_status="paid",
+                message="Cannot create checkout session for paid order",
+            ) from exc
+        except RemotePaymentConflict as exc:
+            raise OrderStateConflict(
+                current_status=exc.current_status,
+                message=str(exc),
+            ) from exc
+
+        return session_result.checkout_url, session_result.session_id
+
+    def apply_payment_event(self, event: ValidatedPaymentEvent) -> str:
+        """Прилага валидирано платежно събитие от Payments към състоянието на поръчката (идемпотентно)."""
+        if self._order_repository.is_inbox_event_processed(event.event_id):
+            return "already_processed"
+
+        try:
+            order = self._order_repository.get_by_id_for_update(event.order_id)
+            if order is None:
+                inserted = self._order_repository.record_inbox_event_idempotent(
+                    event_id=event.event_id,
+                    event_type=event.event_type,
+                    event_version=event.event_version,
+                    payment_attempt_id=event.payment_attempt_id,
+                    order_id=event.order_id,
+                    outcome="order_not_found",
+                    payload=event.payload,
+                    occurred_at=event.occurred_at,
+                )
+                self._session.commit()
+                return "order_not_found" if inserted else "already_processed"
+
+            current_attempt_key = order.current_attempt_key
+            outcome = "ignored"
+
+            if event.event_type == "payment.succeeded":
+                if (
+                    event.amount_minor != order.total_minor
+                    or event.currency.upper() != order.currency.upper()
+                ):
+                    outcome = "mismatched"
+                elif order.status in ("cancelled", "expired"):
+                    reason = (
+                        "payment_on_cancelled_order"
+                        if order.status == "cancelled"
+                        else "payment_on_expired_order"
+                    )
+                    self._order_repository.record_payment_discrepancy_idempotent(
+                        order_id=order.id,
+                        payment_attempt_id=event.payment_attempt_id,
+                        event_id=event.event_id,
+                        reason=reason,
+                        amount_minor=event.amount_minor,
+                        currency=event.currency.upper(),
+                        stripe_session_id=event.stripe_session_id,
+                        stripe_event_id=event.stripe_event_id,
+                        details={
+                            "order_status": order.status,
+                            "attempt_key": event.attempt_key,
+                            "occurred_at": event.occurred_at.isoformat(),
+                        },
+                    )
+                    outcome = "discrepancy"
+                elif order.status == "paid":
+                    self._transition_order_to_paid(order)
+                    outcome = "already_paid"
+                else:
+                    self._transition_order_to_paid(order)
+                    outcome = "paid"
+
+            elif event.event_type == "payment.processing":
+                if event.attempt_key != current_attempt_key:
+                    outcome = "ignored_stale_attempt"
+                elif order.status == "pending_payment":
+                    order.status = "payment_processing"
+                    outcome = "processing"
+                elif order.status == "payment_processing":
+                    outcome = "processing"
+                else:
+                    outcome = "ignored"
+
+            elif event.event_type in ("payment.failed", "payment.expired"):
+                if event.attempt_key != current_attempt_key:
+                    outcome = "ignored_stale_attempt"
+                else:
+                    now = datetime.datetime.now(datetime.UTC)
+                    is_expired = (
+                        order.expires_at is not None and order.expires_at <= now
+                    )
+                    if order.status in ("paid", "cancelled", "expired"):
+                        outcome = "ignored"
+                    elif is_expired:
+                        order.status = "expired"
+                        self._restore_order_stock(order)
+                        outcome = "expired"
+                    else:
+                        if order.status == "payment_processing":
+                            order.status = "pending_payment"
+                        # Отваряме нов ключ за следващ опит след окончателно неуспех/изтичане
+                        next_seq = max(1, int(order.payment_attempt_seq or 1)) + 1
+                        order.payment_attempt_seq = next_seq
+                        order.active_attempt_key = (
+                            f"order_{order.id}_attempt_{next_seq}"
+                        )
+                        outcome = (
+                            "failed"
+                            if event.event_type == "payment.failed"
+                            else "expired"
+                        )
+
+            inserted = self._order_repository.record_inbox_event_idempotent(
+                event_id=event.event_id,
+                event_type=event.event_type,
+                event_version=event.event_version,
+                payment_attempt_id=event.payment_attempt_id,
+                order_id=event.order_id,
+                outcome=outcome,
+                payload=event.payload,
+                occurred_at=event.occurred_at,
+            )
+            if not inserted:
+                self._session.rollback()
+                return "already_processed"
+
+            self._session.commit()
+            return outcome
         except Exception:
             self._session.rollback()
             raise
 
     def cancel_order(self, order_id: int, user_id: int) -> Order:
-        """Сценарий: отказ от неплатена поръчка, прекратяване на Stripe сесия и връщане на наличностите."""
-        # 1. Заключваме реда на поръчката
+        """Сценарий: съгласуван отказ от неплатена поръчка чрез Payments и връщане на наличностите."""
+        # Фаза 1: Проверка на поръчката под FOR UPDATE и освобождаване на заключването преди HTTP
         order = self._order_repository.get_by_id_and_user_id_for_update(
             order_id=order_id,
             user_id=user_id,
@@ -1151,11 +760,10 @@ class OrderService:
         if order is None:
             raise OrderNotFound(f"Order with id {order_id} not found")
 
-        # 2. Идемпотентен отговор при вече отказана поръчка
         if order.status == "cancelled":
+            _ = order.items
             return order
 
-        # 3. Отказ на платена поръчка е забранен
         if order.status == "paid":
             raise OrderAlreadyPaid("Cannot cancel paid order")
 
@@ -1171,129 +779,72 @@ class OrderService:
                 message=f"Cannot cancel order with status '{order.status}'",
             )
 
-        # 4. Проверка за съществуваща Stripe сесия с FOR UPDATE
-        latest_session = (
-            self._order_repository.get_latest_stripe_session_by_order_id_for_update(
-                order.id
-            )
-        )
-
-        # А. Няма създавана Stripe сесия -> директен локален отказ
-        if latest_session is None:
-            order.status = "cancelled"
-            self._restore_order_stock(order)
-            self._session.commit()
-            self._session.refresh(order)
-            _ = order.items
-            return order
-
-        # Б. Сесията вече е завършена успешно
-        if latest_session.status == "completed":
-            self._session.commit()
-            raise OrderAlreadyPaid("Cannot cancel paid order")
-
-        # В. Сесията е в процес на асинхронно плащане -> отказът е забранен
-        if latest_session.status == "processing":
-            self._session.commit()
-            raise OrderStateConflict(
-                current_status="processing",
-                message="Cannot cancel order while payment is processing",
-            )
-
-        # Г. Сесията вече е изтекла или неуспешна
-        if latest_session.status in ("expired", "failed"):
-            order.status = "cancelled"
-            self._restore_order_stock(order)
-            self._session.commit()
-            self._session.refresh(order)
-            _ = order.items
-            return order
-
-        # Д. initiated без Stripe ID: резултатът още не е известен!
-        # Докато резултатът е неизвестен, не връщаме stock и не приемаме сесията за прекратена!
-        if (
-            latest_session.status == "initiated"
-            and not latest_session.stripe_session_id
-        ):
-            self._session.commit()
-            raise OrderStateConflict(
-                current_status="initiated",
-                message="Payment session creation is in progress. Please retry once session is established.",
-            )
-
-        # Е. Активна или започнала прекратяване сесия с наличен Stripe ID
-        session_to_expire = latest_session.stripe_session_id
-        latest_session.status = "cancelling"
+        expires_at_snapshot = order.expires_at
         self._session.commit()
 
-        # Прекратяваме Stripe сесията извън DB заключването
+        # Фаза 2: Прекратяване/проверка в Payments извън DB заключването
         try:
-            self._stripe_client.expire_checkout_session(session_to_expire)
-        except StripeNotConfigured as e:
-            # При липсващ Stripe ключ сесията НЕ се приема за прекратена!
-            try:
-                s_rec = self._order_repository.get_stripe_session_by_id_for_update(
-                    latest_session.id
+            self._payments_client.cancel_order_payment(
+                order_id=order_id,
+                reason="cancel",
+                order_expires_at=expires_at_snapshot,
+            )
+        except RemoteOrderAlreadyPaid as exc:
+            raise OrderAlreadyPaid("Cannot cancel paid order") from exc
+        except RemotePaymentConflict as exc:
+            raise OrderStateConflict(
+                current_status=exc.current_status,
+                message=str(exc),
+            ) from exc
+
+        # Фаза 3: Повторно заключване на поръчката и връщане на наличностите
+        try:
+            order = self._order_repository.get_by_id_and_user_id_for_update(
+                order_id=order_id,
+                user_id=user_id,
+            )
+            if order is None:
+                raise OrderNotFound(f"Order with id {order_id} not found")
+
+            if order.status == "paid":
+                self._session.commit()
+                raise OrderAlreadyPaid(
+                    "Payment completed before cancellation could finish"
                 )
-                if s_rec and s_rec.status == "cancelling":
-                    s_rec.status = "open"
-                    self._session.commit()
-            except SQLAlchemyError:
-                self._session.rollback()
-            raise StripeNotConfigured(str(e))
-        except Exception as e:
-            err_msg = str(e).lower()
-            if "already expired" in err_msg:
-                # Потвърдено от Stripe, че вече е изтекла
-                pass
-            else:
-                # Timeout или неуспешно прекратяване: връщаме сесията в open и не пипаме stock!
-                try:
-                    s_rec = self._order_repository.get_stripe_session_by_id_for_update(
-                        latest_session.id
-                    )
-                    if s_rec and s_rec.status == "cancelling":
-                        s_rec.status = "open"
-                        self._session.commit()
-                except SQLAlchemyError:
-                    self._session.rollback()
-                raise StripeServiceError(f"Failed to expire Stripe session: {e}") from e
 
-        # Повторно заключваме поръчката и опита в ред: поръчка -> опит -> стоки
-        order = self._order_repository.get_by_id_and_user_id_for_update(
-            order_id=order_id,
-            user_id=user_id,
-        )
-        s_rec = self._order_repository.get_stripe_session_by_id_for_update(
-            latest_session.id
-        )
+            if order.status == "cancelled":
+                _ = order.items
+                return order
 
-        if order.status == "paid":
-            if s_rec:
-                s_rec.status = "completed"
+            if order.status == "payment_processing":
+                self._session.commit()
+                raise OrderStateConflict(
+                    current_status="payment_processing",
+                    message="Cannot cancel order while payment is processing",
+                )
+
+            if order.status != "pending_payment":
+                self._session.commit()
+                raise OrderStateConflict(
+                    current_status=order.status,
+                    message=f"Cannot cancel order with status '{order.status}'",
+                )
+
+            order.status = "cancelled"
+            self._restore_order_stock(order)
             self._session.commit()
-            raise OrderAlreadyPaid("Payment completed before cancellation could finish")
-
-        if order.status == "cancelled":
-            if s_rec and s_rec.status != "expired":
-                s_rec.status = "expired"
-            self._session.commit()
+            self._session.refresh(order)
+            _ = order.items
             return order
+        except Exception:
+            self._session.rollback()
+            raise
 
-        order.status = "cancelled"
-        if s_rec:
-            s_rec.status = "expired"
-        self._restore_order_stock(order)
-        self._session.commit()
-        self._session.refresh(order)
-        _ = order.items
-        return order
-
-    def _reconcile_single_order(
+    def _reconcile_single_expired_order(
         self, order_id: int, current_time: datetime.datetime
     ) -> str:
-        """Сверява единична поръчка според нейния статус, срок и състояние в Stripe."""
-        # Фаза 1: Проверка на поръчката и последния опит в DB
+        """Сверява единична просрочена поръчка с Payments и освобождава резерва при потвърждение."""
+        # Фаза 1: Проверка под FOR UPDATE и снимка на expires_at
         try:
             order = self._order_repository.get_by_id_for_update(order_id)
             if order is None:
@@ -1307,145 +858,58 @@ class OrderService:
             is_time_expired = (
                 order.expires_at is not None and order.expires_at <= current_time
             )
-
-            latest_session = (
-                self._order_repository.get_latest_stripe_session_by_order_id_for_update(
-                    order.id
-                )
-            )
-
-            # Случай 1: Никога не е правен опит за Stripe плащане
-            if latest_session is None:
-                if is_time_expired:
-                    order.status = "expired"
-                    self._restore_order_stock(order)
-                    self._session.commit()
-                    return "expired"
-                self._session.commit()
-                return "deferred"
-
-            # Случай 2: Опитът вече е завършен (платен)
-            if latest_session.status == "completed":
-                self._transition_order_to_paid(order)
-                self._session.commit()
-                return "paid"
-
-            # Случай 3: Опитът вече е прекратен или неуспешен
-            if latest_session.status in ("expired", "failed"):
-                if is_time_expired:
-                    order.status = "expired"
-                    self._restore_order_stock(order)
-                    self._session.commit()
-                    return "expired"
-                self._session.commit()
-                return "deferred"
-
-            # Случай 4: Опитът е initiated без Stripe ID (неизвестен резултат)
-            if (
-                latest_session.status == "initiated"
-                and not latest_session.stripe_session_id
-            ):
-                if is_time_expired:
-                    order.status = "expired"
-                    latest_session.status = "expired"
-                    self._restore_order_stock(order)
-                    self._session.commit()
-                    return "expired"
-                self._session.commit()
-                return "deferred"
-
-            # Случай 5: Има stripe_session_id (open, processing, cancelling)
-            stripe_session_id = latest_session.stripe_session_id
-            attempt_id = latest_session.id
-            session_status = latest_session.status
-
-            # Освобождаваме DB заключването преди мрежовата заявка към Stripe
-            self._session.commit()
-        except Exception:
-            self._session.rollback()
-            raise
-
-        # Фаза 2: Мрежово извличане на актуалното състояние от Stripe
-        try:
-            stripe_session = self._stripe_client.retrieve_checkout_session(
-                stripe_session_id
-            )
-        except Exception:  # noqa: BLE001
-            # При недостъпен Stripe запазваме резерва
-            return "deferred"
-
-        stripe_payment_status = getattr(stripe_session, "payment_status", None)
-        stripe_state = getattr(stripe_session, "status", None)
-
-        # Фаза 3: Прилагане на резултата според отговора на Stripe
-        try:
-            # 3.1: Stripe показва успешно плащане
-            if stripe_payment_status == "paid":
-                order = self._order_repository.get_by_id_for_update(order_id)
-                s_rec = self._order_repository.get_stripe_session_by_id_for_update(
-                    attempt_id
-                )
-                if order:
-                    self._transition_order_to_paid(order)
-                if s_rec:
-                    s_rec.status = "completed"
-                self._session.commit()
-                return "paid"
-
-            # 3.2: Не е изтекъл срокът на поръчката: оставяме резерва
             if not is_time_expired:
-                if stripe_payment_status != "paid" and stripe_state == "complete":
-                    order = self._order_repository.get_by_id_for_update(order_id)
-                    s_rec = self._order_repository.get_stripe_session_by_id_for_update(
-                        attempt_id
-                    )
-                    if order and order.status == "pending_payment":
-                        order.status = "payment_processing"
-                    if s_rec:
-                        s_rec.status = "processing"
-                    self._session.commit()
-                return "deferred"
-
-            # 3.3: Срокът е изтекъл
-            # Ако плащането се обработва асинхронно: запазваме резерва
-            if session_status == "processing" or (
-                stripe_state == "complete" and stripe_payment_status != "paid"
-            ):
-                return "deferred"
-
-            # Ако сесията все още е open в Stripe: първо я прекратяваме в Stripe!
-            if stripe_state == "open":
-                try:
-                    self._stripe_client.expire_checkout_session(stripe_session_id)
-                except Exception:  # noqa: BLE001
-                    # При срив на прекратяването запазваме резерва
-                    return "deferred"
-
-            # Сесията е потвърдено прекратена в Stripe -> освобождаваме резерва
-            order = self._order_repository.get_by_id_for_update(order_id)
-            s_rec = self._order_repository.get_stripe_session_by_id_for_update(
-                attempt_id
-            )
-            if order and order.status not in ("cancelled", "expired", "paid"):
-                order.status = "expired"
-                if s_rec:
-                    s_rec.status = "expired"
-                self._restore_order_stock(order)
                 self._session.commit()
-                return "expired"
+                return "deferred"
 
+            expires_at_snapshot = order.expires_at
             self._session.commit()
-            return "deferred"
         except Exception:
             self._session.rollback()
             raise
 
-    def reconcile_unresolved_orders(
+        # Фаза 2: Проверка/прекратяване в Payments без отворена DB транзакция
+        try:
+            self._payments_client.cancel_order_payment(
+                order_id=order_id,
+                reason="reserve_expired",
+                order_expires_at=expires_at_snapshot,
+            )
+        except RemoteOrderAlreadyPaid:
+            # Плащането вече е потвърдено в Payments -> пазим резерва за входящия payment.succeeded
+            return "deferred"
+        except RemotePaymentConflict:
+            return "deferred"
+
+        # Фаза 3: Потвърден отказ в Payments -> освобождаваме резерва в Commerce
+        try:
+            order = self._order_repository.get_by_id_for_update(order_id)
+            if order is None:
+                self._session.commit()
+                return "skipped"
+
+            if order.status in ("paid", "cancelled", "expired"):
+                self._session.commit()
+                return "skipped"
+
+            if order.expires_at is None or order.expires_at > current_time:
+                self._session.commit()
+                return "deferred"
+
+            order.status = "expired"
+            self._restore_order_stock(order)
+            self._session.commit()
+            return "expired"
+        except Exception:
+            self._session.rollback()
+            raise
+
+    def reconcile_expired_orders(
         self, now: datetime.datetime | None = None
     ) -> dict[str, int]:
-        """Сверява всички неразрешени поръчки (pending_payment, payment_processing)."""
+        """Сверява всички неплатени поръчки с изтекъл срок на резерва чрез Payments."""
         current_time = now or datetime.datetime.now(datetime.UTC)
-        order_ids = self._order_repository.list_unresolved_order_ids()
+        order_ids = self._order_repository.list_expired_reserve_order_ids(current_time)
 
         stats = {
             "checked": len(order_ids),
@@ -1457,7 +921,7 @@ class OrderService:
 
         for order_id in order_ids:
             try:
-                res = self._reconcile_single_order(order_id, current_time)
+                res = self._reconcile_single_expired_order(order_id, current_time)
                 if res in stats:
                     stats[res] += 1
             except Exception:  # noqa: BLE001

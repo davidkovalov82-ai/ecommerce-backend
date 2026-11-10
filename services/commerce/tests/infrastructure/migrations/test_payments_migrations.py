@@ -319,3 +319,70 @@ def test_order_processing_and_stripe_mode_migration(
                 )
             ).scalar()
             assert col_exp_exists is False
+
+
+def test_extract_payments_service_migration(
+    temp_migration_db: Callable[..., Any],
+) -> None:
+    """Тества миграция g1b2c3d4e5f6: backfill на attempt_key, inbox/discrepancies и безопасен downgrade."""
+    with temp_migration_db(
+        "commerce_temp_k5_mig_test", alembic_ini_path=ALEMBIC_INI_PATH
+    ) as (alembic_cfg, temp_engine):
+        # 1. Наливане на стара схема f7a8b9c0d1e2 със съществуваща поръчка
+        command.upgrade(alembic_cfg, "f7a8b9c0d1e2")
+
+        with Session(temp_engine) as session:
+            session.execute(
+                text(
+                    "INSERT INTO users (id, email, password_hash, role) "
+                    "VALUES (800, 'k5_mig@example.com', 'dummy_hash', 'customer')"
+                )
+            )
+            session.execute(
+                text(
+                    "INSERT INTO orders (id, user_id, status, total_minor, currency, idempotency_key) "
+                    "VALUES (800, 800, 'pending_payment', 4200, 'EUR', 'idemp_k5_800')"
+                )
+            )
+            session.commit()
+
+        # 2. Upgrade до g1b2c3d4e5f6 (K5 head)
+        command.upgrade(alembic_cfg, "g1b2c3d4e5f6")
+
+        with Session(temp_engine) as session:
+            row = session.execute(
+                text(
+                    "SELECT payment_attempt_seq, active_attempt_key FROM orders WHERE id = 800"
+                )
+            ).one()
+            assert row.payment_attempt_seq == 1
+            assert row.active_attempt_key == "order_800_attempt_1"
+
+            # Запис на разхождение блокира downgrade без загуба на данни
+            session.execute(
+                text(
+                    "INSERT INTO order_payment_discrepancies "
+                    "(order_id, payment_attempt_id, event_id, reason, amount_minor, currency, status, details) "
+                    "VALUES (800, 1, '00000000-0000-4000-8000-000000000800', "
+                    "'payment_on_cancelled_order', 4200, 'EUR', 'open', '{}'::json)"
+                )
+            )
+            session.commit()
+
+        try:
+            command.downgrade(alembic_cfg, "f7a8b9c0d1e2")
+            assert False, "Очакваше се RuntimeError при отворено разхождение"
+        except RuntimeError as exc:
+            assert "payment discrepancies" in str(exc)
+
+        # След изчистване на разхожденията downgrade минава чисто
+        with Session(temp_engine) as session:
+            session.execute(text("DELETE FROM order_payment_discrepancies"))
+            session.commit()
+
+        command.downgrade(alembic_cfg, "f7a8b9c0d1e2")
+        with Session(temp_engine) as session:
+            tbl_exists = session.execute(
+                text("SELECT to_regclass('public.order_inbox_events') IS NOT NULL")
+            ).scalar()
+            assert tbl_exists is False

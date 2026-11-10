@@ -1,4 +1,4 @@
-name: commerce-k4-e2e
+name: commerce-e2e
 
 services:
   db-e2e:
@@ -33,6 +33,9 @@ services:
       NOTIF_APP_USER: notifications_app
       NOTIF_APP_PASSWORD: notifications_app
       NOTIF_DB_NAME: notifications
+      PAYMENTS_APP_USER: payments_app
+      PAYMENTS_APP_PASSWORD: payments_app
+      PAYMENTS_DB_NAME: payments
     restart: "no"
     volumes:
       - ./scripts/postgres_db_init.sh:/usr/local/bin/postgres_db_init.sh:ro
@@ -82,6 +85,77 @@ services:
       timeout: 3s
       retries: 10
 
+  stripe-mock-e2e:
+    image: python:3.13-slim
+    volumes:
+      - ./scripts/e2e_stripe_mock.py:/app/e2e_stripe_mock.py:ro
+    ports:
+      - "127.0.0.1:58081:8081"
+    command: python /app/e2e_stripe_mock.py
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  payments-e2e:
+    build:
+      context: ./services/payments
+      dockerfile: Dockerfile
+    depends_on:
+      db-init-e2e:
+        condition: service_completed_successfully
+      stripe-mock-e2e:
+        condition: service_healthy
+    environment:
+      DB_HOST: db-e2e
+      DB_PORT: "5432"
+      DB_USER: payments_app
+      DB_PASSWORD: payments_app
+      DB_NAME: payments
+      PAYMENTS_INTERNAL_AUTH_TOKEN: k5-e2e-internal-payments-token-32b!
+      STRIPE_MODE: test
+      STRIPE_SECRET_KEY: sk_test_k5_e2e_mock_key_1234567890
+      STRIPE_WEBHOOK_SECRET: whsec_k4_e2e_secret_stripe_commerce_32_bytes_ok
+      STRIPE_API_BASE: http://stripe-mock-e2e:8081
+      STRIPE_TIMEOUT_SECONDS: "2.0"
+      STRIPE_SUCCESS_URL: http://127.0.0.1:58000/orders/{order_id}?payment=success
+      STRIPE_CANCEL_URL: http://127.0.0.1:58000/orders/{order_id}?payment=cancelled
+      RABBITMQ_HOST: rabbitmq-e2e
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+    ports:
+      - "127.0.0.1:58001:8001"
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  payments-outbox-e2e:
+    build:
+      context: ./services/payments
+      dockerfile: Dockerfile
+    depends_on:
+      db-init-e2e:
+        condition: service_completed_successfully
+      payments-e2e:
+        condition: service_healthy
+    environment:
+      DB_HOST: db-e2e
+      DB_PORT: "5432"
+      DB_USER: payments_app
+      DB_PASSWORD: payments_app
+      DB_NAME: payments
+      PAYMENTS_INTERNAL_AUTH_TOKEN: k5-e2e-internal-payments-token-32b!
+      RABBITMQ_HOST: rabbitmq-e2e
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+    command: sh -c "python scripts/process_outbox.py --daemon --poll-interval 0.2"
+
   commerce-api-e2e:
     build:
       context: ./services/commerce
@@ -96,8 +170,8 @@ services:
       DB_PASSWORD: commerce_app
       DB_NAME: commerce
       JWT_SECRET: k4-e2e-test-jwt-secret-key-at-least-32-bytes-long!
-      STRIPE_MODE: test
-      STRIPE_WEBHOOK_SECRET: whsec_k4_e2e_secret_stripe_commerce_32_bytes_ok
+      PAYMENTS_BASE_URL: http://payments-e2e:8001
+      PAYMENTS_INTERNAL_AUTH_TOKEN: k5-e2e-internal-payments-token-32b!
       SMTP_HOST: mailpit-e2e
       SMTP_PORT: "1025"
       SMTP_FROM: noreply@example.com
@@ -130,11 +204,36 @@ services:
       DB_PASSWORD: commerce_app
       DB_NAME: commerce
       JWT_SECRET: k4-e2e-test-jwt-secret-key-at-least-32-bytes-long!
+      PAYMENTS_INTERNAL_AUTH_TOKEN: k5-e2e-internal-payments-token-32b!
       RABBITMQ_HOST: rabbitmq-e2e
       RABBITMQ_PORT: "5672"
       RABBITMQ_USER: guest
       RABBITMQ_PASSWORD: guest
-    command: sh -c "python scripts/process_outbox.py --daemon --poll-interval 0.3"
+    command: sh -c "python scripts/process_outbox.py --daemon --poll-interval 0.2"
+
+  commerce-payment-consumer-e2e:
+    build:
+      context: ./services/commerce
+      dockerfile: Dockerfile
+    depends_on:
+      db-init-e2e:
+        condition: service_completed_successfully
+      commerce-api-e2e:
+        condition: service_healthy
+    environment:
+      DB_HOST: db-e2e
+      DB_PORT: "5432"
+      DB_USER: commerce_app
+      DB_PASSWORD: commerce_app
+      DB_NAME: commerce
+      JWT_SECRET: k4-e2e-test-jwt-secret-key-at-least-32-bytes-long!
+      PAYMENTS_BASE_URL: http://payments-e2e:8001
+      PAYMENTS_INTERNAL_AUTH_TOKEN: k5-e2e-internal-payments-token-32b!
+      RABBITMQ_HOST: rabbitmq-e2e
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+    command: sh -c "python scripts/consume_payment_events.py --daemon"
 
   notifications-e2e:
     build:
@@ -165,7 +264,7 @@ services:
       EMAIL_RETRY_DELAY_SECONDS: "1"
       SMS_RETRY_DELAY_SECONDS: "1"
       DELIVERY_LEASE_SECONDS: "30"
-      WORKER_POLL_INTERVAL_SECONDS: "0.3"
+      WORKER_POLL_INTERVAL_SECONDS: "0.25"
     command: sh -c "alembic upgrade head && python -m app.main"
 
 volumes:

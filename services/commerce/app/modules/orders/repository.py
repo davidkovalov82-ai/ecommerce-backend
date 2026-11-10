@@ -1,12 +1,17 @@
+import datetime
 from collections.abc import Sequence
+from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session, selectinload
 
 from app.modules.orders.models import (
     Order,
+    OrderInboxEvent,
     OrderItem,
     OrderOutboxEvent,
+    OrderPaymentDiscrepancy,
     PaymentAttempt,
     Shipment,
     StripeCheckoutSession,
@@ -58,7 +63,11 @@ class OrderRepository:
                 Order.id == order_id,
                 Order.user_id == user_id,
             )
-            .options(selectinload(Order.items), selectinload(Order.shipments))
+            .options(
+                selectinload(Order.items),
+                selectinload(Order.shipments),
+                selectinload(Order.payment_discrepancies),
+            )
         )
         return self._session.scalars(stmt).first()
 
@@ -74,18 +83,26 @@ class OrderRepository:
                 Order.id == order_id,
                 Order.user_id == user_id,
             )
-            .options(selectinload(Order.items), selectinload(Order.shipments))
+            .options(
+                selectinload(Order.items),
+                selectinload(Order.shipments),
+                selectinload(Order.payment_discrepancies),
+            )
             .with_for_update()
             .execution_options(populate_existing=True)
         )
         return self._session.scalars(stmt).first()
 
     def get_by_id_for_update(self, order_id: int) -> Order | None:
-        """Извлича и заключва ред от поръчката само по id с FOR UPDATE (за webhooks)."""
+        """Извлича и заключва ред от поръчката само по id с FOR UPDATE."""
         stmt = (
             select(Order)
             .where(Order.id == order_id)
-            .options(selectinload(Order.items), selectinload(Order.shipments))
+            .options(
+                selectinload(Order.items),
+                selectinload(Order.shipments),
+                selectinload(Order.payment_discrepancies),
+            )
             .with_for_update()
             .execution_options(populate_existing=True)
         )
@@ -232,6 +249,90 @@ class OrderRepository:
         """Записва събитие в outbox таблицата в същата транзакция."""
         self._session.add(event)
         return event
+
+    def record_inbox_event_idempotent(
+        self,
+        *,
+        event_id: str,
+        event_type: str,
+        event_version: int,
+        payment_attempt_id: int,
+        order_id: int,
+        outcome: str,
+        payload: dict[str, Any],
+        occurred_at: datetime.datetime,
+    ) -> bool:
+        """Записва прието платежно събитие в inbox таблицата идемпотентно."""
+        stmt = (
+            pg_insert(OrderInboxEvent)
+            .values(
+                event_id=event_id,
+                event_type=event_type,
+                event_version=event_version,
+                payment_attempt_id=payment_attempt_id,
+                order_id=order_id,
+                outcome=outcome,
+                payload=payload,
+                occurred_at=occurred_at,
+            )
+            .on_conflict_do_nothing(index_elements=["event_id"])
+            .returning(OrderInboxEvent.event_id)
+        )
+        return self._session.execute(stmt).scalar_one_or_none() is not None
+
+    def is_inbox_event_processed(self, event_id: str) -> bool:
+        stmt = select(
+            select(OrderInboxEvent).where(OrderInboxEvent.event_id == event_id).exists()
+        )
+        return bool(self._session.scalar(stmt))
+
+    def record_payment_discrepancy_idempotent(
+        self,
+        *,
+        order_id: int,
+        payment_attempt_id: int | None,
+        event_id: str | None,
+        reason: str,
+        amount_minor: int,
+        currency: str,
+        stripe_session_id: str | None,
+        stripe_event_id: str | None,
+        details: dict[str, Any],
+    ) -> int | None:
+        """Записва видимо разхождение за плащане върху вече отменена/изтекла поръчка."""
+        stmt = (
+            pg_insert(OrderPaymentDiscrepancy)
+            .values(
+                order_id=order_id,
+                payment_attempt_id=payment_attempt_id,
+                event_id=event_id,
+                reason=reason,
+                amount_minor=amount_minor,
+                currency=currency,
+                stripe_session_id=stripe_session_id,
+                stripe_event_id=stripe_event_id,
+                status="open",
+                details=details,
+            )
+            .on_conflict_do_nothing(index_elements=["event_id"])
+            .returning(OrderPaymentDiscrepancy.id)
+        )
+        return self._session.execute(stmt).scalar_one_or_none()
+
+    def list_expired_reserve_order_ids(
+        self, current_time: datetime.datetime
+    ) -> Sequence[int]:
+        """Извлича поръчки в pending_payment/payment_processing с изтекъл срок за проверка с Payments."""
+        stmt = (
+            select(Order.id)
+            .where(
+                Order.status.in_(["pending_payment", "payment_processing"]),
+                Order.expires_at.is_not(None),
+                Order.expires_at <= current_time,
+            )
+            .order_by(Order.id.asc())
+        )
+        return self._session.scalars(stmt).all()
 
     def get_outbox_event(
         self, order_id: int, event_type: str = "order.paid"

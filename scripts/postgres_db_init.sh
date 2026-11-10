@@ -9,6 +9,9 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 COMMERCE_DB_NAME="${COMMERCE_DB_NAME:-commerce}"
 NOTIF_DB_NAME="${NOTIF_DB_NAME:-notifications}"
+PAYMENTS_DB_NAME="${PAYMENTS_DB_NAME:-payments}"
+PAYMENTS_APP_USER="${PAYMENTS_APP_USER:-payments}"
+PAYMENTS_APP_PASSWORD="${PAYMENTS_APP_PASSWORD:-payments}"
 
 ensure_role() {
   role_name="$1"
@@ -66,8 +69,10 @@ SQL
 
 ensure_role "$COMMERCE_APP_USER" "$COMMERCE_APP_PASSWORD"
 ensure_role "$NOTIF_APP_USER" "$NOTIF_APP_PASSWORD"
+ensure_role "$PAYMENTS_APP_USER" "$PAYMENTS_APP_PASSWORD"
 ensure_database "$COMMERCE_DB_NAME" "$COMMERCE_APP_USER"
 ensure_database "$NOTIF_DB_NAME" "$NOTIF_APP_USER"
+ensure_database "$PAYMENTS_DB_NAME" "$PAYMENTS_APP_USER"
 transfer_ownership_and_lock_db "$COMMERCE_DB_NAME" "$COMMERCE_APP_USER"
 transfer_ownership_and_lock_db "$NOTIF_DB_NAME" "$NOTIF_APP_USER"
-
+transfer_ownership_and_lock_db "$PAYMENTS_DB_NAME" "$PAYMENTS_APP_USER"

@@ -37,6 +37,9 @@ services:
       NOTIF_APP_USER: ${NOTIFICATIONS_DB_USER:-notifications}
       NOTIF_APP_PASSWORD: ${NOTIFICATIONS_DB_PASSWORD:-notifications}
       NOTIF_DB_NAME: notifications
+      PAYMENTS_APP_USER: ${PAYMENTS_DB_USER:-payments}
+      PAYMENTS_APP_PASSWORD: ${PAYMENTS_DB_PASSWORD:-payments}
+      PAYMENTS_DB_NAME: payments
     restart: "no"
     volumes:
       - ./scripts/postgres_db_init.sh:/usr/local/bin/postgres_db_init.sh:ro
@@ -89,9 +92,8 @@ services:
       DB_PASSWORD: ${COMMERCE_DB_PASSWORD:-commerce_app}
       DB_NAME: commerce
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set and non-empty}
-      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
-      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
-      STRIPE_MODE: ${STRIPE_MODE:-test}
+      PAYMENTS_BASE_URL: ${PAYMENTS_BASE_URL:-http://payments:8001}
+      PAYMENTS_INTERNAL_AUTH_TOKEN: ${PAYMENTS_INTERNAL_AUTH_TOKEN:?PAYMENTS_INTERNAL_AUTH_TOKEN must be set and non-empty}
       SMTP_HOST: ${SMTP_HOST:-mailpit}
       SMTP_PORT: ${SMTP_PORT:-1025}
       SMTP_FROM: ${SMTP_FROM:-noreply@example.com}
@@ -121,6 +123,86 @@ services:
       DB_PASSWORD: ${COMMERCE_DB_PASSWORD:-commerce_app}
       DB_NAME: commerce
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set and non-empty}
+      PAYMENTS_INTERNAL_AUTH_TOKEN: ${PAYMENTS_INTERNAL_AUTH_TOKEN:?PAYMENTS_INTERNAL_AUTH_TOKEN must be set and non-empty}
+      RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
+      RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+    command: sh -c "python scripts/process_outbox.py --daemon --poll-interval 1.0"
+
+  commerce-payment-consumer:
+    build:
+      context: ./services/commerce
+      dockerfile: Dockerfile
+    container_name: commerce-payment-consumer
+    restart: unless-stopped
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      api:
+        condition: service_started
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: ${COMMERCE_DB_USER:-commerce_app}
+      DB_PASSWORD: ${COMMERCE_DB_PASSWORD:-commerce_app}
+      DB_NAME: commerce
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set and non-empty}
+      PAYMENTS_BASE_URL: ${PAYMENTS_BASE_URL:-http://payments:8001}
+      PAYMENTS_INTERNAL_AUTH_TOKEN: ${PAYMENTS_INTERNAL_AUTH_TOKEN:?PAYMENTS_INTERNAL_AUTH_TOKEN must be set and non-empty}
+      RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
+      RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+    command: sh -c "python scripts/consume_payment_events.py --daemon"
+
+  payments:
+    build:
+      context: ./services/payments
+      dockerfile: Dockerfile
+    container_name: payments-api
+    restart: unless-stopped
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: ${PAYMENTS_DB_USER:-payments}
+      DB_PASSWORD: ${PAYMENTS_DB_PASSWORD:-payments}
+      DB_NAME: payments
+      PAYMENTS_INTERNAL_AUTH_TOKEN: ${PAYMENTS_INTERNAL_AUTH_TOKEN:?PAYMENTS_INTERNAL_AUTH_TOKEN must be set and non-empty}
+      STRIPE_MODE: ${STRIPE_MODE:-test}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_SUCCESS_URL: ${STRIPE_SUCCESS_URL:-http://localhost:8000/orders/{order_id}?payment=success}
+      STRIPE_CANCEL_URL: ${STRIPE_CANCEL_URL:-http://localhost:8000/orders/{order_id}?payment=cancelled}
+      RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
+      RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
+    ports:
+      - "8001:8001"
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8001"
+
+  payments-outbox:
+    build:
+      context: ./services/payments
+      dockerfile: Dockerfile
+    container_name: payments-outbox
+    restart: unless-stopped
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      payments:
+        condition: service_started
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: ${PAYMENTS_DB_USER:-payments}
+      DB_PASSWORD: ${PAYMENTS_DB_PASSWORD:-payments}
+      DB_NAME: payments
+      PAYMENTS_INTERNAL_AUTH_TOKEN: ${PAYMENTS_INTERNAL_AUTH_TOKEN:?PAYMENTS_INTERNAL_AUTH_TOKEN must be set and non-empty}
       RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
       RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
       RABBITMQ_USER: ${RABBITMQ_USER:-guest}

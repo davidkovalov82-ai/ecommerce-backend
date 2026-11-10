@@ -112,6 +112,16 @@ class Order(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+    payment_attempt_seq: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default=text("1"),
+    )
+    active_attempt_key: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+    )
 
     items: Mapped[list["OrderItem"]] = relationship(
         "OrderItem",
@@ -137,6 +147,25 @@ class Order(Base):
         cascade="all, delete-orphan",
         order_by="StripeCheckoutSession.id.asc()",
     )
+    payment_discrepancies: Mapped[list["OrderPaymentDiscrepancy"]] = relationship(
+        "OrderPaymentDiscrepancy",
+        back_populates="order",
+        cascade="all, delete-orphan",
+        order_by="OrderPaymentDiscrepancy.id.asc()",
+    )
+
+    @property
+    def current_attempt_key(self) -> str:
+        """Връща стабилния ключ за активната платежна попытка."""
+        return (
+            self.active_attempt_key
+            or f"order_{self.id}_attempt_{self.payment_attempt_seq}"
+        )
+
+    @property
+    def has_payment_discrepancy(self) -> bool:
+        """Показва дали има регистрирано разхождение между плащане и отказана/изтекла поръчка."""
+        return len(self.payment_discrepancies) > 0
 
     @property
     def shipping_address(self) -> dict[str, Any] | None:
@@ -567,4 +596,89 @@ class OrderOutboxEvent(Base):
     processed_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
+    )
+
+
+class OrderInboxEvent(Base):
+    """Идемпотентен дневник на приетите платежни събития от Payments."""
+
+    __tablename__ = "order_inbox_events"
+    __table_args__ = (
+        Index("ix_order_inbox_events_order_id", "order_id"),
+        Index("ix_order_inbox_events_attempt_id", "payment_attempt_id"),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    event_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    payment_attempt_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    order_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    outcome: Mapped[str] = mapped_column(String(50), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    occurred_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+    received_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.datetime.now(datetime.UTC),
+        server_default=func.now(),
+    )
+
+
+class OrderPaymentDiscrepancy(Base):
+    """Видима фиксация на потвърдено плащане за вече отменена или изтекла поръчка."""
+
+    __tablename__ = "order_payment_discrepancies"
+    __table_args__ = (
+        UniqueConstraint(
+            "event_id",
+            name="uq_order_payment_discrepancies_event_id",
+        ),
+        CheckConstraint(
+            "status IN ('open', 'resolved')",
+            name="ck_order_payment_discrepancies_status_valid",
+        ),
+        Index("ix_order_payment_discrepancies_order_id", "order_id"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True,
+    )
+    order_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("orders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    payment_attempt_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    reason: Mapped[str] = mapped_column(String(100), nullable=False)
+    amount_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    stripe_session_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    stripe_event_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="open",
+        server_default="open",
+    )
+    details: Mapped[dict[str, Any]] = mapped_column(
+        JSON,
+        nullable=False,
+        default=dict,
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.datetime.now(datetime.UTC),
+        server_default=func.now(),
+    )
+
+    order: Mapped["Order"] = relationship(
+        "Order",
+        back_populates="payment_discrepancies",
     )

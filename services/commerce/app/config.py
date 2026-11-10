@@ -1,6 +1,4 @@
-from typing import Literal
-
-from pydantic import field_validator, model_validator
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,11 +22,10 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_access_token_expire_minutes: int = 15
 
-    stripe_mode: Literal["test", "live"] = "test"
-    stripe_secret_key: str | None = None
-    stripe_webhook_secret: str | None = None
-    stripe_success_url: str = "http://localhost:8000/orders/{order_id}?payment=success"
-    stripe_cancel_url: str = "http://localhost:8000/orders/{order_id}?payment=cancelled"
+    # Независим Payments сервис (Stripe ключовете живеят само в services/payments)
+    payments_base_url: str = "http://localhost:8001"
+    payments_internal_auth_token: str = ""
+    payments_timeout_seconds: float = 10.0
     order_reserve_timeout_minutes: int = 30
 
     smtp_host: str = "localhost"
@@ -46,6 +43,12 @@ class Settings(BaseSettings):
     rabbitmq_dlx_exchange: str = "notifications.dlx"
     rabbitmq_dlq_queue: str = "notifications.events.dlq"
     rabbitmq_dlq_routing_key: str = "notifications.events.dead"
+    rabbitmq_payments_exchange: str = "payments.events"
+    rabbitmq_payments_queue: str = "commerce.payment_events"
+    rabbitmq_payments_dlx_exchange: str = "commerce.payments.dlx"
+    rabbitmq_payments_dlq_queue: str = "commerce.payment_events.dlq"
+    rabbitmq_payments_dlq_routing_key: str = "commerce.payment_events.dead"
+    rabbitmq_prefetch_count: int = 10
     rabbitmq_socket_timeout_seconds: float = 5.0
 
     password_reset_base_url: str = "http://localhost:8000/auth/password-reset/confirm"
@@ -58,35 +61,21 @@ class Settings(BaseSettings):
             raise ValueError("JWT_SECRET must be at least 32 bytes long")
         return v
 
-    @model_validator(mode="after")
-    def validate_stripe_configuration(self) -> "Settings":
-        """Валидация на съвместимостта на Stripe настройките спрямо избрания режим."""
-        if self.stripe_mode == "live":
-            if self.stripe_secret_key is not None:
-                if not self.stripe_secret_key.startswith("sk_live_"):
-                    raise ValueError(
-                        "In live mode, STRIPE_SECRET_KEY must start with 'sk_live_'"
-                    )
-                if not self.stripe_webhook_secret:
-                    raise ValueError(
-                        "In live mode, STRIPE_WEBHOOK_SECRET must be set and non-empty"
-                    )
-                if not self.stripe_success_url.startswith("https://"):
-                    raise ValueError(
-                        "In live mode, STRIPE_SUCCESS_URL must start with 'https://'"
-                    )
-                if not self.stripe_cancel_url.startswith("https://"):
-                    raise ValueError(
-                        "In live mode, STRIPE_CANCEL_URL must start with 'https://'"
-                    )
-        elif self.stripe_mode == "test" and (
-            self.stripe_secret_key is not None
-            and self.stripe_secret_key.startswith("sk_live_")
-        ):
-            raise ValueError(
-                "Live key (sk_live_...) cannot be used in test mode (STRIPE_MODE=test)"
-            )
-        return self
+    @field_validator("payments_internal_auth_token", mode="before")
+    @classmethod
+    def resolve_payments_token_alias(cls, v: object) -> str:
+        import os
+
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        return os.environ.get("PAYMENTS_INTERNAL_AUTH_TOKEN", "").strip()
+
+    @field_validator("payments_timeout_seconds")
+    @classmethod
+    def validate_payments_timeout(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("PAYMENTS_TIMEOUT_SECONDS must be positive")
+        return v
 
     @property
     def database_url(self) -> str:

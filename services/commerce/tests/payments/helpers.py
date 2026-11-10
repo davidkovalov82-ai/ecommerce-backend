@@ -1,7 +1,6 @@
-import hashlib
-import hmac
-import time
+import datetime
 import uuid
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -10,8 +9,7 @@ from app.modules.accounts.models import User
 from app.modules.accounts.tokens import create_access_token
 from app.modules.catalog.models import Product
 from app.modules.orders.models import Order, OrderItem
-
-TEST_WEBHOOK_SECRET = "whsec_test_secret_stripe_commerce_32_bytes_ok"
+from app.modules.orders.payment_contracts import ValidatedPaymentEvent
 
 
 def _create_user_and_token(
@@ -59,6 +57,7 @@ def _create_order(
     product: Product,
     quantity: int = 2,
     status: str = "pending_payment",
+    expires_at: datetime.datetime | None = None,
 ) -> Order:
     """Директно създава поръчка със запазена позиция и резервиран stock."""
     total_minor = product.price_minor * quantity
@@ -68,9 +67,12 @@ def _create_order(
         currency="EUR",
         total_minor=total_minor,
         idempotency_key=str(uuid.uuid4()),
+        expires_at=expires_at,
     )
     db_session.add(order)
     db_session.flush()
+    order.payment_attempt_seq = 1
+    order.active_attempt_key = f"order_{order.id}_attempt_1"
 
     order_item = OrderItem(
         order_id=order.id,
@@ -87,13 +89,80 @@ def _create_order(
     return order
 
 
-def _generate_stripe_signature(
-    payload_bytes: bytes,
-    secret: str = TEST_WEBHOOK_SECRET,
-    timestamp: int | None = None,
-) -> str:
-    """Генерира валиден Stripe-Signature хедър чрез HMAC SHA256."""
-    ts = timestamp if timestamp is not None else int(time.time())
-    signed_payload = f"{ts}.".encode() + payload_bytes
-    sig = hmac.new(secret.encode(), signed_payload, hashlib.sha256).hexdigest()
-    return f"t={ts},v1={sig}"
+def make_payment_event(
+    *,
+    event_type: str,
+    order_id: int,
+    payment_attempt_id: int = 101,
+    attempt_key: str | None = None,
+    amount_minor: int = 2500,
+    currency: str = "EUR",
+    stripe_session_id: str | None = "cs_test_1",
+    stripe_event_id: str | None = None,
+    event_id: str | None = None,
+    occurred_at: datetime.datetime | None = None,
+) -> ValidatedPaymentEvent:
+    """Конструира валидирано платежно събитие от Payments към Commerce."""
+    resolved_event_id = event_id or str(uuid.uuid4())
+    resolved_attempt_key = attempt_key or f"order_{order_id}_attempt_1"
+    resolved_stripe_event_id = stripe_event_id or f"evt_{uuid.uuid4().hex[:12]}"
+    resolved_occurred_at = occurred_at or datetime.datetime.now(datetime.UTC)
+    payload: dict[str, Any] = {
+        "order_id": order_id,
+        "payment_attempt_id": payment_attempt_id,
+        "attempt_key": resolved_attempt_key,
+        "stripe_session_id": stripe_session_id,
+        "stripe_event_id": resolved_stripe_event_id,
+        "amount_minor": amount_minor,
+        "currency": currency.upper(),
+        "mode": "test",
+    }
+    return ValidatedPaymentEvent(
+        event_id=resolved_event_id,
+        event_type=event_type,  # type: ignore[arg-type]
+        event_version=1,
+        occurred_at=resolved_occurred_at,
+        order_id=order_id,
+        payment_attempt_id=payment_attempt_id,
+        attempt_key=resolved_attempt_key,
+        stripe_session_id=stripe_session_id,
+        stripe_event_id=resolved_stripe_event_id,
+        amount_minor=amount_minor,
+        currency=currency.upper(),
+        mode="test",
+        payload=payload,
+    )
+
+
+def make_payment_event_envelope(
+    *,
+    event_type: str,
+    order_id: int,
+    payment_attempt_id: int = 101,
+    attempt_key: str | None = None,
+    amount_minor: int = 2500,
+    currency: str = "EUR",
+    stripe_session_id: str | None = "cs_test_1",
+    stripe_event_id: str | None = None,
+    event_id: str | None = None,
+    event_version: int = 1,
+) -> dict[str, Any]:
+    """Конструира суров JSON плик за RabbitMQ тестовете на платежния consumer."""
+    resolved_event_id = event_id or str(uuid.uuid4())
+    return {
+        "event_id": resolved_event_id,
+        "event_type": event_type,
+        "event_version": event_version,
+        "occurred_at": datetime.datetime.now(datetime.UTC).isoformat(),
+        "producer": "payments",
+        "data": {
+            "order_id": order_id,
+            "payment_attempt_id": payment_attempt_id,
+            "attempt_key": attempt_key or f"order_{order_id}_attempt_1",
+            "stripe_session_id": stripe_session_id,
+            "stripe_event_id": stripe_event_id or f"evt_{uuid.uuid4().hex[:12]}",
+            "amount_minor": amount_minor,
+            "currency": currency.upper(),
+            "mode": "test",
+        },
+    }

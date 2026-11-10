@@ -4,9 +4,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-# Задаваме отделен тестов таен ключ за тестовата среда
+# Задаваме отделен тестов таен ключ и вътрешен токен за тестовата среда
 os.environ.setdefault(
     "JWT_SECRET", "ci-and-test-jwt-secret-key-at-least-32-bytes-long!"
+)
+os.environ.setdefault(
+    "PAYMENTS_INTERNAL_AUTH_TOKEN", "test-internal-payments-token-32b!"
 )
 
 import pytest
@@ -177,6 +180,35 @@ def _sync_shipments_sequence(conn: Any) -> None:
     )
 
 
+def _cleanup_test_tables(session: Session) -> None:
+    """Почиства всички тестови редове без да пипа началния каталог."""
+    session.execute(text("DELETE FROM order_payment_discrepancies"))
+    session.execute(text("DELETE FROM order_inbox_events"))
+    session.execute(text("DELETE FROM order_outbox_events"))
+    session.execute(text("DELETE FROM stripe_checkout_sessions"))
+    session.execute(text("DELETE FROM stripe_processed_events"))
+    session.execute(text("DELETE FROM payment_attempts"))
+    session.execute(text("DELETE FROM cart_items"))
+    session.execute(text("DELETE FROM order_items"))
+    session.execute(text("DELETE FROM shipments"))
+    _sync_shipments_sequence(session)
+    session.execute(text("DELETE FROM orders"))
+    session.execute(text("DELETE FROM products WHERE id != 1"))
+    session.execute(
+        text("UPDATE products SET active = true, category_id = NULL WHERE id = 1")
+    )
+    _sync_products_sequence(session)
+    session.execute(text("DELETE FROM categories"))
+    _sync_categories_sequence(session)
+    session.execute(text("DELETE FROM password_reset_tokens"))
+    session.execute(text("DELETE FROM account_moderation_logs"))
+    session.execute(
+        text("DELETE FROM users WHERE email != 'legacy-catalog@internal.ecommerce.com'")
+    )
+    _sync_users_sequence(session)
+    session.commit()
+
+
 @pytest.fixture
 def db_session() -> Generator[Session]:
     """Изолирана сесия за тестове с автоматично почистване на новите записи."""
@@ -185,32 +217,7 @@ def db_session() -> Generator[Session]:
         yield session
     finally:
         session.rollback()
-        # Премахваме всички добавени от тестовете редове
-        session.execute(text("DELETE FROM order_outbox_events"))
-        session.execute(text("DELETE FROM stripe_checkout_sessions"))
-        session.execute(text("DELETE FROM stripe_processed_events"))
-        session.execute(text("DELETE FROM payment_attempts"))
-        session.execute(text("DELETE FROM cart_items"))
-        session.execute(text("DELETE FROM order_items"))
-        session.execute(text("DELETE FROM shipments"))
-        _sync_shipments_sequence(session)
-        session.execute(text("DELETE FROM orders"))
-        session.execute(text("DELETE FROM products WHERE id != 1"))
-        session.execute(
-            text("UPDATE products SET active = true, category_id = NULL WHERE id = 1")
-        )
-        _sync_products_sequence(session)
-        session.execute(text("DELETE FROM categories"))
-        _sync_categories_sequence(session)
-        session.execute(text("DELETE FROM password_reset_tokens"))
-        session.execute(text("DELETE FROM account_moderation_logs"))
-        session.execute(
-            text(
-                "DELETE FROM users WHERE email != 'legacy-catalog@internal.ecommerce.com'"
-            )
-        )
-        _sync_users_sequence(session)
-        session.commit()
+        _cleanup_test_tables(session)
         session.close()
 
 
@@ -218,58 +225,10 @@ def db_session() -> Generator[Session]:
 def clean_users_table() -> Generator[None]:
     """Гарантира почистване на таблиците преди и след всеки тест."""
     with TestingSessionLocal() as session:
-        session.execute(text("DELETE FROM order_outbox_events"))
-        session.execute(text("DELETE FROM stripe_checkout_sessions"))
-        session.execute(text("DELETE FROM stripe_processed_events"))
-        session.execute(text("DELETE FROM payment_attempts"))
-        session.execute(text("DELETE FROM cart_items"))
-        session.execute(text("DELETE FROM order_items"))
-        session.execute(text("DELETE FROM shipments"))
-        _sync_shipments_sequence(session)
-        session.execute(text("DELETE FROM orders"))
-        session.execute(text("DELETE FROM products WHERE id != 1"))
-        session.execute(
-            text("UPDATE products SET active = true, category_id = NULL WHERE id = 1")
-        )
-        _sync_products_sequence(session)
-        session.execute(text("DELETE FROM categories"))
-        _sync_categories_sequence(session)
-        session.execute(text("DELETE FROM password_reset_tokens"))
-        session.execute(text("DELETE FROM account_moderation_logs"))
-        session.execute(
-            text(
-                "DELETE FROM users WHERE email != 'legacy-catalog@internal.ecommerce.com'"
-            )
-        )
-        _sync_users_sequence(session)
-        session.commit()
+        _cleanup_test_tables(session)
     yield
     with TestingSessionLocal() as session:
-        session.execute(text("DELETE FROM order_outbox_events"))
-        session.execute(text("DELETE FROM stripe_checkout_sessions"))
-        session.execute(text("DELETE FROM stripe_processed_events"))
-        session.execute(text("DELETE FROM payment_attempts"))
-        session.execute(text("DELETE FROM cart_items"))
-        session.execute(text("DELETE FROM order_items"))
-        session.execute(text("DELETE FROM shipments"))
-        _sync_shipments_sequence(session)
-        session.execute(text("DELETE FROM orders"))
-        session.execute(text("DELETE FROM products WHERE id != 1"))
-        session.execute(
-            text("UPDATE products SET active = true, category_id = NULL WHERE id = 1")
-        )
-        _sync_products_sequence(session)
-        session.execute(text("DELETE FROM categories"))
-        _sync_categories_sequence(session)
-        session.execute(text("DELETE FROM password_reset_tokens"))
-        session.execute(text("DELETE FROM account_moderation_logs"))
-        session.execute(
-            text(
-                "DELETE FROM users WHERE email != 'legacy-catalog@internal.ecommerce.com'"
-            )
-        )
-        _sync_users_sequence(session)
-        session.commit()
+        _cleanup_test_tables(session)
 
 
 @pytest.fixture(autouse=True)

@@ -1,9 +1,15 @@
+from collections.abc import Generator
+from unittest.mock import MagicMock
+
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.main import app
 from app.modules.catalog.models import Product
+from app.modules.orders.dependencies import get_payments_client
 from app.modules.orders.models import Order
+from app.modules.orders.payments_client import CancelPaymentResult, PaymentsClient
 from tests.orders.helpers import (
     _create_order,
     _create_product,
@@ -11,6 +17,21 @@ from tests.orders.helpers import (
 )
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def mock_payments_cancel() -> Generator[MagicMock]:
+    """По подразбиране Payments потвърждава безопасна отмяна без активна Stripe сесия."""
+    mock_client = MagicMock(spec=PaymentsClient)
+    mock_client.cancel_order_payment.return_value = CancelPaymentResult(
+        status="can_cancel",
+        action="no_session",
+    )
+    app.dependency_overrides[get_payments_client] = lambda: mock_client
+    try:
+        yield mock_client
+    finally:
+        app.dependency_overrides.pop(get_payments_client, None)
 
 
 def test_cancel_auth_required() -> None:

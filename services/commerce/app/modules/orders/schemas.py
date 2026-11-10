@@ -127,8 +127,26 @@ class OrderSummaryResponse(BaseModel):
     expires_at: datetime.datetime | None = None
 
 
+class OrderPaymentDiscrepancyResponse(BaseModel):
+    """Схема за регистрирано платежно разхождение по отменена или изтекла поръчка."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    order_id: int
+    payment_attempt_id: int | None = None
+    event_id: str | None = None
+    reason: str
+    amount_minor: int
+    currency: str
+    stripe_session_id: str | None = None
+    stripe_event_id: str | None = None
+    status: str
+    created_at: datetime.datetime
+
+
 class OrderDetailResponse(BaseModel):
-    """Детайлна схема за поръчка с включени нейни позиции, адрес и пратки."""
+    """Детайлна схема за поръчка с включени нейни позиции, адрес, пратки и платежни разхождения."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -142,6 +160,8 @@ class OrderDetailResponse(BaseModel):
     shipping_address: ShippingAddressResponse | None = None
     items: list[OrderItemResponse]
     shipments: list[OrderShipmentResponse] = []
+    has_payment_discrepancy: bool = False
+    payment_discrepancies: list[OrderPaymentDiscrepancyResponse] = []
 
 
 class OrderListResponse(BaseModel):

@@ -95,10 +95,8 @@ def test_openapi_registered_operations() -> None:
         paths["/orders/{order_id}/checkout-session"]["post"]["operationId"] is not None
     )
 
-    # 12. POST /webhooks/stripe
-    assert "/webhooks/stripe" in paths
-    assert "post" in paths["/webhooks/stripe"]
-    assert paths["/webhooks/stripe"]["post"]["operationId"] is not None
+    # 12. POST /webhooks/stripe е изнесен в независимия Payments сервис
+    assert "/webhooks/stripe" not in paths
 
     # 13. GET /seller/shipments & POST /seller/shipments/{shipment_id}/ship
     assert "/seller/shipments" in paths

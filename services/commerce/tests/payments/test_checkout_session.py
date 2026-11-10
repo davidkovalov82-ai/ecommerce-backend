@@ -1,21 +1,35 @@
+import datetime
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
-from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.config import settings
 from app.main import app
-from app.modules.orders.dependencies import get_stripe_client
-from app.modules.orders.models import Order, StripeCheckoutSession
-from app.modules.orders.stripe_client import StripeClient
+from app.modules.accounts.repository import UserRepository
+from app.modules.cart.repository import CartRepository
+from app.modules.catalog.models import Product
+from app.modules.catalog.repository import ProductRepository
+from app.modules.orders.dependencies import get_payments_client
+from app.modules.orders.models import Order
+from app.modules.orders.payments_client import (
+    CancelPaymentResult,
+    CheckoutSessionResult,
+    PaymentGatewayError,
+    PaymentsClient,
+    PaymentsNotConfigured,
+    RemoteOrderAlreadyPaid,
+    RemotePaymentConflict,
+)
+from app.modules.orders.repository import OrderRepository
+from app.modules.orders.service import OrderService
 from tests.payments.helpers import (
     _create_order,
     _create_product,
     _create_user_and_token,
+    make_payment_event,
 )
 
 client = TestClient(app)
@@ -34,7 +48,6 @@ def test_checkout_session_foreign_and_not_found(db_session: Session) -> None:
     product = _create_product(db_session, "P1", price_minor=1000)
     order_a = _create_order(db_session, user_a.id, product)
 
-    # Несъществуваща поръчка
     resp = client.post(
         "/orders/99999/checkout-session",
         headers={"Authorization": f"Bearer {token_a}"},
@@ -42,7 +55,6 @@ def test_checkout_session_foreign_and_not_found(db_session: Session) -> None:
     assert resp.status_code == 404
     assert resp.json()["detail"]["code"] == "ORDER_NOT_FOUND"
 
-    # Чужда поръчка
     resp_foreign = client.post(
         f"/orders/{order_a.id}/checkout-session",
         headers={"Authorization": f"Bearer {token_b}"},
@@ -52,32 +64,24 @@ def test_checkout_session_foreign_and_not_found(db_session: Session) -> None:
 
 
 def test_checkout_session_invalid_order_status(db_session: Session) -> None:
-    """Платена или отменена поръчка връща 409 ORDER_STATUS_CONFLICT."""
+    """Платена, отменена, изтекла или обработваща се поръчка връща 409 ORDER_STATUS_CONFLICT."""
     user, token = _create_user_and_token(db_session)
-    product = _create_product(db_session, "P1", price_minor=1000)
+    product = _create_product(db_session, "P1", price_minor=1000, stock=20)
 
-    paid_order = _create_order(db_session, user.id, product, status="paid")
-    resp_paid = client.post(
-        f"/orders/{paid_order.id}/checkout-session",
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    assert resp_paid.status_code == 409
-    assert resp_paid.json()["detail"]["code"] == "ORDER_STATUS_CONFLICT"
-
-    cancelled_order = _create_order(db_session, user.id, product, status="cancelled")
-    resp_cancelled = client.post(
-        f"/orders/{cancelled_order.id}/checkout-session",
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    assert resp_cancelled.status_code == 409
-    assert resp_cancelled.json()["detail"]["code"] == "ORDER_STATUS_CONFLICT"
+    for invalid_status in ("paid", "cancelled", "expired", "payment_processing"):
+        bad_order = _create_order(db_session, user.id, product, status=invalid_status)
+        resp = client.post(
+            f"/orders/{bad_order.id}/checkout-session",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["code"] == "ORDER_STATUS_CONFLICT"
 
 
 def test_checkout_session_minimum_and_maximum_amount(db_session: Session) -> None:
     """Сума под 50 цента или над 99 999 999 цента връща 400 INVALID_ORDER_AMOUNT."""
     user, token = _create_user_and_token(db_session)
 
-    # 40 цента < 50 цента
     product_cheap = _create_product(db_session, "Cheap", price_minor=20, stock=5)
     order_cheap = _create_order(db_session, user.id, product_cheap, quantity=2)
     resp = client.post(
@@ -87,7 +91,6 @@ def test_checkout_session_minimum_and_maximum_amount(db_session: Session) -> Non
     assert resp.status_code == 400
     assert resp.json()["detail"]["code"] == "INVALID_ORDER_AMOUNT"
 
-    # Прекалено голяма сума > 99 999 999
     product_expensive = _create_product(
         db_session, "Expensive", price_minor=100_000_000, stock=5
     )
@@ -100,230 +103,242 @@ def test_checkout_session_minimum_and_maximum_amount(db_session: Session) -> Non
     assert resp_exp.json()["detail"]["code"] == "INVALID_ORDER_AMOUNT"
 
 
-def test_checkout_session_stripe_not_configured(db_session: Session) -> None:
-    """Липса на STRIPE_SECRET_KEY връща 503 STRIPE_NOT_CONFIGURED."""
+def test_checkout_session_payments_not_configured(db_session: Session) -> None:
+    """Липсващ вътрешен токен или Stripe конфигурация в Payments връща 503."""
     user, token = _create_user_and_token(db_session)
-    product = _create_product(db_session, "P1", price_minor=1500)
+    product = _create_product(db_session, "NoKeyItem", price_minor=1500)
     order = _create_order(db_session, user.id, product)
 
-    with patch.object(settings, "stripe_secret_key", None):
+    mock_client = MagicMock(spec=PaymentsClient)
+    mock_client.create_checkout_session.side_effect = PaymentsNotConfigured(
+        "missing internal auth"
+    )
+    app.dependency_overrides[get_payments_client] = lambda: mock_client
+    try:
         resp = client.post(
             f"/orders/{order.id}/checkout-session",
             headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 503
-        assert resp.json()["detail"]["code"] == "STRIPE_NOT_CONFIGURED"
-
-
-def test_checkout_session_success_and_idempotency(db_session: Session) -> None:
-    """Успешно създаване връща checkout_url, а повторно извикване връща същата сесия."""
-    user, token = _create_user_and_token(db_session)
-    product = _create_product(db_session, "P1", price_minor=2500)
-    order = _create_order(db_session, user.id, product, quantity=2)
-
-    mock_session = MagicMock()
-    mock_session.id = "cs_test_success_123"
-    mock_session.url = "https://checkout.stripe.com/c/pay/cs_test_success_123"
-
-    mock_client = MagicMock(spec=StripeClient)
-    mock_client.create_checkout_session.return_value = mock_session
-
-    app.dependency_overrides[get_stripe_client] = lambda: mock_client
-    try:
-        # Първо извикване -> създаване през Stripe
-        resp1 = client.post(
-            f"/orders/{order.id}/checkout-session",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert resp1.status_code == 200
-        data1 = resp1.json()
-        assert data1["checkout_url"] == mock_session.url
-        assert data1["session_id"] == mock_session.id
-        assert mock_client.create_checkout_session.call_count == 1
-
-        # Проверка в базата данни за запис в stripe_checkout_sessions
-        session_rec = db_session.execute(
-            text(
-                "SELECT status, amount_minor, currency, stripe_session_id "
-                "FROM stripe_checkout_sessions WHERE order_id = :oid"
-            ),
-            {"oid": order.id},
-        ).fetchone()
-        assert session_rec is not None
-        assert session_rec[0] == "open"
-        assert session_rec[1] == 5000
-        assert session_rec[2] == "EUR"
-        assert session_rec[3] == "cs_test_success_123"
-
-        # Второ извикване за същата поръчка -> връща съществуващата сесия БЕЗ нов Stripe call
-        resp2 = client.post(
-            f"/orders/{order.id}/checkout-session",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        assert resp2.status_code == 200
-        data2 = resp2.json()
-        assert data2["checkout_url"] == mock_session.url
-        assert data2["session_id"] == mock_session.id
-        assert mock_client.create_checkout_session.call_count == 1
+        assert resp.json()["detail"]["code"] == "PAYMENTS_NOT_CONFIGURED"
     finally:
-        app.dependency_overrides.pop(get_stripe_client, None)
+        app.dependency_overrides.pop(get_payments_client, None)
 
 
-def test_checkout_session_during_cancelling_returns_409(db_session: Session) -> None:
-    """Критерий: нов checkout по време на cancelling връща 409 и не заобикаля защитата."""
-    user, token = _create_user_and_token(db_session)
-    product = _create_product(db_session, "P1", price_minor=2000)
-    order = _create_order(db_session, user.id, product)
-
-    session_rec = StripeCheckoutSession(
-        order_id=order.id,
-        status="cancelling",
-        amount_minor=4000,
-        currency="EUR",
-        stripe_session_id="cs_cancelling_123",
-        checkout_url="https://checkout.stripe.com/c/pay/cs_cancelling_123",
-        idempotency_key="idemp_cancelling_1",
-    )
-    db_session.add(session_rec)
-    db_session.commit()
-
-    resp = client.post(
-        f"/orders/{order.id}/checkout-session",
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    assert resp.status_code == 409
-    assert resp.json()["detail"]["code"] == "ORDER_STATUS_CONFLICT"
-
-
-def test_checkout_session_delayed_response_does_not_reopen_completed_or_cancelled_session(
+def test_checkout_session_passes_authoritative_order_data_and_rotates_on_failure(
     db_session: Session,
-    session_factory: sessionmaker[Session],
 ) -> None:
-    """Критерий: Закъснял отговор от Stripe не трябва да върне completed или expired сесия в open."""
+    """Commerce подава сума/позиции/attempt_key от БД и сменя attempt_key само след терминален неуспех."""
     user, token = _create_user_and_token(db_session)
-    product = _create_product(db_session, "P1", price_minor=2000)
-    order = _create_order(db_session, user.id, product)
+    product = _create_product(db_session, "Authoritative Item", price_minor=2500)
+    expires_at = datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=20)
+    order = _create_order(
+        db_session, user.id, product, quantity=2, expires_at=expires_at
+    )
 
-    mock_session = MagicMock()
-    mock_session.id = "cs_delayed_123"
-    mock_session.url = "https://checkout.stripe.com/c/pay/cs_delayed_123"
-
-    # Симулираме, че докато тече повикването към Stripe, поръчката се анулира
-    def _simulate_concurrent_cancel(*args: Any, **kwargs: Any) -> Any:
-        with session_factory() as s:
-            o = s.get(Order, order.id)
-            if o:
-                o.status = "cancelled"
-            sess = (
-                s.query(StripeCheckoutSession)
-                .filter(StripeCheckoutSession.order_id == order.id)
-                .first()
-            )
-            if sess:
-                sess.status = "expired"
-            s.commit()
-        return mock_session
-
-    mock_client = MagicMock(spec=StripeClient)
-    mock_client.create_checkout_session.side_effect = _simulate_concurrent_cancel
-
-    app.dependency_overrides[get_stripe_client] = lambda: mock_client
+    mock_client = MagicMock(spec=PaymentsClient)
+    mock_client.create_checkout_session.return_value = CheckoutSessionResult(
+        payment_attempt_id=10,
+        session_id="cs_auth_1",
+        checkout_url="https://checkout.stripe.com/pay/cs_auth_1",
+        status="open",
+    )
+    app.dependency_overrides[get_payments_client] = lambda: mock_client
     try:
-        resp = client.post(
+        r1 = client.post(
             f"/orders/{order.id}/checkout-session",
             headers={"Authorization": f"Bearer {token}"},
         )
-        assert resp.status_code == 409
-
-        # Проверка: статусът в базата си остава expired, а НЕ open!
-        db_session.refresh(order)
-        sess_db = (
-            db_session.query(StripeCheckoutSession)
-            .filter(StripeCheckoutSession.order_id == order.id)
-            .first()
+        r2 = client.post(
+            f"/orders/{order.id}/checkout-session",
+            headers={"Authorization": f"Bearer {token}"},
         )
-        assert sess_db is not None
-        assert sess_db.status == "expired"
-        assert order.status == "cancelled"
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        assert r1.json() == {
+            "checkout_url": "https://checkout.stripe.com/pay/cs_auth_1",
+            "session_id": "cs_auth_1",
+        }
+
+        assert mock_client.create_checkout_session.call_count == 2
+        kwargs = mock_client.create_checkout_session.call_args.kwargs
+        assert kwargs["order_id"] == order.id
+        assert kwargs["attempt_key"] == f"order_{order.id}_attempt_1"
+        assert kwargs["amount_minor"] == 5000
+        assert kwargs["currency"] == "EUR"
+        assert kwargs["line_items"] == [
+            {
+                "name": "Authoritative Item",
+                "unit_amount": 2500,
+                "quantity": 2,
+                "currency": "eur",
+            }
+        ]
+
+        # Симулираме payment.failed -> Commerce отваря attempt_2
+        svc = OrderService(
+            order_repository=OrderRepository(db_session),
+            cart_repository=CartRepository(db_session),
+            product_repository=ProductRepository(db_session),
+            user_repository=UserRepository(db_session),
+            session=db_session,
+            payments_client=mock_client,
+        )
+        svc.apply_payment_event(
+            make_payment_event(
+                event_type="payment.failed",
+                order_id=order.id,
+                attempt_key=f"order_{order.id}_attempt_1",
+                amount_minor=5000,
+            )
+        )
+
+        mock_client.create_checkout_session.return_value = CheckoutSessionResult(
+            payment_attempt_id=11,
+            session_id="cs_auth_2",
+            checkout_url="https://checkout.stripe.com/pay/cs_auth_2",
+            status="open",
+        )
+        r3 = client.post(
+            f"/orders/{order.id}/checkout-session",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r3.status_code == 200
+        assert (
+            mock_client.create_checkout_session.call_args.kwargs["attempt_key"]
+            == f"order_{order.id}_attempt_2"
+        )
     finally:
-        app.dependency_overrides.pop(get_stripe_client, None)
+        app.dependency_overrides.pop(get_payments_client, None)
 
 
-def test_checkout_session_parallel_requests(db_session: Session) -> None:
-    """Две паралелни заявки връщат същия сесиен линк без дублирани записи в базата."""
+def test_checkout_session_parallel_requests_use_same_attempt_key_without_db_lock(
+    db_session: Session,
+) -> None:
+    """Паралелни заявки получават същия attempt_key и не блокират БД по време на HTTP."""
     user, token = _create_user_and_token(db_session)
-    product = _create_product(db_session, "P1", price_minor=2000)
-    order = _create_order(db_session, user.id, product, quantity=2)
+    product = _create_product(db_session, "ConcurrentItem", price_minor=1500)
+    order = _create_order(db_session, user.id, product)
 
-    mock_session = MagicMock()
-    mock_session.id = "cs_test_concurrent_999"
-    mock_session.url = "https://checkout.stripe.com/c/pay/cs_test_concurrent_999"
+    mock_client = MagicMock(spec=PaymentsClient)
+    observed_keys: list[str] = []
 
-    mock_client = MagicMock(spec=StripeClient)
-    mock_client.create_checkout_session.return_value = mock_session
+    def slow_payments_create(**kwargs):  # type: ignore[no-untyped-def]
+        observed_keys.append(kwargs["attempt_key"])
+        time.sleep(0.1)
+        return CheckoutSessionResult(
+            payment_attempt_id=77,
+            session_id="cs_concurrent_ok",
+            checkout_url="https://checkout.stripe.com/pay/cs_concurrent_ok",
+            status="open",
+        )
 
-    app.dependency_overrides[get_stripe_client] = lambda: mock_client
+    mock_client.create_checkout_session.side_effect = slow_payments_create
+    app.dependency_overrides[get_payments_client] = lambda: mock_client
     try:
 
-        def _call_session() -> tuple[int, dict[str, Any]]:
-            thread_client = TestClient(app)
-            r = thread_client.post(
+        def _req() -> int:
+            resp = client.post(
                 f"/orders/{order.id}/checkout-session",
                 headers={"Authorization": f"Bearer {token}"},
             )
-            return r.status_code, r.json()
+            return resp.status_code
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            f1 = executor.submit(_call_session)
-            f2 = executor.submit(_call_session)
-            res1_code, res1_data = f1.result()
-            res2_code, res2_data = f2.result()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            statuses = list(pool.map(lambda _: _req(), range(2)))
 
-        assert res1_code == 200
-        assert res2_code == 200
-        assert res1_data["checkout_url"] == res2_data["checkout_url"]
-        assert res1_data["session_id"] == res2_data["session_id"]
-
-        count = db_session.execute(
-            text("SELECT count(*) FROM stripe_checkout_sessions WHERE order_id = :oid"),
-            {"oid": order.id},
-        ).scalar()
-        assert count == 1
+        assert statuses == [200, 200]
+        assert observed_keys == [
+            f"order_{order.id}_attempt_1",
+            f"order_{order.id}_attempt_1",
+        ]
     finally:
-        app.dependency_overrides.pop(get_stripe_client, None)
+        app.dependency_overrides.pop(get_payments_client, None)
 
 
-def test_checkout_session_network_error_returns_502(db_session: Session) -> None:
-    """Мрежова грешка при връзка със Stripe връща 502 STRIPE_ERROR."""
+def test_checkout_session_expired_order_coordinates_with_payments(
+    db_session: Session,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Просрочена поръчка съгласува прекратяване с Payments преди да освободи резерва."""
     user, token = _create_user_and_token(db_session)
-    product = _create_product(db_session, "P1", price_minor=2000)
+    product = _create_product(db_session, "ExpiredCheck", price_minor=1200, stock=10)
+    past = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=5)
+
+    # 1. Payments отказва прекратяване с RemoteOrderAlreadyPaid -> stock НЕ се връща!
+    o_paid = _create_order(
+        db_session, user.id, product, quantity=2, expires_at=past
+    )  # stock=8
+    mock_client = MagicMock(spec=PaymentsClient)
+    mock_client.cancel_order_payment.side_effect = RemoteOrderAlreadyPaid("paid")
+    app.dependency_overrides[get_payments_client] = lambda: mock_client
+    try:
+        r_paid = client.post(
+            f"/orders/{o_paid.id}/checkout-session",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r_paid.status_code == 409
+        with session_factory() as s:
+            assert s.get(Product, product.id).stock == 8  # type: ignore[union-attr]
+            assert s.get(Order, o_paid.id).status == "pending_payment"  # type: ignore[union-attr]
+
+        # 2. Payments потвърждава can_cancel -> order=expired, stock се възстановява!
+        mock_client.cancel_order_payment.side_effect = None
+        mock_client.cancel_order_payment.return_value = CancelPaymentResult(
+            status="can_cancel", action="expired_stripe_session"
+        )
+        r_exp = client.post(
+            f"/orders/{o_paid.id}/checkout-session",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r_exp.status_code == 409
+        with session_factory() as s:
+            assert s.get(Product, product.id).stock == 10  # type: ignore[union-attr]
+            assert s.get(Order, o_paid.id).status == "expired"  # type: ignore[union-attr]
+    finally:
+        app.dependency_overrides.pop(get_payments_client, None)
+
+
+def test_checkout_session_network_error_and_conflicts_map_status(
+    db_session: Session,
+) -> None:
+    """Мрежова грешка с Payments връща 502; конфликт в Payments връща 409."""
+    user, token = _create_user_and_token(db_session)
+    product = _create_product(db_session, "ErrProd", price_minor=1500)
     order = _create_order(db_session, user.id, product)
 
-    mock_client = MagicMock(spec=StripeClient)
-    mock_client.create_checkout_session.side_effect = ConnectionError("Stripe API down")
-
-    app.dependency_overrides[get_stripe_client] = lambda: mock_client
+    mock_client = MagicMock(spec=PaymentsClient)
+    app.dependency_overrides[get_payments_client] = lambda: mock_client
     try:
-        resp = client.post(
+        mock_client.create_checkout_session.side_effect = PaymentGatewayError("down")
+        r_502 = client.post(
             f"/orders/{order.id}/checkout-session",
             headers={"Authorization": f"Bearer {token}"},
         )
-        assert resp.status_code == 502
-        assert resp.json()["detail"]["code"] == "STRIPE_ERROR"
+        assert r_502.status_code == 502
+        assert r_502.json()["detail"]["code"] == "PAYMENT_GATEWAY_ERROR"
+
+        mock_client.create_checkout_session.side_effect = RemotePaymentConflict(
+            "cancelling", "Cancellation in progress"
+        )
+        r_409 = client.post(
+            f"/orders/{order.id}/checkout-session",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r_409.status_code == 409
+        assert r_409.json()["detail"]["code"] == "ORDER_STATUS_CONFLICT"
     finally:
-        app.dependency_overrides.pop(get_stripe_client, None)
+        app.dependency_overrides.pop(get_payments_client, None)
 
 
 def test_simulator_endpoint_removed_cannot_change_status(
     db_session: Session,
 ) -> None:
-    """Критерий: Публичният POST /orders/{id}/payments е премахнат и не може да обяви поръчка за платена."""
+    """Старият POST /orders/{order_id}/payments е премахнат и не променя статуса."""
     user, token = _create_user_and_token(db_session)
-    product = _create_product(db_session, stock=10)
-    order = _create_order(db_session, user.id, product, quantity=2)  # stock = 8
-    initial_stock = product.stock
+    product = _create_product(db_session, "OldSim", price_minor=1500)
+    order = _create_order(db_session, user.id, product)
 
-    # Опит за извикване на стария симулаторен endpoint с test_success
     resp = client.post(
         f"/orders/{order.id}/payments",
         json={"payment_method": "test_success"},
@@ -332,11 +347,7 @@ def test_simulator_endpoint_removed_cannot_change_status(
             "Idempotency-Key": str(uuid.uuid4()),
         },
     )
-    # Тъй като endpoint-ът е премахнат, FastAPI връща 404 Not Found (или 405)
     assert resp.status_code in (404, 405)
 
-    # Проверка в базата: поръчката ЗАДЪЛЖИТЕЛНО остава в pending_payment
     db_session.refresh(order)
-    db_session.refresh(product)
     assert order.status == "pending_payment"
-    assert product.stock == initial_stock
