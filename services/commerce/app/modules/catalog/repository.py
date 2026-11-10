@@ -3,7 +3,6 @@ from collections.abc import Sequence
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.modules.accounts.models import User
 from app.modules.catalog.models import Category, Product
 
 
@@ -52,14 +51,12 @@ class ProductRepository:
         return self._session.get(Product, product_id)
 
     def get_active_by_id(self, product_id: int) -> Product | None:
-        """Извлича активен продукт на активен продавач по неговото ID."""
+        """Извлича активен продукт по неговото ID."""
         stmt = (
             select(Product)
-            .join(User, Product.seller_id == User.id)
             .where(
                 Product.id == product_id,
                 Product.active.is_(True),
-                User.status == "active",
             )
         )
         return self._session.scalars(stmt).one_or_none()
@@ -88,12 +85,8 @@ class ProductRepository:
     def list_active(
         self, limit: int, offset: int, category_id: int | None = None
     ) -> Sequence[Product]:
-        """Извлича списък с активни продукти на активни продавачи, подредени по ID възходящо с пагинация."""
-        stmt = (
-            select(Product)
-            .join(User, Product.seller_id == User.id)
-            .where(Product.active.is_(True), User.status == "active")
-        )
+        """Извлича списък с активни продукти, подредени по ID възходящо с пагинация."""
+        stmt = select(Product).where(Product.active.is_(True))
         if category_id is not None:
             stmt = stmt.where(Product.category_id == category_id)
         stmt = stmt.order_by(Product.id.asc()).limit(limit).offset(offset)

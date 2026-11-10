@@ -61,4 +61,3 @@ def test_internal_get_user_success(client: TestClient, db_session: Session) -> N
     assert data["status"] == "active"
     assert data["token_version"] == 2
     assert data["display_name"] == "Internal Merchant"
-

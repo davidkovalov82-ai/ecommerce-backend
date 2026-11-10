@@ -274,21 +274,8 @@ class LocalTestUsersClient(UsersClient):
 
     @contextmanager
     def _get_session(self) -> Iterator[Session]:
-        override = app.dependency_overrides.get(get_db_session)
-        if override:
-            res = override()
-            if hasattr(res, "__enter__"):
-                with res as s:
-                    yield s
-            else:
-                s = next(res)
-                try:
-                    yield s
-                finally:
-                    pass
-        else:
-            with self.session_factory() as s:
-                yield s
+        with self.session_factory() as s:
+            yield s
 
     def get_user_status(self, user_id: int) -> RemoteUserInfo | None:
         with self._get_session() as session:
