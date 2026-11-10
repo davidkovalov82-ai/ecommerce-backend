@@ -317,6 +317,7 @@ class LocalTestUsersClient(UsersClient):
         import httpx
         from pwdlib import PasswordHash
 
+        from app.modules.accounts.dependencies import _password_hasher
         from app.modules.accounts.repository import UserRepository
         from app.modules.accounts.service import (
             AccountBlocked,
@@ -327,6 +328,7 @@ class LocalTestUsersClient(UsersClient):
             InvalidCredentials,
             InvalidCurrentPassword,
             InvalidResetToken,
+            RateLimitExceeded,
             SamePasswordError,
             SelfModerationForbidden,
             TechnicalAccountProtected,
@@ -337,15 +339,24 @@ class LocalTestUsersClient(UsersClient):
         with self._get_session() as session:
             repo = UserRepository(session)
             service = AccountService(
-                repo, session, password_hasher=PasswordHash.recommended()
+                repo, session, password_hasher=_password_hasher
             )
             data = json.loads(content) if content else {}
 
-            def _get_auth_user() -> User | None:
+            def _get_auth_user() -> tuple[int, Any, dict[str, str]]:
                 auth = (headers or {}).get("authorization", "")
                 if not auth.startswith("Bearer "):
-                    return None
-                token = auth[7:]
+                    return (
+                        401,
+                        {
+                            "detail": {
+                                "code": "AUTHENTICATION_REQUIRED",
+                                "message": "Authentication required",
+                            }
+                        },
+                        {"WWW-Authenticate": "Bearer"},
+                    )
+                token = auth[7:].strip()
                 try:
                     td = decode_access_token(
                         token,
@@ -354,9 +365,74 @@ class LocalTestUsersClient(UsersClient):
                         issuer=settings.jwt_issuer,
                         audience=settings.jwt_audience,
                     )
-                    return repo.get_by_id(td.user_id)
                 except Exception:
-                    return None
+                    return (
+                        401,
+                        {
+                            "detail": {
+                                "code": "INVALID_TOKEN",
+                                "message": "Invalid or expired token",
+                            }
+                        },
+                        {"WWW-Authenticate": "Bearer"},
+                    )
+                u = repo.get_by_id(td.user_id)
+                if not u:
+                    return (
+                        401,
+                        {
+                            "detail": {
+                                "code": "USER_NOT_FOUND",
+                                "message": "User not found",
+                            }
+                        },
+                        {"WWW-Authenticate": "Bearer"},
+                    )
+                if u.token_version != td.token_version:
+                    return (
+                        401,
+                        {
+                            "detail": {
+                                "code": "INVALID_TOKEN",
+                                "message": "Token has been revoked",
+                            }
+                        },
+                        {"WWW-Authenticate": "Bearer"},
+                    )
+                if u.status == "blocked":
+                    return (
+                        403,
+                        {
+                            "detail": {
+                                "code": "ACCOUNT_BLOCKED",
+                                "message": "Account is blocked",
+                            }
+                        },
+                        {},
+                    )
+                if u.status == "closed":
+                    return (
+                        403,
+                        {
+                            "detail": {
+                                "code": "ACCOUNT_CLOSED",
+                                "message": "Account is closed",
+                            }
+                        },
+                        {},
+                    )
+                if u.status != "active":
+                    return (
+                        403,
+                        {
+                            "detail": {
+                                "code": "ACCOUNT_INACTIVE",
+                                "message": "Account is inactive",
+                            }
+                        },
+                        {},
+                    )
+                return 200, u, {}
 
             try:
                 if path == "/users" and method == "POST":
@@ -389,41 +465,29 @@ class LocalTestUsersClient(UsersClient):
                         headers={"content-type": "application/json"},
                     )
                 elif path == "/users/me" and method == "GET":
-                    u = _get_auth_user()
-                    if not u:
+                    status_c, u_or_err, r_headers = _get_auth_user()
+                    if status_c != 200:
                         return httpx.Response(
-                            401,
-                            json={
-                                "detail": {
-                                    "code": "AUTHENTICATION_REQUIRED",
-                                    "message": "Authentication required",
-                                }
-                            },
+                            status_c, json=u_or_err, headers=r_headers
                         )
                     return httpx.Response(
                         200,
                         json={
-                            "id": u.id,
-                            "email": u.email,
-                            "role": u.role,
-                            "display_name": u.display_name,
+                            "id": u_or_err.id,
+                            "email": u_or_err.email,
+                            "role": u_or_err.role,
+                            "display_name": u_or_err.display_name,
                         },
                         headers={"content-type": "application/json"},
                     )
                 elif path == "/users/me" and method == "PATCH":
-                    u = _get_auth_user()
-                    if not u:
+                    status_c, u_or_err, r_headers = _get_auth_user()
+                    if status_c != 200:
                         return httpx.Response(
-                            401,
-                            json={
-                                "detail": {
-                                    "code": "AUTHENTICATION_REQUIRED",
-                                    "message": "Authentication required",
-                                }
-                            },
+                            status_c, json=u_or_err, headers=r_headers
                         )
                     updated = service.update_user_profile(
-                        user_id=u.id, display_name=data.get("display_name")
+                        user_id=u_or_err.id, display_name=data.get("display_name")
                     )
                     return httpx.Response(
                         200,
@@ -436,26 +500,24 @@ class LocalTestUsersClient(UsersClient):
                         headers={"content-type": "application/json"},
                     )
                 elif path == "/users/me/change-password" and method == "POST":
-                    u = _get_auth_user()
-                    if not u:
+                    status_c, u_or_err, r_headers = _get_auth_user()
+                    if status_c != 200:
                         return httpx.Response(
-                            401,
-                            json={
-                                "detail": {
-                                    "code": "AUTHENTICATION_REQUIRED",
-                                    "message": "Authentication required",
-                                }
-                            },
+                            status_c, json=u_or_err, headers=r_headers
                         )
                     service.change_password(
-                        user_id=u.id,
+                        user_id=u_or_err.id,
                         current_password=data["current_password"],
                         new_password=data["new_password"],
                     )
                     return httpx.Response(204)
                 elif path.startswith("/users/") and path.endswith("/block"):
-                    u = _get_auth_user()
-                    if not u or u.role != "admin":
+                    status_c, u_or_err, r_headers = _get_auth_user()
+                    if status_c != 200:
+                        return httpx.Response(
+                            status_c, json=u_or_err, headers=r_headers
+                        )
+                    if u_or_err.role != "admin":
                         return httpx.Response(
                             403,
                             json={
@@ -467,7 +529,7 @@ class LocalTestUsersClient(UsersClient):
                         )
                     target_id = int(path.split("/")[2])
                     blocked = service.block_user(
-                        admin_id=u.id,
+                        admin_id=u_or_err.id,
                         target_user_id=target_id,
                         reason=data.get("reason"),
                     )
@@ -482,8 +544,12 @@ class LocalTestUsersClient(UsersClient):
                         headers={"content-type": "application/json"},
                     )
                 elif path.startswith("/users/") and path.endswith("/unblock"):
-                    u = _get_auth_user()
-                    if not u or u.role != "admin":
+                    status_c, u_or_err, r_headers = _get_auth_user()
+                    if status_c != 200:
+                        return httpx.Response(
+                            status_c, json=u_or_err, headers=r_headers
+                        )
+                    if u_or_err.role != "admin":
                         return httpx.Response(
                             403,
                             json={
@@ -495,7 +561,7 @@ class LocalTestUsersClient(UsersClient):
                         )
                     target_id = int(path.split("/")[2])
                     unblocked = service.unblock_user(
-                        admin_id=u.id,
+                        admin_id=u_or_err.id,
                         target_user_id=target_id,
                         reason=data.get("reason"),
                     )
@@ -510,8 +576,12 @@ class LocalTestUsersClient(UsersClient):
                         headers={"content-type": "application/json"},
                     )
                 elif path.startswith("/users/") and path.endswith("/close"):
-                    u = _get_auth_user()
-                    if not u or u.role != "admin":
+                    status_c, u_or_err, r_headers = _get_auth_user()
+                    if status_c != 200:
+                        return httpx.Response(
+                            status_c, json=u_or_err, headers=r_headers
+                        )
+                    if u_or_err.role != "admin":
                         return httpx.Response(
                             403,
                             json={
@@ -523,7 +593,7 @@ class LocalTestUsersClient(UsersClient):
                         )
                     target_id = int(path.split("/")[2])
                     closed = service.close_user(
-                        admin_id=u.id,
+                        admin_id=u_or_err.id,
                         target_user_id=target_id,
                         reason=data.get("reason"),
                     )
@@ -552,25 +622,26 @@ class LocalTestUsersClient(UsersClient):
                         new_password=data.get("new_password", ""),
                     )
                     return httpx.Response(204)
-            except EmailAlreadyExists as exc:
+            except EmailAlreadyExists:
                 return httpx.Response(
                     409,
                     json={
                         "detail": {
                             "code": "EMAIL_ALREADY_EXISTS",
-                            "message": str(exc),
+                            "message": "User with this email already exists",
                         }
                     },
                 )
-            except InvalidCredentials as exc:
+            except InvalidCredentials:
                 return httpx.Response(
                     401,
                     json={
                         "detail": {
                             "code": "INVALID_CREDENTIALS",
-                            "message": str(exc),
+                            "message": "Invalid email or password",
                         }
                     },
+                    headers={"WWW-Authenticate": "Bearer"},
                 )
             except AccountBlocked as exc:
                 return httpx.Response(
@@ -642,6 +713,16 @@ class LocalTestUsersClient(UsersClient):
                     json={
                         "detail": {
                             "code": "INVALID_RESET_TOKEN",
+                            "message": str(exc),
+                        }
+                    },
+                )
+            except RateLimitExceeded as exc:
+                return httpx.Response(
+                    429,
+                    json={
+                        "detail": {
+                            "code": "RATE_LIMIT_EXCEEDED",
                             "message": str(exc),
                         }
                     },

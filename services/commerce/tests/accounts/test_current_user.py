@@ -155,11 +155,13 @@ def test_token_with_unsupported_algorithm_rejected() -> None:
 
 def test_create_access_token_exact_duration_900_seconds() -> None:
     """9. exp - iat е точно 900 секунди (15 минути) при стандартната конфигурация."""
-    token = create_access_token(user_id=42, secret=settings.jwt_secret)
+    token = create_access_token(user_id=42)
     decoded = jwt.decode(
         token,
-        settings.jwt_secret,
-        algorithms=["HS256"],
+        settings.get_public_key(),
+        algorithms=["RS256"],
         options={"verify_signature": True},
+        audience=settings.jwt_audience,
+        issuer=settings.jwt_issuer,
     )
     assert decoded["exp"] - decoded["iat"] == 900

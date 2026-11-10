@@ -29,8 +29,10 @@ def test_login_successful_after_registration() -> None:
     token = data["access_token"]
     decoded = jwt.decode(
         token,
-        settings.jwt_secret,
-        algorithms=["HS256"],
+        settings.get_public_key(),
+        algorithms=["RS256"],
+        audience=settings.jwt_audience,
+        issuer=settings.jwt_issuer,
         options={"verify_signature": True},
     )
     assert decoded["sub"] == str(reg_res.json()["id"])

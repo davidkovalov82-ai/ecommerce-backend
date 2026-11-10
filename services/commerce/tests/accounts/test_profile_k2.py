@@ -1,4 +1,5 @@
 import concurrent.futures
+import os
 from datetime import UTC, datetime
 
 import jwt
@@ -358,14 +359,28 @@ def test_change_password_legacy_token_compatibility_without_version(
     pwd_new = "LegacyBrandNewPassword456!"
 
     user, _ = _create_user(db_session, email)
-    # Създаваме токен без token_version claim (като от по-стара ревизия на системата)
+    # Старите HS256 токени отпреди превключването към Users се отхвърлят веднага
+    old_hs_token = jwt.encode(
+        {"sub": str(user.id), "iat": int(datetime.now(UTC).timestamp()), "exp": int(datetime.now(UTC).timestamp()) + 900},
+        settings.jwt_secret,
+        algorithm="HS256",
+    )
+    assert client.get("/users/me", headers={"Authorization": f"Bearer {old_hs_token}"}).status_code == 401
+
+    # Създаваме валиден RS256 токен без token_version claim (третира се като версия 0)
     now = int(datetime.now(UTC).timestamp())
     legacy_payload = {
         "sub": str(user.id),
         "iat": now,
         "exp": now + 900,
+        "iss": settings.jwt_issuer,
+        "aud": settings.jwt_audience,
     }
-    legacy_token = jwt.encode(legacy_payload, settings.jwt_secret, algorithm="HS256")
+    legacy_token = jwt.encode(
+        legacy_payload,
+        settings.get_public_key() if False else os.environ["JWT_PRIVATE_KEY"],
+        algorithm="RS256",
+    )
 
     # Преди смяна на паролата токенът работи (версия 0 == версия 0)
     res_before = client.get(

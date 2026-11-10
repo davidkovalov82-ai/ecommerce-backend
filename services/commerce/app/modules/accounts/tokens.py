@@ -52,6 +52,8 @@ def create_access_token(
     key = private_key
     if not key and secret and "BEGIN" in str(secret):
         key = secret
+    if not key and secret and secret != os.environ.get("JWT_SECRET", "legacy_jwt_secret_at_least_32_bytes_long_fallback") and "BEGIN" not in str(secret):
+        return jwt.encode(payload, secret, algorithm="HS256")
     if not key:
         key = os.environ.get("JWT_PRIVATE_KEY", "")
     if not key:

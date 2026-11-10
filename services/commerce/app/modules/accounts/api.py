@@ -70,9 +70,14 @@ def _forward(
         )
 
     content_type = resp.headers.get("content-type", "application/json")
+    hop_by_hop = {"content-length", "content-encoding", "transfer-encoding", "connection"}
+    response_headers = {
+        k: v for k, v in resp.headers.items() if k.lower() not in hop_by_hop
+    }
     return Response(
         content=resp.content,
         status_code=resp.status_code,
+        headers=response_headers,
         media_type=content_type,
     )
 
