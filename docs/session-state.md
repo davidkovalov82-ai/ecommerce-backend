@@ -1,13 +1,16 @@
 # Session State
 
-- **Текуща задача**: Етап К5 (`feat/payments-service`) — дедупликация на `reconcile_interrupted_closure`, отделно събитие `payment.cancelled` за асинхронно приключване на ръчна отмяна и актуализиран `k5_e2e_verify.py`.
+- **Текуща задача**: Етап K6.1 (част 1) — отделен независим микросервис `services/users` с регистрация и вход.
 - **Реализирано**:
-  - [`services/payments/app/service.py`](file:///Users/kovalovdavid/Projects/ecommerce-backend/services/payments/app/service.py): премахнато дублираното определение на `reconcile_interrupted_closure`; добавен `_finalize_order_closure_with_outbox`, записващ `payment.cancelled` за `cancelling`/`cancelled` (или `payment.expired` за `expiring`) в една транзакция с `finalize_order_closure`.
-  - Миграция [`0005_allow_payment_cancelled_outbox_event.py`](file:///Users/kovalovdavid/Projects/ecommerce-backend/services/payments/migrations/versions/0005_allow_payment_cancelled_outbox_event.py), [`models.py`](file:///Users/kovalovdavid/Projects/ecommerce-backend/services/payments/app/models.py) и [`publisher.py`](file:///Users/kovalovdavid/Projects/ecommerce-backend/services/payments/app/publisher.py): добавен `payment.cancelled`.
-  - [`payment_contracts.py`](file:///Users/kovalovdavid/Projects/ecommerce-backend/services/commerce/app/modules/orders/payment_contracts.py), [`payment_consumer.py`](file:///Users/kovalovdavid/Projects/ecommerce-backend/services/commerce/app/modules/orders/payment_consumer.py) и [`OrderService.apply_payment_event`](file:///Users/kovalovdavid/Projects/ecommerce-backend/services/commerce/app/modules/orders/service.py): обработка на `payment.cancelled` (`cancelled` + 1 възстановяване, игнориране при `paid`/`cancelled`/`expired`), без да се засяга `payment.expired` преди крайния срок.
-  - [`scripts/k5_e2e_verify.py`](file:///Users/kovalovdavid/Projects/ecommerce-backend/scripts/k5_e2e_verify.py): премахнато двойното резервиране и повторния `POST /cancel`; проверяват се автоматичен `cancelled`, непроменен `stock=6` при повторения и `paid` при платена прекъсната отмяна.
-- **Проверено локално**: `services/payments` Ruff (`check .`, `--select F811`, `format --check`) + pytest (`33 passed`), `services/commerce` Ruff + pytest (`301 passed`), `make test-k5-e2e` OK.
-- **Непроверено**: Реален Stripe Sandbox (`sk_test_...` / `stripe listen`); новият GitHub Actions run след локалните (непубликувани) промени.
-- **Работещи команди**: `cd services/payments && uv run --locked ruff check . && uv run --locked ruff check --select F811 . && uv run --locked pytest -q`, `cd services/commerce && uv run --locked pytest -q`, `make test-k5-e2e`.
-- **Засегнати файлове**: `services/payments/{app,migrations/versions/0005*,tests}/*`, `services/commerce/{app/modules/orders,tests/payments}/*`, `scripts/k5_e2e_verify.py`, `docs/session-state.md`.
-- **Следваща стъпка**: Потребителят да прегледа промените, да изпълни commit/push и да провери CI за `feat/payments-service`.
+  - `services/users`: FastAPI, синхронен SQLAlchemy 2.0, PostgreSQL, Alembic, uv, pytest, Ruff. Архитектура API -> Service -> Repository.
+  - Изолирана PostgreSQL роля и база `users` (`scripts/postgres_db_init.sh`, `compose.yaml`). Порт `8002`.
+  - Модел `User` и миграция `0001_create_users_table.py` (id, email, password_hash, role='customer', status='active', token_version=0).
+  - Регистрация (`POST /users`), вход (`POST /auth/login`), здраве (`GET /health`) и публичен ключ (`GET /auth/public-key`).
+  - Асиметричен JWT (RS256, 15m, `iss="ecommerce-users"`, `aud="ecommerce"`, `sub`, `role`, `email`, `token_version`). Частен ключ извън Git; скрипт `scripts/generate_keys.py`.
+  - Dockerfile, compose конфигурация, .env.example, CI job `users-checks` в `.github/workflows/ci.yml`.
+  - 26 интеграционни теста (PostgreSQL): миграции, регистрация (дубликати, правила, роли), вход (грешни данни, блокировки), токени, персистентност.
+- **Проверено локално**: `services/users` ruff check/format (23 файла OK) + pytest (26 passed); реална миграция към `users` DB; Docker compose config; извличане на /health и /auth/public-key.
+- **Непроверено**: пълен Docker Compose build в чист Docker daemon; превключване на Commerce към Users (отложено за следващи части на K6.1).
+- **Работещи команди**: `cd services/users && uv run --locked pytest -q`, `cd services/users && uv run --locked ruff check . && uv run --locked ruff format --check .`, `docker compose up -d users`.
+- **Засегнати файлове**: `services/users/*`, `compose.yaml`, `scripts/postgres_db_init.sh`, `.github/workflows/ci.yml`, `README.md`, `TODO.md`, `docs/session-state.md`.
+- **Следваща стъпка**: Преглед и пускане на промените от потребителя, преминаване към следващата фаза на K6.1.

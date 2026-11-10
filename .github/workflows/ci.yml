@@ -268,6 +268,64 @@ jobs:
       - name: Run payments tests
         run: uv run --locked pytest -q
 
+  users-checks:
+    name: users-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        working-directory: services/users
+
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: "5432"
+      DB_USER: users
+      DB_PASSWORD: users_ci
+      DB_NAME: users
+      DB_ADMIN_USER: commerce
+      DB_ADMIN_PASSWORD: commerce_ci
+      DB_ADMIN_NAME: commerce
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: commerce
+          POSTGRES_PASSWORD: commerce_ci
+          POSTGRES_DB: commerce
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U commerce -d commerce"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.6"
+
+      - name: Install Python
+        run: uv python install 3.13
+
+      - name: Install locked dependencies
+        run: uv sync --locked --dev --python 3.13
+
+      - name: Check lint
+        run: uv run --locked ruff check .
+
+      - name: Check formatting
+        run: uv run --locked ruff format --check .
+
+      - name: Run users tests
+        run: uv run --locked pytest -q
+
   k4-e2e-checks:
     name: k4-e2e-checks
     runs-on: ubuntu-latest

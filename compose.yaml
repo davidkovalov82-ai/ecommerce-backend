@@ -40,6 +40,9 @@ services:
       PAYMENTS_APP_USER: ${PAYMENTS_DB_USER:-payments}
       PAYMENTS_APP_PASSWORD: ${PAYMENTS_DB_PASSWORD:-payments}
       PAYMENTS_DB_NAME: payments
+      USERS_APP_USER: ${USERS_DB_USER:-users}
+      USERS_APP_PASSWORD: ${USERS_DB_PASSWORD:-users}
+      USERS_DB_NAME: users
     restart: "no"
     volumes:
       - ./scripts/postgres_db_init.sh:/usr/local/bin/postgres_db_init.sh:ro
@@ -236,6 +239,33 @@ services:
       SMS_MODE: ${SMS_MODE:-test}
       SMS_API_BASE_URL: ${SMS_API_BASE_URL:-}
     command: sh -c "alembic upgrade head && python -m app.main"
+
+  users:
+    build:
+      context: ./services/users
+      dockerfile: Dockerfile
+    container_name: users-api
+    restart: unless-stopped
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: ${USERS_DB_USER:-users}
+      DB_PASSWORD: ${USERS_DB_PASSWORD:-users}
+      DB_NAME: users
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-RS256}
+      JWT_ACCESS_TOKEN_EXPIRE_MINUTES: ${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-15}
+      JWT_ISSUER: ${JWT_ISSUER:-ecommerce-users}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-ecommerce}
+      JWT_PRIVATE_KEY: ${JWT_PRIVATE_KEY:-}
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY:-}
+      JWT_PRIVATE_KEY_PATH: ${JWT_PRIVATE_KEY_PATH:-jwt_private.pem}
+      JWT_PUBLIC_KEY_PATH: ${JWT_PUBLIC_KEY_PATH:-jwt_public.pem}
+    ports:
+      - "8002:8002"
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8002"
 
 volumes:
   postgres_data:

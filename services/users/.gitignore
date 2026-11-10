@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.env
+jwt_private.pem
+jwt_public.pem
+*.pem
+keys/
+

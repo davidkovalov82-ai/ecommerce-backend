@@ -9,7 +9,8 @@
 
 ## Архитектура на проекта
 
-Проектът се състои от три независими сервиса в `services/`:
+Проектът се състои от четири независими сервиса в `services/`:
+- **`services/users`** – независим потребителски сервис (`http://localhost:8002`) със собствена PostgreSQL база и роля (`users`), собствени Alembic миграции, регистрация (`POST /users`), вход (`POST /auth/login`), здравен статус (`GET /health`) и издаване на асиметрично подписани JWT access-токени (RS256) с публичен ключ през `GET /auth/public-key`.
 - **`services/commerce`** – основният домейн бекенд (`accounts`, `catalog`, `cart`, `orders`, управление на складови резерви), издателят `commerce-outbox` (`order.paid`, `shipment.shipped` -> RabbitMQ) и консуматорът `commerce-payment-consumer` (`payment.*` -> `orders` + `order_payment_discrepancies`).
 - **`services/payments`** – независим платежен сервис (`http://localhost:8001`) със собствена PostgreSQL база и роля (`payments`), собствени Alembic миграции, Stripe SDK интеграция, вътрешно HTTP API защитено с `X-Internal-Token`, публичен `/webhooks/stripe`, фонов издател `payments-outbox` и сверка `scripts/reconcile_payments.py`. Единствено `services/payments` получава `STRIPE_SECRET_KEY` и `STRIPE_WEBHOOK_SECRET`.
 - **`services/notifications`** – независим консуматор на събития (`order.paid`, `shipment.shipped`) и worker за доставка по отделни канали (**Email** през SMTP/Mailpit и **SMS** през адаптер на провайдър), със собствена PostgreSQL база и роля (`notifications`).
@@ -80,9 +81,9 @@ docker compose --env-file services/commerce/.env up --build
 ```
 
 Compose автоматично:
-1. Стартира PostgreSQL контейнер и инициализира три изолирани БД и роли (`commerce_app`, `payments`, `notifications`).
+1. Стартира PostgreSQL контейнер и инициализира четири изолирани БД и роли (`commerce_app`, `payments`, `notifications`, `users`).
 2. Стартира **RabbitMQ** (портове `5672` и `15672`) и **Mailpit** (SMTP `1025`, Web UI `http://localhost:8025`).
-3. Построява и пуска **`api`** (`http://localhost:8000`), **`commerce-outbox`**, **`commerce-payment-consumer`**, **`payments`** (`http://localhost:8001`), **`payments-outbox`** и **`notifications`**.
+3. Построява и пуска **`api`** (`http://localhost:8000`), **`commerce-outbox`**, **`commerce-payment-consumer`**, **`payments`** (`http://localhost:8001`), **`payments-outbox`**, **`notifications`** и **`users`** (`http://localhost:8002`).
 
 ### Преминаване от предишния запуск (`services/commerce`)
 
