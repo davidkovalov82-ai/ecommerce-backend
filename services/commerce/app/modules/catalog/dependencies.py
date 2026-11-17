@@ -3,12 +3,33 @@ from typing import Annotated
 from fastapi import Depends
 
 from app.dependencies import DbSession
+from app.modules.catalog.client import CatalogClient
 from app.modules.catalog.repository import (
     CategoryRepository,
     ProductRepository,
     SellerStatusRepository,
 )
 from app.modules.catalog.service import CatalogService
+
+
+def get_catalog_client() -> CatalogClient:
+    """Фабрика за CatalogClient."""
+    return CatalogClient()
+
+
+def resolve_catalog_client(explicit: CatalogClient | None = None) -> CatalogClient:
+    """Връща подадения клиент, текущия override от app.dependency_overrides или нов CatalogClient."""
+    if explicit is not None:
+        return explicit
+    from app.main import app
+
+    override = app.dependency_overrides.get(get_catalog_client)
+    if override is not None:
+        return override()
+    return CatalogClient()
+
+
+CatalogClientDep = Annotated[CatalogClient, Depends(get_catalog_client)]
 
 
 def get_product_repository(session: DbSession) -> ProductRepository:

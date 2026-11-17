@@ -223,7 +223,6 @@ class OrderItem(Base):
     )
     product_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("products.id", ondelete="RESTRICT"),
         nullable=False,
     )
     seller_id: Mapped[int | None] = mapped_column(

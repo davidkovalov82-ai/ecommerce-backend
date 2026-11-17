@@ -39,6 +39,9 @@ services:
       USERS_APP_USER: users_app
       USERS_APP_PASSWORD: users_app
       USERS_DB_NAME: users
+      CATALOG_APP_USER: catalog_app
+      CATALOG_APP_PASSWORD: catalog_app
+      CATALOG_DB_NAME: catalog
     restart: "no"
     volumes:
       - ./scripts/postgres_db_init.sh:/usr/local/bin/postgres_db_init.sh:ro
@@ -191,6 +194,22 @@ services:
       DB_NAME: users
     command: sh -c "alembic upgrade head"
 
+  catalog-migrations-e2e:
+    build:
+      context: ./services/catalog
+      dockerfile: Dockerfile
+    restart: "no"
+    depends_on:
+      db-init-e2e:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: db-e2e
+      DB_PORT: "5432"
+      DB_USER: catalog_app
+      DB_PASSWORD: catalog_app
+      DB_NAME: catalog
+    command: sh -c "alembic upgrade head"
+
   users-accounts-migration-e2e:
     build:
       context: ./services/users
@@ -254,6 +273,69 @@ services:
       timeout: 3s
       retries: 15
 
+  catalog-e2e:
+    build:
+      context: ./services/catalog
+      dockerfile: Dockerfile
+    container_name: catalog-api-e2e
+    restart: unless-stopped
+    depends_on:
+      catalog-migrations-e2e:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: db-e2e
+      DB_PORT: "5432"
+      DB_USER: catalog_app
+      DB_PASSWORD: catalog_app
+      DB_NAME: catalog
+      JWT_ALGORITHM: RS256
+      JWT_ISSUER: ecommerce-users
+      JWT_AUDIENCE: ecommerce
+      JWT_PUBLIC_KEY_PATH: jwt_public.pem
+      INTERNAL_AUTH_TOKEN: ecommerce-catalog-internal-secret
+      RABBITMQ_HOST: rabbitmq-e2e
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+    ports:
+      - "127.0.0.1:58003:8003"
+    volumes:
+      - ${USERS_E2E_JWT_PUBLIC_KEY_PATH}:/app/jwt_public.pem:ro
+    networks:
+      default:
+        aliases:
+          - catalog
+    command: sh -c "uvicorn app.main:app --host 0.0.0.0 --port 8003"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  catalog-user-consumer-e2e:
+    build:
+      context: ./services/catalog
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      catalog-migrations-e2e:
+        condition: service_completed_successfully
+      catalog-e2e:
+        condition: service_healthy
+      rabbitmq-e2e:
+        condition: service_healthy
+    environment:
+      DB_HOST: db-e2e
+      DB_PORT: "5432"
+      DB_USER: catalog_app
+      DB_PASSWORD: catalog_app
+      DB_NAME: catalog
+      RABBITMQ_HOST: rabbitmq-e2e
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+    command: sh -c "python scripts/consume_user_events.py --daemon"
+
   commerce-api-e2e:
     build:
       context: ./services/commerce
@@ -262,6 +344,8 @@ services:
       commerce-migrations-e2e:
         condition: service_completed_successfully
       users-e2e:
+        condition: service_healthy
+      catalog-e2e:
         condition: service_healthy
     environment:
       DB_HOST: db-e2e
@@ -272,6 +356,8 @@ services:
       JWT_SECRET: k4-e2e-test-jwt-secret-key-at-least-32-bytes-long!
       USERS_BASE_URL: http://users:8002
       USERS_INTERNAL_AUTH_TOKEN: ecommerce-users-internal-secret
+      CATALOG_BASE_URL: http://catalog:8003
+      CATALOG_INTERNAL_AUTH_TOKEN: ecommerce-catalog-internal-secret
       JWT_PUBLIC_KEY_PATH: jwt_public.pem
       PAYMENTS_BASE_URL: http://payments-e2e:8001
       PAYMENTS_INTERNAL_AUTH_TOKEN: k5-e2e-internal-payments-token-32b!
@@ -334,6 +420,8 @@ services:
       JWT_SECRET: k4-e2e-test-jwt-secret-key-at-least-32-bytes-long!
       USERS_BASE_URL: http://users:8002
       USERS_INTERNAL_AUTH_TOKEN: ecommerce-users-internal-secret
+      CATALOG_BASE_URL: http://catalog:8003
+      CATALOG_INTERNAL_AUTH_TOKEN: ecommerce-catalog-internal-secret
       JWT_PUBLIC_KEY_PATH: jwt_public.pem
       PAYMENTS_BASE_URL: http://payments-e2e:8001
       PAYMENTS_INTERNAL_AUTH_TOKEN: k5-e2e-internal-payments-token-32b!

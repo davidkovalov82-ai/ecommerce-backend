@@ -13,6 +13,12 @@ from app.modules.accounts.users_client import (
     UsersServiceUnavailableError,
 )
 from app.modules.cart.repository import CartRepository
+from app.modules.catalog.client import (
+    CatalogClient,
+    CatalogInsufficientStockError,
+    CatalogProductUnavailableError,
+)
+from app.modules.catalog.dependencies import resolve_catalog_client
 from app.modules.catalog.repository import ProductRepository
 from app.modules.orders.models import (
     Order,
@@ -103,11 +109,12 @@ class OrderService:
         self,
         order_repository: OrderRepository,
         cart_repository: CartRepository,
-        product_repository: ProductRepository,
+        product_repository: ProductRepository | None = None,
         user_repository: UserRepository | None = None,
         session: Session | None = None,
         payments_client: PaymentsClient | None = None,
         users_client: UsersClient | None = None,
+        catalog_client: CatalogClient | None = None,
     ) -> None:
         self._order_repository = order_repository
         self._cart_repository = cart_repository
@@ -118,6 +125,7 @@ class OrderService:
         self._session = session
         self._payments_client = payments_client or HttpPaymentsClient()
         self._users_client = users_client or UsersClient()
+        self._catalog_client = resolve_catalog_client(catalog_client)
 
     def create_order(
         self,
@@ -184,12 +192,10 @@ class OrderService:
             if not cart_items:
                 raise CartEmpty("Shopping cart is empty")
 
-            # 4. Заключване на продуктите във възходящ ред по id
+            # 4. Извличане на продуктите през Catalog договора
             product_ids = [item.product_id for item in cart_items]
-            locked_products = self._product_repository.get_by_ids_for_update(
-                product_ids
-            )
-            products_by_id = {p.id: p for p in locked_products}
+            remote_products = self._catalog_client.get_products_batch(product_ids)
+            products_by_id = {p.id: p for p in remote_products}
 
             # 5. Проверка на активност, наличност и статус на продавачите през Users
             if self._users_client is None:
@@ -198,7 +204,7 @@ class OrderService:
                 )
 
             unique_seller_ids = sorted(
-                {p.seller_id for p in locked_products if p.seller_id is not None}
+                {p.seller_id for p in remote_products if p.seller_id is not None}
             )
             sellers_by_id: dict[int, object] = {}
 
@@ -270,7 +276,9 @@ class OrderService:
             order.active_attempt_key = f"order_{order.id}_attempt_1"
 
             # 7. Създаване на отделна пратка (Shipment) за всеки уникален продавач
-            unique_seller_ids = sorted({p.seller_id for p in locked_products})
+            unique_seller_ids = sorted(
+                {p.seller_id for p in remote_products if p.seller_id is not None}
+            )
             for s_id in unique_seller_ids:
                 shipment = Shipment(
                     order_id=order.id,
@@ -299,9 +307,19 @@ class OrderService:
                 )
                 self._order_repository.add_item(order_item)
 
-                # 9. Намаляване на наличността
-                product = products_by_id[p_id]
-                product.stock -= qty
+            # 9. Атомарно резервиране на наличността в Catalog през явния договор
+            items_to_reserve = [
+                {"product_id": p_id, "quantity": qty}
+                for (p_id, _, qty, _, _, _) in order_items_data
+            ]
+            try:
+                self._catalog_client.reserve_stock(
+                    order_id=order.id, items=items_to_reserve
+                )
+            except CatalogInsufficientStockError as exc:
+                raise InsufficientStock(exc.product_id)
+            except CatalogProductUnavailableError as exc:
+                raise CartProductUnavailable(exc.product_id)
 
             # 10. Изчистване на поръчаната количка
             self._cart_repository.clear_by_user_id(user_id)
@@ -473,23 +491,12 @@ class OrderService:
             raise
 
     def _restore_order_stock(self, order: Order) -> None:
-        """Възстановява запазените количества от позициите на поръчката в склада."""
-        product_quantities: dict[int, int] = {}
-        for item in order.items:
-            product_quantities[item.product_id] = (
-                product_quantities.get(item.product_id, 0) + item.quantity
-            )
-
-        sorted_product_ids = sorted(product_quantities.keys())
-        locked_products = self._product_repository.get_by_ids_for_update(
-            sorted_product_ids
-        )
-        products_by_id = {p.id: p for p in locked_products}
-
-        for pid, qty in product_quantities.items():
-            product = products_by_id.get(pid)
-            if product is not None:
-                product.stock += qty
+        """Възстановява запазените количества от позициите на поръчката в склада чрез Catalog."""
+        try:
+            self._catalog_client.release_stock(order.id)
+        except Exception as exc:
+            logger.error("Failed to release stock for order %s: %s", order.id, exc)
+            raise
 
     def _transition_order_to_paid(self, order: Order) -> None:
         """Превежда поръчката в статус paid и записва outbox събитие order.paid в същата транзакция.

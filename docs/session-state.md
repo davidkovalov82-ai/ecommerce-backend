@@ -1,15 +1,15 @@
 # Session State
 
-- **Текуща задача**: K6.1 — валидация на статус на продавачите през Users при `POST /orders`, изолация на миграцията в Compose.
+- **Текуща задача**: K6.2 — отделяне на Catalog в самостоятелен микросервис services/catalog на чист стенд.
 - **Реализирано**:
-  - `compose.e2e.yaml`: отделна еднократна задача `users-accounts-migration-e2e` (`restart: "no"`); рестартът на Users не повтаря миграцията и запазва промените в профилите.
-  - `OrderService.create_order`: статусът на продавачите се проверява единствено през `UsersClient.get_user_status`; неактивен/блокиран/непознат връща 409 `CART_PRODUCT_UNAVAILABLE`; недостъпен Users връща 503; при отказ няма създадена поръчка, остатъците и количката са непроменени; запазена идемпотентност.
-  - `scripts/users_e2e_verify.py` & `test_users_e2e.sh`: реални API тестове за блокиране на продавач (409), отблокиране и покупка (201), повторен идемпотентен опит (без повторно списване), количка с двама продавачи (единият блокиран -> отказ за целия чек-аут; след отблокиране -> 2 пратки) и запазване на профил при рестарт на Users.
+  - `services/catalog`: самостоятелен FastAPI сървис, PostgreSQL БД `catalog`, Alembic миграции, RabbitMQ consumer за потребителски събития (`users.events` -> `catalog.user_events`), атомно и идемпотентно управление на наличности (резервация и освобождаване).
+  - `services/commerce`: премахнати директни SQL връзки към Catalog; Cart и Orders комуникират през `CatalogClient`; запазени публични URL адреси; Orders пази исторически снимки (`title`, `price_minor`, `seller_id`).
+  - Миграция `k5f6a7b8c9d0`: премахнати foreign key ограничения към `products.id` от `cart_items` и `order_items`.
+  - Инфраструктура: добавени `catalog` и `catalog-user-consumer` в `compose.yaml` и `compose.e2e.yaml`, скрипт `scripts/catalog_e2e_verify.py` и команда `make test-catalog-e2e`.
 - **Проверено локално**:
-  - `make test-users-e2e`: успешно (всички сценарии за продавачи, блокиране, поръчки и рестарт);
-  - `make test-k4-e2e` & `make test-k5-e2e`: успешно;
-  - `commerce` pytest: 310 passed; `users` pytest: 57 passed; Ruff (check/format) чист.
+  - `make test-catalog-e2e`: успешно на чист стенд (1 наличност -> 2 купувача -> точно една 201, една 409, остатък 0, потвърдена идемпотентност и снимка в поръчката);
+  - `services/catalog` pytest: 3 passed; `services/commerce` pytest: 310 passed; `services/users` pytest: 57 passed; Ruff чист.
 - **Непроверено**: няма.
-- **Работещи команди**: `make test-users-e2e`, `make test-k4-e2e`, `make test-k5-e2e`, `uv run --locked pytest -q`.
-- **Засегнати файлове**: `scripts/users_e2e_verify.py`, `services/commerce/tests/integration/test_users_integration.py`, `docs/session-state.md`.
-- **Следваща стъпка**: Преглед от потребителя и commit.
+- **Работещи команди**: `make test-catalog-e2e`, `cd services/commerce && uv run --locked pytest -q`, `cd services/catalog && uv run pytest -q`.
+- **Засегнати файлове**: `services/catalog/*`, `services/commerce/*`, `compose.yaml`, `compose.e2e.yaml`, `scripts/*`, `Makefile`.
+- **Следваща стъпка**: Преглед и публикуване на промените от потребителя.

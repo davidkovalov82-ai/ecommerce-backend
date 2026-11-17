@@ -68,7 +68,7 @@ def test_orders_database_constraints(db_session: Session) -> None:
     persisted_order = db_session.get(Order, valid_order.id)
     assert persisted_order is not None
 
-    # 6. RESTRICT на изтриване на продукт с поръчки
+    # 6. След K6.2 няма блокиращ FK към products: поръчката пази снимка и логическо product_id
     order_item = OrderItem(
         order_id=valid_order.id,
         product_id=product.id,
@@ -80,7 +80,10 @@ def test_orders_database_constraints(db_session: Session) -> None:
     db_session.add(order_item)
     db_session.commit()
 
-    with pytest.raises(IntegrityError):
-        db_session.execute(text(f"DELETE FROM products WHERE id = {product.id}"))
-        db_session.commit()
-    db_session.rollback()
+    db_session.execute(text(f"DELETE FROM products WHERE id = {product.id}"))
+    db_session.commit()
+    persisted_item = (
+        db_session.query(OrderItem).filter(OrderItem.order_id == valid_order.id).first()
+    )
+    assert persisted_item is not None
+    assert persisted_item.product_title == product.title

@@ -51,6 +51,14 @@ from app.main import app
 from app.modules.accounts.dependencies import get_users_client
 from app.modules.accounts.models import User
 from app.modules.accounts.users_client import RemoteUserInfo, UsersClient
+from app.modules.catalog.client import (
+    CatalogClient,
+    CatalogInsufficientStockError,
+    CatalogProductUnavailableError,
+    RemoteProductInfo,
+)
+from app.modules.catalog.dependencies import get_catalog_client
+from app.modules.catalog.models import Product, SellerStatus
 
 settings.jwt_public_key = _test_public_pem
 settings.jwt_algorithm = "RS256"
@@ -731,9 +739,576 @@ class LocalTestUsersClient(UsersClient):
             )
 
 
+class LocalTestCatalogClient(CatalogClient):
+    """Тестов клиент за Catalog, изпълняващ операциите локално през тестовата сесия."""
+
+    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+        super().__init__(base_url="http://test-catalog", internal_token="test-token")
+        self.session_factory = session_factory
+        self._reservations: dict[int, list[dict[str, Any]]] = {}
+        self._released_orders: set[int] = set()
+
+    @contextmanager
+    def _get_session(self) -> Iterator[Session]:
+        with self.session_factory() as s:
+            yield s
+
+    def get_product(self, product_id: int) -> RemoteProductInfo | None:
+        with self._get_session() as session:
+            p = session.get(Product, product_id)
+            if p is None:
+                return None
+            seller_status = session.get(SellerStatus, p.seller_id)
+            is_active = (seller_status.status == "active") if seller_status else True
+            return RemoteProductInfo(
+                id=p.id,
+                seller_id=p.seller_id,
+                category_id=p.category_id,
+                title=p.title,
+                price_minor=p.price_minor,
+                currency=p.currency,
+                stock=p.stock,
+                active=p.active,
+                seller_active=is_active,
+            )
+
+    def get_products_batch(self, product_ids: list[int]) -> list[RemoteProductInfo]:
+        if not product_ids:
+            return []
+        with self._get_session() as session:
+            from sqlalchemy import select
+
+            products = session.scalars(
+                select(Product).where(Product.id.in_(product_ids))
+            ).all()
+            seller_ids = [p.seller_id for p in products]
+            statuses = {
+                s.seller_id: s.status
+                for s in session.scalars(
+                    select(SellerStatus).where(SellerStatus.seller_id.in_(seller_ids))
+                ).all()
+            }
+            return [
+                RemoteProductInfo(
+                    id=p.id,
+                    seller_id=p.seller_id,
+                    category_id=p.category_id,
+                    title=p.title,
+                    price_minor=p.price_minor,
+                    currency=p.currency,
+                    stock=p.stock,
+                    active=p.active,
+                    seller_active=(statuses.get(p.seller_id, "active") == "active"),
+                )
+                for p in products
+            ]
+
+    def reserve_stock(self, order_id: int, items: list[dict[str, int]]) -> None:
+        with self._get_session() as session:
+            if order_id in self._reservations:
+                return
+
+            sorted_ids = sorted({item["product_id"] for item in items})
+            from sqlalchemy import select
+
+            products = session.scalars(
+                select(Product)
+                .where(Product.id.in_(sorted_ids))
+                .order_by(Product.id.asc())
+                .with_for_update()
+            ).all()
+            products_by_id = {p.id: p for p in products}
+
+            for item in items:
+                p = products_by_id.get(item["product_id"])
+                if p is None or not p.active:
+                    raise CatalogProductUnavailableError(item["product_id"])
+                if p.stock < item["quantity"]:
+                    raise CatalogInsufficientStockError(item["product_id"])
+
+            for item in items:
+                p = products_by_id[item["product_id"]]
+                p.stock -= item["quantity"]
+
+            self._reservations[order_id] = [dict(item) for item in items]
+            session.commit()
+
+    def release_stock(self, order_id: int) -> None:
+        if order_id in self._released_orders:
+            return
+        self._released_orders.add(order_id)
+        reserved_items = self._reservations.pop(order_id, None)
+        with self._get_session() as session:
+            if reserved_items is not None:
+                for item in reserved_items:
+                    p = session.get(Product, item["product_id"])
+                    if p is not None:
+                        p.stock += item["quantity"]
+            else:
+                from app.modules.orders.models import OrderItem
+
+                items = (
+                    session.query(OrderItem)
+                    .filter(OrderItem.order_id == order_id)
+                    .all()
+                )
+                for item in items:
+                    p = session.get(Product, item.product_id)
+                    if p is not None:
+                        p.stock += item.quantity
+            session.commit()
+
+    def forward_request(
+        self,
+        method: str,
+        path: str,
+        content: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        import json
+
+        import httpx
+        from pydantic import ValidationError
+
+        from app.modules.accounts.tokens import (
+            InvalidToken,
+            TokenData,
+            decode_access_token,
+        )
+        from app.modules.catalog.repository import (
+            CategoryRepository,
+            ProductRepository,
+        )
+        from app.modules.catalog.schemas import (
+            CategoryCreateRequest,
+            CategoryUpdateRequest,
+            ProductCreateRequest,
+            ProductUpdateRequest,
+        )
+        from app.modules.catalog.service import (
+            CatalogService,
+            CategoryInUse,
+            CategoryNameAlreadyExists,
+            CategoryNotFound,
+            InvalidCategoryId,
+            ProductNotFound,
+        )
+
+        with self._get_session() as session:
+            cat_repo = CategoryRepository(session)
+            prod_repo = ProductRepository(session)
+            service = CatalogService(prod_repo, session, cat_repo)
+
+            def _get_auth_user() -> tuple[int, Any, dict[str, str]]:
+                auth = (headers or {}).get("authorization", "")
+                if not auth.startswith("Bearer "):
+                    return (
+                        401,
+                        {
+                            "detail": {
+                                "code": "AUTHENTICATION_REQUIRED",
+                                "message": "Authentication required",
+                            }
+                        },
+                        {"WWW-Authenticate": "Bearer"},
+                    )
+                token = auth[7:].strip()
+                try:
+                    td = decode_access_token(
+                        token,
+                        public_key=settings.get_public_key(),
+                        algorithm=settings.jwt_algorithm,
+                        issuer=settings.jwt_issuer,
+                        audience=settings.jwt_audience,
+                    )
+                except InvalidToken:
+                    return (
+                        401,
+                        {
+                            "detail": {
+                                "code": "INVALID_TOKEN",
+                                "message": "Invalid token",
+                            }
+                        },
+                        {"WWW-Authenticate": "Bearer"},
+                    )
+                from app.modules.accounts.dependencies import get_users_client
+
+                users_client_factory = app.dependency_overrides.get(get_users_client)
+                users_client = users_client_factory() if users_client_factory else None
+                if users_client is not None and hasattr(
+                    users_client, "get_user_status"
+                ):
+                    from app.modules.accounts.users_client import (
+                        UsersServiceUnavailableError,
+                    )
+
+                    try:
+                        u_status = users_client.get_user_status(td.user_id)
+                        if u_status is None:
+                            return (
+                                401,
+                                {
+                                    "detail": {
+                                        "code": "USER_NOT_FOUND",
+                                        "message": "User not found",
+                                    }
+                                },
+                                {"WWW-Authenticate": "Bearer"},
+                            )
+                        if u_status.role != td.role:
+                            td = TokenData(
+                                user_id=td.user_id,
+                                role=u_status.role,
+                                email=td.email,
+                                token_version=td.token_version,
+                            )
+                    except UsersServiceUnavailableError:
+                        pass
+                return 200, td, {}
+
+            body_json = json.loads(content) if content else {}
+            params = params or {}
+
+            # /categories
+            if path == "/categories" and method == "GET":
+                cats = service.list_categories()
+                return httpx.Response(
+                    200, json=[{"id": c.id, "name": c.name} for c in cats]
+                )
+
+            if path == "/categories" and method == "POST":
+                code, user_data, hdrs = _get_auth_user()
+                if code != 200:
+                    return httpx.Response(code, json=user_data, headers=hdrs)
+                if getattr(user_data, "role", "") != "admin":
+                    return httpx.Response(
+                        403,
+                        json={
+                            "detail": {
+                                "code": "FORBIDDEN",
+                                "message": "Admin privileges required",
+                            }
+                        },
+                    )
+                try:
+                    cat_req = CategoryCreateRequest.model_validate(body_json)
+                except ValidationError as exc:
+                    err_list = [
+                        {"msg": str(e.get("msg", "")), "loc": list(e.get("loc", []))}
+                        for e in exc.errors()
+                    ]
+                    return httpx.Response(422, json={"detail": err_list})
+                try:
+                    c = service.create_category(cat_req.name)
+                    return httpx.Response(201, json={"id": c.id, "name": c.name})
+                except CategoryNameAlreadyExists:
+                    return httpx.Response(
+                        409,
+                        json={
+                            "detail": {
+                                "code": "CATEGORY_NAME_EXISTS",
+                                "message": "Already exists",
+                            }
+                        },
+                    )
+
+            if path.startswith("/categories/") and method == "PATCH":
+                code, user_data, hdrs = _get_auth_user()
+                if code != 200:
+                    return httpx.Response(code, json=user_data, headers=hdrs)
+                if getattr(user_data, "role", "") != "admin":
+                    return httpx.Response(
+                        403,
+                        json={
+                            "detail": {
+                                "code": "FORBIDDEN",
+                                "message": "Admin privileges required",
+                            }
+                        },
+                    )
+                try:
+                    cat_patch = CategoryUpdateRequest.model_validate(body_json)
+                except ValidationError as exc:
+                    err_list = [
+                        {"msg": str(e.get("msg", "")), "loc": list(e.get("loc", []))}
+                        for e in exc.errors()
+                    ]
+                    return httpx.Response(422, json={"detail": err_list})
+                cat_id = int(path.split("/")[-1])
+                try:
+                    c = service.update_category(cat_id, cat_patch.name)
+                    return httpx.Response(200, json={"id": c.id, "name": c.name})
+                except CategoryNotFound:
+                    return httpx.Response(
+                        404,
+                        json={
+                            "detail": {
+                                "code": "CATEGORY_NOT_FOUND",
+                                "message": "Not found",
+                            }
+                        },
+                    )
+                except CategoryNameAlreadyExists:
+                    return httpx.Response(
+                        409,
+                        json={
+                            "detail": {
+                                "code": "CATEGORY_NAME_EXISTS",
+                                "message": "Already exists",
+                            }
+                        },
+                    )
+
+            if path.startswith("/categories/") and method == "DELETE":
+                code, user_data, hdrs = _get_auth_user()
+                if code != 200:
+                    return httpx.Response(code, json=user_data, headers=hdrs)
+                if getattr(user_data, "role", "") != "admin":
+                    return httpx.Response(
+                        403,
+                        json={
+                            "detail": {
+                                "code": "FORBIDDEN",
+                                "message": "Admin privileges required",
+                            }
+                        },
+                    )
+                cat_id = int(path.split("/")[-1])
+                try:
+                    service.delete_category(cat_id)
+                    return httpx.Response(204)
+                except CategoryNotFound:
+                    return httpx.Response(
+                        404,
+                        json={
+                            "detail": {
+                                "code": "CATEGORY_NOT_FOUND",
+                                "message": "Not found",
+                            }
+                        },
+                    )
+                except CategoryInUse:
+                    return httpx.Response(
+                        409,
+                        json={
+                            "detail": {
+                                "code": "CATEGORY_IN_USE",
+                                "message": "In use",
+                            }
+                        },
+                    )
+
+            # /products
+            if path == "/products" and method == "GET":
+                try:
+                    limit = int(params.get("limit", 20))
+                    offset = int(params.get("offset", 0))
+                    if limit < 1 or limit > 100 or offset < 0:
+                        raise ValueError("Out of bounds")
+                except (ValueError, TypeError):
+                    return httpx.Response(
+                        422,
+                        json={
+                            "detail": [{"loc": ["query"], "msg": "Invalid pagination"}]
+                        },
+                    )
+                cat_id = (
+                    int(params["category_id"])
+                    if "category_id" in params and params["category_id"] is not None
+                    else None
+                )
+                items = service.list_active_products(
+                    limit=limit, offset=offset, category_id=cat_id
+                )
+                return httpx.Response(
+                    200,
+                    json={
+                        "items": [
+                            {
+                                "id": p.id,
+                                "seller_id": p.seller_id,
+                                "category_id": p.category_id,
+                                "title": p.title,
+                                "price_minor": p.price_minor,
+                                "currency": p.currency,
+                                "stock": p.stock,
+                                "active": p.active,
+                            }
+                            for p in items
+                        ],
+                        "limit": limit,
+                        "offset": offset,
+                    },
+                )
+
+            if path == "/products" and method == "POST":
+                code, user_data, hdrs = _get_auth_user()
+                if code != 200:
+                    return httpx.Response(code, json=user_data, headers=hdrs)
+                try:
+                    prod_req = ProductCreateRequest.model_validate(body_json)
+                except ValidationError as exc:
+                    err_list = [
+                        {"msg": str(e.get("msg", "")), "loc": list(e.get("loc", []))}
+                        for e in exc.errors()
+                    ]
+                    return httpx.Response(422, json={"detail": err_list})
+                try:
+                    p = service.create_product(
+                        seller_id=user_data.user_id,
+                        title=prod_req.title,
+                        price_minor=prod_req.price_minor,
+                        currency=prod_req.currency,
+                        stock=prod_req.stock,
+                        active=prod_req.active,
+                        category_id=prod_req.category_id,
+                    )
+                    return httpx.Response(
+                        201,
+                        json={
+                            "id": p.id,
+                            "seller_id": p.seller_id,
+                            "category_id": p.category_id,
+                            "title": p.title,
+                            "price_minor": p.price_minor,
+                            "currency": p.currency,
+                            "stock": p.stock,
+                            "active": p.active,
+                        },
+                    )
+                except InvalidCategoryId:
+                    return httpx.Response(
+                        422,
+                        json={
+                            "detail": {
+                                "code": "INVALID_CATEGORY",
+                                "message": "Category not found",
+                            }
+                        },
+                    )
+
+            if path.startswith("/products/") and method == "GET":
+                prod_id = int(path.split("/")[-1])
+                try:
+                    p = service.get_product_by_id(prod_id)
+                    return httpx.Response(
+                        200,
+                        json={
+                            "id": p.id,
+                            "seller_id": p.seller_id,
+                            "category_id": p.category_id,
+                            "title": p.title,
+                            "price_minor": p.price_minor,
+                            "currency": p.currency,
+                            "stock": p.stock,
+                            "active": p.active,
+                        },
+                    )
+                except ProductNotFound:
+                    return httpx.Response(
+                        404,
+                        json={
+                            "detail": {
+                                "code": "PRODUCT_NOT_FOUND",
+                                "message": "Product not found",
+                            }
+                        },
+                    )
+
+            if path.startswith("/products/") and method == "PATCH":
+                code, user_data, hdrs = _get_auth_user()
+                if code != 200:
+                    return httpx.Response(code, json=user_data, headers=hdrs)
+                try:
+                    prod_patch = ProductUpdateRequest.model_validate(body_json)
+                except ValidationError as exc:
+                    err_list = [
+                        {"msg": str(e.get("msg", "")), "loc": list(e.get("loc", []))}
+                        for e in exc.errors()
+                    ]
+                    return httpx.Response(422, json={"detail": err_list})
+                prod_id = int(path.split("/")[-1])
+                patch_dict = prod_patch.model_dump(exclude_unset=True)
+                try:
+                    p = service.update_product(
+                        product_id=prod_id,
+                        seller_id=user_data.user_id,
+                        update_data=patch_dict,
+                    )
+                    return httpx.Response(
+                        200,
+                        json={
+                            "id": p.id,
+                            "seller_id": p.seller_id,
+                            "category_id": p.category_id,
+                            "title": p.title,
+                            "price_minor": p.price_minor,
+                            "currency": p.currency,
+                            "stock": p.stock,
+                            "active": p.active,
+                        },
+                    )
+                except ProductNotFound:
+                    return httpx.Response(
+                        404,
+                        json={
+                            "detail": {
+                                "code": "PRODUCT_NOT_FOUND",
+                                "message": "Product not found",
+                            }
+                        },
+                    )
+                except InvalidCategoryId:
+                    return httpx.Response(
+                        422,
+                        json={
+                            "detail": {
+                                "code": "INVALID_CATEGORY",
+                                "message": "Category not found",
+                            }
+                        },
+                    )
+
+            if path == "/users/me/products" and method == "GET":
+                code, user_data, hdrs = _get_auth_user()
+                if code != 200:
+                    return httpx.Response(code, json=user_data, headers=hdrs)
+                limit = int(params.get("limit", 20))
+                offset = int(params.get("offset", 0))
+                items = service.list_products_by_seller(
+                    seller_id=user_data.user_id, limit=limit, offset=offset
+                )
+                return httpx.Response(
+                    200,
+                    json={
+                        "items": [
+                            {
+                                "id": p.id,
+                                "seller_id": p.seller_id,
+                                "category_id": p.category_id,
+                                "title": p.title,
+                                "price_minor": p.price_minor,
+                                "currency": p.currency,
+                                "stock": p.stock,
+                                "active": p.active,
+                            }
+                            for p in items
+                        ],
+                        "limit": limit,
+                        "offset": offset,
+                    },
+                )
+
+            return httpx.Response(
+                404, json={"detail": {"code": "NOT_FOUND", "message": "Not found"}}
+            )
+
+
 @pytest.fixture(autouse=True)
 def override_db_dependency() -> Generator[None]:
-    """Пренасочва FastAPI зависимостта get_db_session и get_users_client към commerce_test за всички тестове."""
+    """Пренасочва FastAPI зависимостта get_db_session, get_users_client и get_catalog_client към commerce_test за всички тестове."""
 
     def _get_test_db() -> Generator[Session]:
         with TestingSessionLocal() as session:
@@ -743,6 +1318,10 @@ def override_db_dependency() -> Generator[None]:
     app.dependency_overrides[get_users_client] = lambda: LocalTestUsersClient(
         TestingSessionLocal
     )
+    app.dependency_overrides[get_catalog_client] = lambda: LocalTestCatalogClient(
+        TestingSessionLocal
+    )
     yield
     app.dependency_overrides.pop(get_db_session, None)
     app.dependency_overrides.pop(get_users_client, None)
+    app.dependency_overrides.pop(get_catalog_client, None)

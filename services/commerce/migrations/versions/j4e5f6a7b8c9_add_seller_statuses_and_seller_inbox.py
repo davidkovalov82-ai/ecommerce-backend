@@ -23,7 +23,9 @@ def upgrade() -> None:
     op.create_table(
         "seller_statuses",
         sa.Column("seller_id", sa.Integer(), primary_key=True, autoincrement=False),
-        sa.Column("status", sa.String(length=32), nullable=False, server_default="active"),
+        sa.Column(
+            "status", sa.String(length=32), nullable=False, server_default="active"
+        ),
         sa.Column(
             "updated_at",
             sa.DateTime(timezone=True),
@@ -73,4 +75,3 @@ def downgrade() -> None:
     """Премахва seller_inbox_events и seller_statuses."""
     op.drop_table("seller_inbox_events")
     op.drop_table("seller_statuses")
-

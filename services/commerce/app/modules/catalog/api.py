@@ -1,35 +1,81 @@
-from fastapi import APIRouter, HTTPException, Query, status
+"""HTTP обработчици за публични маршрути на Catalog в Commerce.
 
-from app.modules.accounts.dependencies import AdminUserDep, CurrentUserDep
-from app.modules.catalog.dependencies import CatalogServiceDep
+След K6.2 микросервисът Catalog е единствен собственик на стоки, категории,
+цените, остатъците и видимостта. Commerce запазва публичните си URL адреси
+и проксира заявките към Catalog.
+"""
+
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+
+from app.modules.catalog.client import (
+    CatalogClient,
+    CatalogServiceUnavailableError,
+)
+from app.modules.catalog.dependencies import get_catalog_client
 from app.modules.catalog.schemas import (
-    CategoryCreateRequest,
     CategoryResponse,
-    CategoryUpdateRequest,
-    ProductCreateRequest,
     ProductListResponse,
     ProductResponse,
-    ProductUpdateRequest,
-)
-from app.modules.catalog.service import (
-    CategoryInUse,
-    CategoryNameAlreadyExists,
-    CategoryNotFound,
-    InvalidCategoryId,
-    ProductNotFound,
 )
 
 categories_router = APIRouter(prefix="/categories", tags=["categories"])
 router = APIRouter(prefix="/products", tags=["catalog"])
 
 
+async def _forward(
+    request: Request,
+    path: str,
+    method: str,
+    catalog_client: CatalogClient,
+    body: bytes | None = None,
+) -> Response:
+    """Пренасочва публична заявка към самостоятелния Catalog микросервис."""
+    headers = dict(request.headers)
+    client_ip = request.client.host if request.client else None
+    if client_ip:
+        headers["x-forwarded-for"] = client_ip
+
+    try:
+        resp = catalog_client.forward_request(
+            method=method,
+            path=path,
+            content=body,
+            headers=headers,
+            params=dict(request.query_params),
+        )
+    except CatalogServiceUnavailableError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "SERVICE_UNAVAILABLE",
+                "message": "Catalog service is unavailable",
+            },
+        )
+
+    # Премахваме content-length за избягване на конфликти при стрийминг
+    resp_headers = dict(resp.headers)
+    resp_headers.pop("content-length", None)
+    resp_headers.pop("transfer-encoding", None)
+
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers=resp_headers,
+        media_type=resp.headers.get("content-type"),
+    )
+
+
+# --- Категории ---
+
+
 @categories_router.get("", response_model=list[CategoryResponse])
-def list_categories(
-    catalog_service: CatalogServiceDep,
-) -> list[CategoryResponse]:
-    """HTTP обработчик за получаване на публичен списък с категории със стабилна сортировка."""
-    categories = catalog_service.list_categories()
-    return [CategoryResponse.model_validate(c) for c in categories]
+async def list_categories(
+    request: Request,
+    catalog_client: Annotated[CatalogClient, Depends(get_catalog_client)],
+) -> Response:
+    return await _forward(request, "/categories", "GET", catalog_client)
 
 
 @categories_router.post(
@@ -37,159 +83,73 @@ def list_categories(
     response_model=CategoryResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def create_category(
-    data: CategoryCreateRequest,
-    catalog_service: CatalogServiceDep,
-    admin_user: AdminUserDep,
-) -> CategoryResponse:
-    """HTTP обработчик за създаване на нова категория (само за администратори)."""
-    try:
-        category = catalog_service.create_category(name=data.name)
-        return CategoryResponse.model_validate(category)
-    except CategoryNameAlreadyExists:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": "CATEGORY_NAME_EXISTS",
-                "message": "Category with this name already exists",
-            },
-        )
+async def create_category(
+    request: Request,
+    catalog_client: Annotated[CatalogClient, Depends(get_catalog_client)],
+) -> Response:
+    body = await request.body()
+    return await _forward(request, "/categories", "POST", catalog_client, body=body)
 
 
 @categories_router.patch("/{category_id}", response_model=CategoryResponse)
-def update_category(
+async def update_category(
     category_id: int,
-    data: CategoryUpdateRequest,
-    catalog_service: CatalogServiceDep,
-    admin_user: AdminUserDep,
-) -> CategoryResponse:
-    """HTTP обработчик за преименуване на категория (само за администратори)."""
-    try:
-        category = catalog_service.update_category(
-            category_id=category_id, name=data.name
-        )
-        return CategoryResponse.model_validate(category)
-    except CategoryNotFound:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"code": "CATEGORY_NOT_FOUND", "message": "Category not found"},
-        )
-    except CategoryNameAlreadyExists:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": "CATEGORY_NAME_EXISTS",
-                "message": "Category with this name already exists",
-            },
-        )
+    request: Request,
+    catalog_client: Annotated[CatalogClient, Depends(get_catalog_client)],
+) -> Response:
+    body = await request.body()
+    return await _forward(
+        request, f"/categories/{category_id}", "PATCH", catalog_client, body=body
+    )
 
 
 @categories_router.delete("/{category_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_category(
+async def delete_category(
     category_id: int,
-    catalog_service: CatalogServiceDep,
-    admin_user: AdminUserDep,
-) -> None:
-    """HTTP обработчик за изтриване на категория без продукти (само за администратори)."""
-    try:
-        catalog_service.delete_category(category_id=category_id)
-    except CategoryNotFound:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"code": "CATEGORY_NOT_FOUND", "message": "Category not found"},
-        )
-    except CategoryInUse:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": "CATEGORY_IN_USE",
-                "message": "Category cannot be deleted because it is assigned to products",
-            },
-        )
+    request: Request,
+    catalog_client: Annotated[CatalogClient, Depends(get_catalog_client)],
+) -> Response:
+    return await _forward(
+        request, f"/categories/{category_id}", "DELETE", catalog_client
+    )
+
+
+# --- Продукти ---
 
 
 @router.post("", response_model=ProductResponse, status_code=status.HTTP_201_CREATED)
-def create_product(
-    data: ProductCreateRequest,
-    catalog_service: CatalogServiceDep,
-    current_user: CurrentUserDep,
-) -> ProductResponse:
-    """HTTP обработчик за създаване на нов продукт от автентикиран потребител."""
-    try:
-        product = catalog_service.create_product(
-            seller_id=current_user.id,
-            title=data.title,
-            price_minor=data.price_minor,
-            currency=data.currency,
-            stock=data.stock,
-            active=data.active,
-            category_id=data.category_id,
-        )
-        return ProductResponse.model_validate(product)
-    except InvalidCategoryId:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"code": "INVALID_CATEGORY", "message": "Category not found"},
-        )
+async def create_product(
+    request: Request,
+    catalog_client: Annotated[CatalogClient, Depends(get_catalog_client)],
+) -> Response:
+    body = await request.body()
+    return await _forward(request, "/products", "POST", catalog_client, body=body)
 
 
 @router.patch("/{product_id}", response_model=ProductResponse)
-def update_product(
+async def update_product(
     product_id: int,
-    data: ProductUpdateRequest,
-    catalog_service: CatalogServiceDep,
-    current_user: CurrentUserDep,
-) -> ProductResponse:
-    """HTTP обработчик за частично обновяване на собствен продукт (само за собственика)."""
-    update_data = data.model_dump(exclude_unset=True)
-    try:
-        product = catalog_service.update_product(
-            product_id=product_id,
-            seller_id=current_user.id,
-            update_data=update_data,
-        )
-        return ProductResponse.model_validate(product)
-    except ProductNotFound:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"code": "PRODUCT_NOT_FOUND", "message": "Product not found"},
-        )
-    except InvalidCategoryId:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"code": "INVALID_CATEGORY", "message": "Category not found"},
-        )
+    request: Request,
+    catalog_client: Annotated[CatalogClient, Depends(get_catalog_client)],
+) -> Response:
+    body = await request.body()
+    return await _forward(
+        request, f"/products/{product_id}", "PATCH", catalog_client, body=body
+    )
 
 
 @router.get("", response_model=ProductListResponse)
-def list_products(
-    catalog_service: CatalogServiceDep,
-    limit: int = Query(default=20, ge=1, le=100),
-    offset: int = Query(default=0, ge=0),
-    category_id: int | None = Query(default=None),
-) -> ProductListResponse:
-    """HTTP обработчик за получаване на публичен списък с активни продукти."""
-    products = catalog_service.list_active_products(
-        limit=limit, offset=offset, category_id=category_id
-    )
-    return ProductListResponse(
-        items=[ProductResponse.model_validate(p) for p in products],
-        limit=limit,
-        offset=offset,
-    )
+async def list_products(
+    request: Request,
+    catalog_client: Annotated[CatalogClient, Depends(get_catalog_client)],
+) -> Response:
+    return await _forward(request, "/products", "GET", catalog_client)
 
 
 @router.get("/{product_id}", response_model=ProductResponse)
-def get_product(
+async def get_product(
     product_id: int,
-    catalog_service: CatalogServiceDep,
-) -> ProductResponse:
-    """HTTP обработчик за получаване на продукт по ID от базата данни (само активни)."""
-    try:
-        product = catalog_service.get_product_by_id(product_id)
-        return ProductResponse.model_validate(product)
-    except ProductNotFound:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"code": "PRODUCT_NOT_FOUND", "message": "Product not found"},
-        )
+    request: Request,
+    catalog_client: Annotated[CatalogClient, Depends(get_catalog_client)],
+) -> Response:
+    return await _forward(request, f"/products/{product_id}", "GET", catalog_client)

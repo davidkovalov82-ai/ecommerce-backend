@@ -7,7 +7,11 @@ from app.modules.accounts.dependencies import get_users_client
 from app.modules.accounts.users_client import UsersClient
 from app.modules.cart.dependencies import get_cart_repository
 from app.modules.cart.repository import CartRepository
-from app.modules.catalog.dependencies import get_product_repository
+from app.modules.catalog.client import CatalogClient
+from app.modules.catalog.dependencies import (
+    get_catalog_client,
+    get_product_repository,
+)
 from app.modules.catalog.repository import ProductRepository
 from app.modules.orders.payments_client import HttpPaymentsClient, PaymentsClient
 from app.modules.orders.repository import OrderRepository
@@ -31,8 +35,9 @@ def get_order_service(
     product_repository: Annotated[ProductRepository, Depends(get_product_repository)],
     payments_client: Annotated[PaymentsClient, Depends(get_payments_client)],
     users_client: Annotated[UsersClient, Depends(get_users_client)],
+    catalog_client: Annotated[CatalogClient, Depends(get_catalog_client)],
 ) -> OrderService:
-    """Фабрика за OrderService, осигуряваща споделена сесия за всички участващи хранилища."""
+    """Фабрика за OrderService."""
     return OrderService(
         order_repository=order_repository,
         cart_repository=cart_repository,
@@ -40,6 +45,7 @@ def get_order_service(
         session=session,
         payments_client=payments_client,
         users_client=users_client,
+        catalog_client=catalog_client,
     )
 
 

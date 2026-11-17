@@ -1,3 +1,4 @@
+import os
 import uuid
 
 from sqlalchemy.orm import Session
@@ -36,7 +37,13 @@ def _create_user_and_token(
     db_session.add(user)
     db_session.commit()
     db_session.refresh(user)
-    token = create_access_token(user_id=user.id, secret=settings.jwt_secret)
+    token = create_access_token(
+        user_id=user.id,
+        role=role,
+        email=email,
+        secret=settings.jwt_secret,
+        private_key=os.environ.get("JWT_PRIVATE_KEY"),
+    )
     return user, token
 
 

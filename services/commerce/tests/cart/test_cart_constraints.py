@@ -85,11 +85,9 @@ def test_cart_database_constraints(db_session: Session) -> None:
         db_session.commit()
     db_session.rollback()
 
-    # 5. FK RESTRICT: опит за изтриване на продукт, който е в количка, бива отхвърлен
-    with pytest.raises(IntegrityError):
-        db_session.execute(text(f"DELETE FROM products WHERE id = {product.id}"))
-        db_session.commit()
-    db_session.rollback()
+    # 5. След K6.2 няма блокиращ FK към products: cart_items се пазят по логически product_id
+    db_session.execute(text(f"DELETE FROM products WHERE id = {product.id}"))
+    db_session.commit()
 
     # 6. След K6.1 няма блокиращ FK към users: cart_items се пазят по логически user_id
     db_session.execute(text(f"DELETE FROM users WHERE id = {user.id}"))

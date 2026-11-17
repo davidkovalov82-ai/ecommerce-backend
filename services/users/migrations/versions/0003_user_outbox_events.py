@@ -63,4 +63,3 @@ def downgrade() -> None:
     op.drop_index("ix_user_outbox_events_user_id", table_name="user_outbox_events")
     op.drop_index("ix_user_outbox_events_event_type", table_name="user_outbox_events")
     op.drop_table("user_outbox_events")
-

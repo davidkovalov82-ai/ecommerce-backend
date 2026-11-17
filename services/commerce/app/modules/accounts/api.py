@@ -9,10 +9,9 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from app.modules.accounts.dependencies import (
-    CurrentUserDep,
     get_users_client,
 )
 from app.modules.accounts.schemas import (
@@ -32,8 +31,12 @@ from app.modules.accounts.users_client import (
     UsersClient,
     UsersServiceUnavailableError,
 )
-from app.modules.catalog.dependencies import CatalogServiceDep
-from app.modules.catalog.schemas import ProductListResponse, ProductResponse
+from app.modules.catalog.client import (
+    CatalogClient,
+    CatalogServiceUnavailableError,
+)
+from app.modules.catalog.dependencies import get_catalog_client
+from app.modules.catalog.schemas import ProductListResponse
 
 router = APIRouter(prefix="/users", tags=["accounts"])
 auth_router = APIRouter(prefix="/auth", tags=["auth"])
@@ -202,22 +205,41 @@ async def change_password(
 
 
 @router.get("/me/products", response_model=ProductListResponse)
-def get_my_products(
-    current_user: CurrentUserDep,
-    catalog_service: CatalogServiceDep,
-    limit: int = Query(default=20, ge=1, le=100),
-    offset: int = Query(default=0, ge=0),
-) -> ProductListResponse:
-    """Извличане на собствените продукти на продавача (управлява се от Catalog в Commerce)."""
-    products = catalog_service.list_products_by_seller(
-        seller_id=current_user.id,
-        limit=limit,
-        offset=offset,
-    )
-    return ProductListResponse(
-        items=[ProductResponse.model_validate(p) for p in products],
-        limit=limit,
-        offset=offset,
+async def get_my_products(
+    request: Request,
+    catalog_client: Annotated[CatalogClient, Depends(get_catalog_client)],
+) -> Response:
+    """Извличане на собствените продукти на продавача (проксира се към Catalog)."""
+    headers = dict(request.headers)
+    client_ip = request.client.host if request.client else None
+    if client_ip:
+        headers["x-forwarded-for"] = client_ip
+
+    try:
+        resp = catalog_client.forward_request(
+            method="GET",
+            path="/users/me/products",
+            headers=headers,
+            params=dict(request.query_params),
+        )
+    except CatalogServiceUnavailableError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "SERVICE_UNAVAILABLE",
+                "message": "Catalog service is unavailable",
+            },
+        )
+
+    resp_headers = dict(resp.headers)
+    resp_headers.pop("content-length", None)
+    resp_headers.pop("transfer-encoding", None)
+
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers=resp_headers,
+        media_type=resp.headers.get("content-type"),
     )
 
 
