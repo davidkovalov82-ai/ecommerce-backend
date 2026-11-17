@@ -2,6 +2,7 @@ import datetime
 import logging
 import uuid
 from collections.abc import Sequence
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -12,7 +13,8 @@ from app.modules.accounts.users_client import (
     UsersClient,
     UsersServiceUnavailableError,
 )
-from app.modules.cart.repository import CartRepository
+from app.modules.cart.client import CartClient
+from app.modules.cart.dependencies import resolve_cart_client
 from app.modules.catalog.client import (
     CatalogClient,
     CatalogInsufficientStockError,
@@ -108,16 +110,16 @@ class OrderService:
     def __init__(
         self,
         order_repository: OrderRepository,
-        cart_repository: CartRepository,
+        cart_repository: Any = None,
         product_repository: ProductRepository | None = None,
         user_repository: UserRepository | None = None,
         session: Session | None = None,
         payments_client: PaymentsClient | None = None,
         users_client: UsersClient | None = None,
         catalog_client: CatalogClient | None = None,
+        cart_client: CartClient | None = None,
     ) -> None:
         self._order_repository = order_repository
-        self._cart_repository = cart_repository
         self._product_repository = product_repository
         self._user_repository = user_repository or (
             UserRepository(session) if session is not None else None
@@ -126,6 +128,12 @@ class OrderService:
         self._payments_client = payments_client or HttpPaymentsClient()
         self._users_client = users_client or UsersClient()
         self._catalog_client = resolve_catalog_client(catalog_client)
+        if isinstance(cart_repository, CartClient):
+            self._cart_client = cart_repository
+        elif cart_client is not None:
+            self._cart_client = cart_client
+        else:
+            self._cart_client = resolve_cart_client()
 
     def create_order(
         self,
@@ -187,10 +195,12 @@ class OrderService:
                     )
                 return existing_order
 
-            # 3. Прочитане на текущата количка
-            cart_items = self._cart_repository.list_by_user_id(user_id)
-            if not cart_items:
+            # 3. Прочитане на текущата количка през вътрешния API на Cart
+            remote_cart = self._cart_client.get_cart(user_id)
+            if not remote_cart.items:
                 raise CartEmpty("Shopping cart is empty")
+
+            cart_items = remote_cart.items
 
             # 4. Извличане на продуктите през Catalog договора
             product_ids = [item.product_id for item in cart_items]
@@ -321,8 +331,9 @@ class OrderService:
             except CatalogProductUnavailableError as exc:
                 raise CartProductUnavailable(exc.product_id)
 
-            # 10. Изчистване на поръчаната количка
-            self._cart_repository.clear_by_user_id(user_id)
+            # 10. Изчистване на поръчаните позиции през Cart договора
+            purchased_product_ids = [item.product_id for item in cart_items]
+            self._cart_client.clear_purchased(user_id, purchased_product_ids)
 
             # 11. Записване на транзакцията
             self._session.flush()

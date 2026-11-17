@@ -1,60 +1,88 @@
-from fastapi import APIRouter, HTTPException, status
+"""HTTP обработчици за публични маршрути на Cart в Commerce.
 
-from app.modules.accounts.dependencies import CurrentUserDep
-from app.modules.cart.dependencies import CartServiceDep
-from app.modules.cart.schemas import CartItemUpdateRequest, CartResponse
-from app.modules.cart.service import InsufficientStock
-from app.modules.catalog.service import ProductNotFound
+След K6.3 микросервисът Cart е самостоятелен собственик на потребителските
+колички. Commerce запазва публичните си маршрути (/cart, /cart/items/{product_id})
+и проксира заявките към Cart.
+"""
+
+from fastapi import APIRouter, HTTPException, Request, Response, status
+
+from app.modules.cart.client import CartClient, CartServiceUnavailableError
+from app.modules.cart.dependencies import CartClientDep
+from app.modules.cart.schemas import CartResponse
 
 router = APIRouter(prefix="/cart", tags=["cart"])
 
 
-@router.get("", response_model=CartResponse)
-def get_cart(
-    current_user: CurrentUserDep,
-    cart_service: CartServiceDep,
-) -> CartResponse:
-    """HTTP обработчик за получаване на текущата количка на автентикирания потребител."""
-    return cart_service.get_cart(user_id=current_user.id)
+async def _forward(
+    request: Request,
+    path: str,
+    method: str,
+    cart_client: CartClient,
+    body: bytes | None = None,
+) -> Response:
+    """Пренасочва публична заявка към самостоятелния Cart микросервис."""
+    headers = dict(request.headers)
+    client_ip = request.client.host if request.client else None
+    if client_ip:
+        headers["x-forwarded-for"] = client_ip
 
-
-@router.put("/items/{product_id}", response_model=CartResponse)
-def update_cart_item(
-    product_id: int,
-    data: CartItemUpdateRequest,
-    current_user: CurrentUserDep,
-    cart_service: CartServiceDep,
-) -> CartResponse:
-    """HTTP обработчик за задаване на точно количество на продукт в количката."""
     try:
-        return cart_service.set_item_quantity(
-            user_id=current_user.id,
-            product_id=product_id,
-            quantity=data.quantity,
+        resp = cart_client.forward_request(
+            method=method,
+            path=path,
+            content=body,
+            headers=headers,
+            params=dict(request.query_params),
         )
-    except ProductNotFound:
+    except CartServiceUnavailableError:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"code": "PRODUCT_NOT_FOUND", "message": "Product not found"},
-        )
-    except InsufficientStock:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
-                "code": "INSUFFICIENT_STOCK",
-                "message": "Insufficient stock for requested quantity",
+                "code": "SERVICE_UNAVAILABLE",
+                "message": "Cart service is unavailable",
             },
         )
 
+    resp_headers = dict(resp.headers)
+    resp_headers.pop("content-length", None)
+    resp_headers.pop("transfer-encoding", None)
+
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers=resp_headers,
+        media_type=resp.headers.get("content-type"),
+    )
+
+
+@router.get("", response_model=CartResponse)
+async def get_cart(
+    request: Request,
+    cart_client: CartClientDep,
+) -> Response:
+    """Извличане на потребителската количка (прокси към Cart)."""
+    return await _forward(request, "/cart", "GET", cart_client)
+
+
+@router.put("/items/{product_id}", response_model=CartResponse)
+async def update_cart_item(
+    product_id: int,
+    request: Request,
+    cart_client: CartClientDep,
+) -> Response:
+    """Задаване на количество за продукт в количката (прокси към Cart)."""
+    body = await request.body()
+    return await _forward(
+        request, f"/cart/items/{product_id}", "PUT", cart_client, body=body
+    )
+
 
 @router.delete("/items/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
-def remove_cart_item(
+async def remove_cart_item(
     product_id: int,
-    current_user: CurrentUserDep,
-    cart_service: CartServiceDep,
-) -> None:
-    """HTTP обработчик за премахване на продукт от количката на потребителя."""
-    cart_service.remove_item(
-        user_id=current_user.id,
-        product_id=product_id,
-    )
+    request: Request,
+    cart_client: CartClientDep,
+) -> Response:
+    """Премахване на продукт от количката (прокси към Cart)."""
+    return await _forward(request, f"/cart/items/{product_id}", "DELETE", cart_client)

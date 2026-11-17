@@ -1,7 +1,6 @@
 """Тестове за основните сценарии на Catalog микросервиса."""
 
 from fastapi.testclient import TestClient
-
 from tests.conftest import make_auth_headers
 
 INTERNAL_HEADERS = {"X-Internal-Token": "ecommerce-catalog-internal-secret"}
@@ -181,3 +180,26 @@ def test_internal_stock_reserve_and_release_idempotency(client: TestClient) -> N
     assert resp_rel_idem.status_code == 200
     resp = client.get(f"/products/{prod_id}")
     assert resp.json()["stock"] == 1  # Остава точно 1!
+
+
+def test_auth_headers_without_jwt_returns_401(client: TestClient) -> None:
+    """Заявки с фалшиви заглавки X-User-Id/X-User-Role без валиден JWT връщат 401."""
+    # 1. Опит за създаване на продукт само с X-User-Id
+    resp = client.post(
+        "/products",
+        json={
+            "title": "Hacked Product",
+            "price_minor": 100,
+            "currency": "EUR",
+            "stock": 1,
+            "active": True,
+        },
+        headers={"X-User-Id": "1", "X-User-Role": "admin"},
+    )
+    assert resp.status_code == 401
+    assert resp.json()["detail"]["code"] == "AUTHENTICATION_REQUIRED"
+
+    # 2. Опит за преглед на продавачески продукти само с X-User-Id
+    resp = client.get("/users/me/products", headers={"X-User-Id": "1"})
+    assert resp.status_code == 401
+    assert resp.json()["detail"]["code"] == "AUTHENTICATION_REQUIRED"

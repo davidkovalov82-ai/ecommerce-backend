@@ -80,34 +80,27 @@ CatalogServiceDep = Annotated[CatalogService, Depends(get_catalog_service)]
 
 def get_current_user(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(oauth2_scheme)],
-    x_user_id: Annotated[str | None, Header(alias="X-User-Id")] = None,
-    x_user_role: Annotated[str | None, Header(alias="X-User-Role")] = None,
 ) -> TokenData:
-    """Извлича и верифицира потребителя по Bearer токен или доверени заглавки."""
-    if credentials is not None:
-        try:
-            return decode_access_token(credentials.credentials)
-        except InvalidToken as exc:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail={"code": "INVALID_TOKEN", "message": str(exc)},
-            ) from exc
+    """Извлича и верифицира потребителя по Bearer токен (RS256 JWT от Users).
 
-    if x_user_id:
-        try:
-            uid = int(x_user_id)
-            role = x_user_role or "customer"
-            return TokenData(user_id=uid, role=role, email="", token_version=0)
-        except ValueError:
-            pass
+    Заявки с фалшиви заглавки X-User-Id/X-User-Role без валиден JWT връщат 401.
+    """
+    if credentials is None or not credentials.credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "AUTHENTICATION_REQUIRED",
+                "message": "Authentication required",
+            },
+        )
 
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail={
-            "code": "AUTHENTICATION_REQUIRED",
-            "message": "Authentication required",
-        },
-    )
+    try:
+        return decode_access_token(credentials.credentials)
+    except InvalidToken as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "INVALID_TOKEN", "message": str(exc)},
+        ) from exc
 
 
 CurrentUserDep = Annotated[TokenData, Depends(get_current_user)]

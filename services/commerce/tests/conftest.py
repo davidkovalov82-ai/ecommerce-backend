@@ -51,6 +51,8 @@ from app.main import app
 from app.modules.accounts.dependencies import get_users_client
 from app.modules.accounts.models import User
 from app.modules.accounts.users_client import RemoteUserInfo, UsersClient
+from app.modules.cart.client import CartClient, RemoteCartInfo, RemoteCartItem
+from app.modules.cart.dependencies import get_cart_client
 from app.modules.catalog.client import (
     CatalogClient,
     CatalogInsufficientStockError,
@@ -1306,9 +1308,320 @@ class LocalTestCatalogClient(CatalogClient):
             )
 
 
+class LocalTestCartClient(CartClient):
+    """Тестов клиент за Cart, изпълняващ операциите локално през тестовата сесия."""
+
+    def __init__(self, session_factory: sessionmaker[Session]) -> None:
+        super().__init__(base_url="http://test-cart", internal_token="test-token")
+        self.session_factory = session_factory
+
+    @contextmanager
+    def _get_session(self) -> Iterator[Session]:
+        with self.session_factory() as s:
+            yield s
+
+    def get_cart(self, user_id: int) -> RemoteCartInfo:
+        with self._get_session() as session:
+            from app.modules.cart.models import CartItem
+            from app.modules.catalog.models import Product, SellerStatus
+
+            items_db = (
+                session.query(CartItem)
+                .filter(CartItem.user_id == user_id)
+                .order_by(CartItem.product_id.asc())
+                .all()
+            )
+            if not items_db:
+                return RemoteCartInfo(items=[], total_minor=0, currency="EUR")
+
+            items: list[RemoteCartItem] = []
+            total = 0
+            for item in items_db:
+                p = session.get(Product, item.product_id)
+                if p is None:
+                    continue
+                seller_status = session.get(SellerStatus, p.seller_id)
+                s_active = (seller_status.status == "active") if seller_status else True
+                available = bool(p.active and s_active and p.stock >= item.quantity)
+                subtotal = p.price_minor * item.quantity
+                total += subtotal
+                items.append(
+                    RemoteCartItem(
+                        product_id=item.product_id,
+                        title=p.title,
+                        quantity=item.quantity,
+                        unit_price_minor=p.price_minor,
+                        subtotal_minor=subtotal,
+                        available=available,
+                    )
+                )
+            return RemoteCartInfo(items=items, total_minor=total, currency="EUR")
+
+    def clear_purchased(self, user_id: int, product_ids: list[int]) -> dict[str, Any]:
+        with self._get_session() as session:
+            from app.modules.cart.models import CartItem
+
+            session.query(CartItem).filter(
+                CartItem.user_id == user_id,
+                CartItem.product_id.in_(product_ids),
+            ).delete(synchronize_session=False)
+            session.commit()
+            return {
+                "status": "cleared",
+                "user_id": user_id,
+                "cleared_product_ids": product_ids,
+            }
+
+    def forward_request(
+        self,
+        method: str,
+        path: str,
+        content: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        import httpx
+        import jwt as pyjwt
+
+        from app.modules.accounts.tokens import InvalidToken, decode_access_token
+        from app.modules.cart.models import CartItem
+        from app.modules.catalog.models import Product, SellerStatus
+
+        auth = (headers or {}).get("authorization", "")
+        if not auth.startswith("Bearer "):
+            return httpx.Response(
+                401,
+                headers={"WWW-Authenticate": "Bearer"},
+                json={
+                    "detail": {
+                        "code": "AUTHENTICATION_REQUIRED",
+                        "message": "Authentication required",
+                    }
+                },
+            )
+
+        token = auth[7:].strip()
+        user_id = None
+        token_data = None
+        try:
+            token_data = decode_access_token(
+                token,
+                public_key=settings.get_public_key(),
+                algorithm=settings.jwt_algorithm,
+                issuer=settings.jwt_issuer,
+                audience=settings.jwt_audience,
+            )
+            user_id = token_data.user_id
+        except InvalidToken:
+            try:
+                unverified = pyjwt.decode(token, options={"verify_signature": False})
+                user_id = int(unverified.get("sub", 0))
+            except (pyjwt.PyJWTError, ValueError):
+                user_id = None
+
+        if not user_id:
+            return httpx.Response(
+                401,
+                headers={"WWW-Authenticate": "Bearer"},
+                json={"detail": {"code": "INVALID_TOKEN", "message": "Invalid token"}},
+            )
+
+        from app.modules.accounts.dependencies import get_users_client
+
+        users_client_factory = app.dependency_overrides.get(get_users_client)
+        users_client = users_client_factory() if users_client_factory else None
+        if users_client is not None and hasattr(users_client, "get_user_status"):
+            from app.modules.accounts.users_client import (
+                UsersServiceAuthError,
+                UsersServiceUnavailableError,
+            )
+
+            try:
+                u_status = users_client.get_user_status(user_id)
+                if u_status is None:
+                    return httpx.Response(
+                        401,
+                        headers={"WWW-Authenticate": "Bearer"},
+                        json={
+                            "detail": {
+                                "code": "USER_NOT_FOUND",
+                                "message": "User not found",
+                            }
+                        },
+                    )
+                if u_status.status == "blocked":
+                    return httpx.Response(
+                        403,
+                        json={
+                            "detail": {
+                                "code": "ACCOUNT_BLOCKED",
+                                "message": "Account is blocked",
+                            }
+                        },
+                    )
+                if u_status.status == "closed":
+                    return httpx.Response(
+                        403,
+                        json={
+                            "detail": {
+                                "code": "ACCOUNT_CLOSED",
+                                "message": "Account is closed",
+                            }
+                        },
+                    )
+                if token_data and u_status.token_version != getattr(
+                    token_data, "token_version", u_status.token_version
+                ):
+                    return httpx.Response(
+                        401,
+                        headers={"WWW-Authenticate": "Bearer"},
+                        json={
+                            "detail": {
+                                "code": "INVALID_TOKEN",
+                                "message": "Token has been revoked",
+                            }
+                        },
+                    )
+            except (UsersServiceUnavailableError, UsersServiceAuthError):
+                return httpx.Response(
+                    503,
+                    json={
+                        "detail": {
+                            "code": "USERS_SERVICE_UNAVAILABLE",
+                            "message": "Users service is unavailable",
+                        }
+                    },
+                )
+
+        with self._get_session() as session:
+            if method == "GET" and path == "/cart":
+                info = self.get_cart(user_id)
+                return httpx.Response(
+                    200,
+                    json={
+                        "items": [
+                            {
+                                "product_id": it.product_id,
+                                "title": it.title,
+                                "quantity": it.quantity,
+                                "unit_price_minor": it.unit_price_minor,
+                                "subtotal_minor": it.subtotal_minor,
+                                "available": it.available,
+                            }
+                            for it in info.items
+                        ],
+                        "total_minor": info.total_minor,
+                        "currency": info.currency,
+                    },
+                )
+
+            if method == "PUT" and path.startswith("/cart/items/"):
+                try:
+                    product_id = int(path.split("/cart/items/")[1])
+                except ValueError:
+                    return httpx.Response(400, json={"detail": "Invalid product ID"})
+
+                from pydantic import ValidationError
+
+                from app.modules.cart.schemas import CartItemUpdateRequest
+
+                try:
+                    update_req = CartItemUpdateRequest.model_validate_json(
+                        content or b"{}"
+                    )
+                    quantity = update_req.quantity
+                except ValidationError as exc:
+                    return httpx.Response(422, json={"detail": exc.errors()})
+
+                product = session.get(Product, product_id)
+                if product is None or not product.active:
+                    return httpx.Response(
+                        404,
+                        json={
+                            "detail": {
+                                "code": "PRODUCT_NOT_FOUND",
+                                "message": "Product not found",
+                            }
+                        },
+                    )
+                seller_status = session.get(SellerStatus, product.seller_id)
+                if seller_status and seller_status.status != "active":
+                    return httpx.Response(
+                        404,
+                        json={
+                            "detail": {
+                                "code": "PRODUCT_NOT_FOUND",
+                                "message": "Product not found",
+                            }
+                        },
+                    )
+
+                if quantity > product.stock:
+                    return httpx.Response(
+                        409,
+                        json={
+                            "detail": {
+                                "code": "INSUFFICIENT_STOCK",
+                                "message": "Insufficient stock for requested quantity",
+                            }
+                        },
+                    )
+
+                from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+                stmt = (
+                    pg_insert(CartItem)
+                    .values(
+                        user_id=user_id,
+                        product_id=product_id,
+                        quantity=quantity,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[CartItem.user_id, CartItem.product_id],
+                        set_={"quantity": quantity},
+                    )
+                )
+                session.execute(stmt)
+                session.commit()
+
+                info = self.get_cart(user_id)
+                return httpx.Response(
+                    200,
+                    json={
+                        "items": [
+                            {
+                                "product_id": it.product_id,
+                                "title": it.title,
+                                "quantity": it.quantity,
+                                "unit_price_minor": it.unit_price_minor,
+                                "subtotal_minor": it.subtotal_minor,
+                                "available": it.available,
+                            }
+                            for it in info.items
+                        ],
+                        "total_minor": info.total_minor,
+                        "currency": info.currency,
+                    },
+                )
+
+            if method == "DELETE" and path.startswith("/cart/items/"):
+                try:
+                    product_id = int(path.split("/cart/items/")[1])
+                except ValueError:
+                    return httpx.Response(400, json={"detail": "Invalid product ID"})
+
+                existing = session.get(CartItem, (user_id, product_id))
+                if existing:
+                    session.delete(existing)
+                    session.commit()
+                return httpx.Response(204)
+
+        return httpx.Response(404, json={"detail": "Not found"})
+
+
 @pytest.fixture(autouse=True)
 def override_db_dependency() -> Generator[None]:
-    """Пренасочва FastAPI зависимостта get_db_session, get_users_client и get_catalog_client към commerce_test за всички тестове."""
+    """Пренасочва FastAPI зависимостта get_db_session, get_users_client, get_catalog_client и get_cart_client към commerce_test за всички тестове."""
 
     def _get_test_db() -> Generator[Session]:
         with TestingSessionLocal() as session:
@@ -1321,7 +1634,11 @@ def override_db_dependency() -> Generator[None]:
     app.dependency_overrides[get_catalog_client] = lambda: LocalTestCatalogClient(
         TestingSessionLocal
     )
+    app.dependency_overrides[get_cart_client] = lambda: LocalTestCartClient(
+        TestingSessionLocal
+    )
     yield
     app.dependency_overrides.pop(get_db_session, None)
     app.dependency_overrides.pop(get_users_client, None)
     app.dependency_overrides.pop(get_catalog_client, None)
+    app.dependency_overrides.pop(get_cart_client, None)

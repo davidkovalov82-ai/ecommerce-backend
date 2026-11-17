@@ -35,6 +35,10 @@ USERS_DSN = os.environ.get(
     "USERS_DSN",
     "postgresql://users_app:users_app@127.0.0.1:55432/users",
 )
+CATALOG_DSN = os.environ.get(
+    "CATALOG_DSN",
+    "postgresql://catalog_app:catalog_app@127.0.0.1:55432/catalog",
+)
 
 ORDER_PAYLOAD = {
     "shipping_address": {
@@ -193,7 +197,7 @@ def main() -> None:
     print(
         "==> Step 4A: Negative scenario - order with non-existent seller (seller_id=999999)"
     )
-    with psycopg.connect(COMMERCE_DSN) as conn, conn.cursor() as cur:
+    with psycopg.connect(CATALOG_DSN) as conn, conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO products (title, price_minor, currency, stock, active, seller_id)
@@ -230,6 +234,7 @@ def main() -> None:
     with psycopg.connect(COMMERCE_DSN) as conn, conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM orders WHERE user_id = %s", (buyer_id,))
         assert cur.fetchone()[0] == 0, "Order was unexpectedly created in database!"
+    with psycopg.connect(CATALOG_DSN) as conn, conn.cursor() as cur:
         cur.execute("SELECT stock FROM products WHERE id = %s", (invalid_prod_id,))
         assert cur.fetchone()[0] == 5, "Product stock was modified on failed order!"
     cart_check = httpx.get(
@@ -319,6 +324,7 @@ def main() -> None:
     with psycopg.connect(COMMERCE_DSN) as conn, conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM orders WHERE user_id = %s", (buyer_id,))
         assert cur.fetchone()[0] == 0
+    with psycopg.connect(CATALOG_DSN) as conn, conn.cursor() as cur:
         cur.execute("SELECT stock FROM products WHERE id = %s", (valid_product_id,))
         assert cur.fetchone()[0] == 10
     print(
@@ -450,6 +456,7 @@ def main() -> None:
         )
         order_row = cur.fetchone()
         assert order_row is not None and order_row[2] == buyer_id
+    with psycopg.connect(CATALOG_DSN) as conn, conn.cursor() as cur:
         cur.execute("SELECT stock FROM products WHERE id = %s", (valid_product_id,))
         assert cur.fetchone()[0] == 8, "Stock was not decremented to 8!"
     cart_after = httpx.get(
@@ -469,6 +476,7 @@ def main() -> None:
     with psycopg.connect(COMMERCE_DSN) as conn, conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM orders WHERE user_id = %s", (buyer_id,))
         assert cur.fetchone()[0] == 1, "Duplicate order created on idempotent retry!"
+    with psycopg.connect(CATALOG_DSN) as conn, conn.cursor() as cur:
         cur.execute("SELECT stock FROM products WHERE id = %s", (valid_product_id,))
         assert cur.fetchone()[0] == 8, (
             "Stock was decremented twice on idempotent retry!"
@@ -565,6 +573,7 @@ def main() -> None:
     with psycopg.connect(COMMERCE_DSN) as conn, conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM orders WHERE user_id = %s", (buyer_id,))
         assert cur.fetchone()[0] == 1
+    with psycopg.connect(CATALOG_DSN) as conn, conn.cursor() as cur:
         cur.execute("SELECT stock FROM products WHERE id = %s", (valid_product_id,))
         assert cur.fetchone()[0] == 8
         cur.execute("SELECT stock FROM products WHERE id = %s", (s2_prod_id,))
@@ -615,6 +624,7 @@ def main() -> None:
     with psycopg.connect(COMMERCE_DSN) as conn, conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM orders WHERE user_id = %s", (buyer_id,))
         assert cur.fetchone()[0] == 2
+    with psycopg.connect(CATALOG_DSN) as conn, conn.cursor() as cur:
         cur.execute("SELECT stock FROM products WHERE id = %s", (valid_product_id,))
         assert cur.fetchone()[0] == 6  # 8 - 2
         cur.execute("SELECT stock FROM products WHERE id = %s", (s2_prod_id,))

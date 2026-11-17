@@ -2,40 +2,24 @@ from typing import Annotated
 
 from fastapi import Depends
 
-from app.dependencies import DbSession
-from app.modules.cart.repository import CartRepository
-from app.modules.cart.service import CartService
-from app.modules.catalog.client import CatalogClient
-from app.modules.catalog.dependencies import (
-    get_catalog_client,
-    get_product_repository,
-    get_seller_status_repository,
-)
-from app.modules.catalog.repository import ProductRepository, SellerStatusRepository
+from app.modules.cart.client import CartClient
 
 
-def get_cart_repository(session: DbSession) -> CartRepository:
-    """Фабрика за CartRepository с текущата сесия на заявката."""
-    return CartRepository(session)
+def get_cart_client() -> CartClient:
+    """Фабрика за CartClient."""
+    return CartClient()
 
 
-def get_cart_service(
-    session: DbSession,
-    cart_repository: Annotated[CartRepository, Depends(get_cart_repository)],
-    product_repository: Annotated[ProductRepository, Depends(get_product_repository)],
-    seller_status_repository: Annotated[
-        SellerStatusRepository, Depends(get_seller_status_repository)
-    ],
-    catalog_client: Annotated[CatalogClient, Depends(get_catalog_client)],
-) -> CartService:
-    """Фабрика за CartService, осигуряваща обща сесия за хранилищата."""
-    return CartService(
-        cart_repository=cart_repository,
-        product_repository=product_repository,
-        session=session,
-        seller_status_repository=seller_status_repository,
-        catalog_client=catalog_client,
-    )
+def resolve_cart_client(explicit: CartClient | None = None) -> CartClient:
+    """Връща подадения клиент, текущия override от app.dependency_overrides или нов CartClient."""
+    if explicit is not None:
+        return explicit
+    from app.main import app
+
+    override = app.dependency_overrides.get(get_cart_client)
+    if override is not None:
+        return override()
+    return CartClient()
 
 
-CartServiceDep = Annotated[CartService, Depends(get_cart_service)]
+CartClientDep = Annotated[CartClient, Depends(get_cart_client)]

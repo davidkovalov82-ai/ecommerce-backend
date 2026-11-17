@@ -42,6 +42,9 @@ services:
       CATALOG_APP_USER: catalog_app
       CATALOG_APP_PASSWORD: catalog_app
       CATALOG_DB_NAME: catalog
+      CART_APP_USER: cart_app
+      CART_APP_PASSWORD: cart_app
+      CART_DB_NAME: cart
     restart: "no"
     volumes:
       - ./scripts/postgres_db_init.sh:/usr/local/bin/postgres_db_init.sh:ro
@@ -210,6 +213,22 @@ services:
       DB_NAME: catalog
     command: sh -c "alembic upgrade head"
 
+  cart-migrations-e2e:
+    build:
+      context: ./services/cart
+      dockerfile: Dockerfile
+    restart: "no"
+    depends_on:
+      db-init-e2e:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: db-e2e
+      DB_PORT: "5432"
+      DB_USER: cart_app
+      DB_PASSWORD: cart_app
+      DB_NAME: cart
+    command: sh -c "alembic upgrade head"
+
   users-accounts-migration-e2e:
     build:
       context: ./services/users
@@ -336,6 +355,45 @@ services:
       RABBITMQ_PASSWORD: guest
     command: sh -c "python scripts/consume_user_events.py --daemon"
 
+  cart-e2e:
+    build:
+      context: ./services/cart
+      dockerfile: Dockerfile
+    container_name: cart-api-e2e
+    restart: unless-stopped
+    depends_on:
+      cart-migrations-e2e:
+        condition: service_completed_successfully
+      catalog-e2e:
+        condition: service_healthy
+    environment:
+      DB_HOST: db-e2e
+      DB_PORT: "5432"
+      DB_USER: cart_app
+      DB_PASSWORD: cart_app
+      DB_NAME: cart
+      JWT_ALGORITHM: RS256
+      JWT_ISSUER: ecommerce-users
+      JWT_AUDIENCE: ecommerce
+      JWT_PUBLIC_KEY_PATH: jwt_public.pem
+      INTERNAL_AUTH_TOKEN: ecommerce-cart-internal-secret
+      CATALOG_BASE_URL: http://catalog:8003
+      CATALOG_INTERNAL_AUTH_TOKEN: ecommerce-catalog-internal-secret
+    ports:
+      - "127.0.0.1:58004:8004"
+    volumes:
+      - ${USERS_E2E_JWT_PUBLIC_KEY_PATH}:/app/jwt_public.pem:ro
+    networks:
+      default:
+        aliases:
+          - cart
+    command: sh -c "uvicorn app.main:app --host 0.0.0.0 --port 8004"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8004/health', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
   commerce-api-e2e:
     build:
       context: ./services/commerce
@@ -346,6 +404,8 @@ services:
       users-e2e:
         condition: service_healthy
       catalog-e2e:
+        condition: service_healthy
+      cart-e2e:
         condition: service_healthy
     environment:
       DB_HOST: db-e2e
@@ -358,6 +418,8 @@ services:
       USERS_INTERNAL_AUTH_TOKEN: ecommerce-users-internal-secret
       CATALOG_BASE_URL: http://catalog:8003
       CATALOG_INTERNAL_AUTH_TOKEN: ecommerce-catalog-internal-secret
+      CART_BASE_URL: http://cart:8004
+      CART_INTERNAL_AUTH_TOKEN: ecommerce-cart-internal-secret
       JWT_PUBLIC_KEY_PATH: jwt_public.pem
       PAYMENTS_BASE_URL: http://payments-e2e:8001
       PAYMENTS_INTERNAL_AUTH_TOKEN: k5-e2e-internal-payments-token-32b!

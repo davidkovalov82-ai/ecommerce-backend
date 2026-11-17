@@ -46,6 +46,9 @@ services:
       CATALOG_APP_USER: ${CATALOG_DB_USER:-catalog}
       CATALOG_APP_PASSWORD: ${CATALOG_DB_PASSWORD:-catalog}
       CATALOG_DB_NAME: catalog
+      CART_APP_USER: ${CART_DB_USER:-cart}
+      CART_APP_PASSWORD: ${CART_DB_PASSWORD:-cart}
+      CART_DB_NAME: cart
     restart: "no"
     volumes:
       - ./scripts/postgres_db_init.sh:/usr/local/bin/postgres_db_init.sh:ro
@@ -95,6 +98,8 @@ services:
         condition: service_healthy
       catalog:
         condition: service_healthy
+      cart:
+        condition: service_healthy
     environment:
       DB_HOST: db
       DB_PORT: "5432"
@@ -106,6 +111,8 @@ services:
       USERS_INTERNAL_AUTH_TOKEN: ${USERS_INTERNAL_AUTH_TOKEN:-ecommerce-users-internal-secret}
       CATALOG_BASE_URL: ${CATALOG_BASE_URL:-http://catalog:8003}
       CATALOG_INTERNAL_AUTH_TOKEN: ${CATALOG_INTERNAL_AUTH_TOKEN:-ecommerce-catalog-internal-secret}
+      CART_BASE_URL: ${CART_BASE_URL:-http://cart:8004}
+      CART_INTERNAL_AUTH_TOKEN: ${CART_INTERNAL_AUTH_TOKEN:-ecommerce-cart-internal-secret}
       JWT_PUBLIC_KEY_PATH: ${JWT_PUBLIC_KEY_PATH:-jwt_public.pem}
       PAYMENTS_BASE_URL: ${PAYMENTS_BASE_URL:-http://payments:8001}
       PAYMENTS_INTERNAL_AUTH_TOKEN: ${PAYMENTS_INTERNAL_AUTH_TOKEN:?PAYMENTS_INTERNAL_AUTH_TOKEN must be set and non-empty}
@@ -406,6 +413,41 @@ services:
       RABBITMQ_USER: ${RABBITMQ_USER:-guest}
       RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
     command: sh -c "python scripts/process_outbox.py --daemon --poll-interval 1.0"
+
+  cart:
+    build:
+      context: ./services/cart
+      dockerfile: Dockerfile
+    container_name: cart-api
+    restart: unless-stopped
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      catalog:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: ${CART_DB_USER:-cart}
+      DB_PASSWORD: ${CART_DB_PASSWORD:-cart}
+      DB_NAME: cart
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-RS256}
+      JWT_ISSUER: ${JWT_ISSUER:-ecommerce-users}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-ecommerce}
+      JWT_PUBLIC_KEY_PATH: ${JWT_PUBLIC_KEY_PATH:-jwt_public.pem}
+      INTERNAL_AUTH_TOKEN: ${CART_INTERNAL_AUTH_TOKEN:-ecommerce-cart-internal-secret}
+      CATALOG_BASE_URL: ${CATALOG_BASE_URL:-http://catalog:8003}
+      CATALOG_INTERNAL_AUTH_TOKEN: ${CATALOG_INTERNAL_AUTH_TOKEN:-ecommerce-catalog-internal-secret}
+    ports:
+      - "8004:8004"
+    volumes:
+      - ./services/users/jwt_public.pem:/app/jwt_public.pem:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8004/health', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8004"
 
 volumes:
   postgres_data:

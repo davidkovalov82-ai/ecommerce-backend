@@ -30,11 +30,16 @@ class Settings(BaseSettings):
     users_base_url: str = "http://localhost:8002"
     users_internal_auth_token: str = "ecommerce-users-internal-secret"
     users_timeout_seconds: float = 2.0
-    
+
     # Независим Catalog сервис (продукти, категории, наличности)
     catalog_base_url: str = "http://localhost:8003"
     catalog_internal_auth_token: str = "ecommerce-catalog-internal-secret"
     catalog_timeout_seconds: float = 5.0
+
+    # Независим Cart сервис (потребителски колички)
+    cart_base_url: str = "http://localhost:8004"
+    cart_internal_auth_token: str = "ecommerce-cart-internal-secret"
+    cart_timeout_seconds: float = 5.0
 
     # Независим Payments сервис (Stripe ключовете живеят само в services/payments)
     payments_base_url: str = "http://localhost:8001"

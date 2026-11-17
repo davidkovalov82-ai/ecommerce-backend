@@ -5,8 +5,8 @@ from fastapi import Depends
 from app.dependencies import DbSession
 from app.modules.accounts.dependencies import get_users_client
 from app.modules.accounts.users_client import UsersClient
-from app.modules.cart.dependencies import get_cart_repository
-from app.modules.cart.repository import CartRepository
+from app.modules.cart.client import CartClient
+from app.modules.cart.dependencies import get_cart_client
 from app.modules.catalog.client import CatalogClient
 from app.modules.catalog.dependencies import (
     get_catalog_client,
@@ -31,7 +31,7 @@ def get_order_repository(session: DbSession) -> OrderRepository:
 def get_order_service(
     session: DbSession,
     order_repository: Annotated[OrderRepository, Depends(get_order_repository)],
-    cart_repository: Annotated[CartRepository, Depends(get_cart_repository)],
+    cart_client: Annotated[CartClient, Depends(get_cart_client)],
     product_repository: Annotated[ProductRepository, Depends(get_product_repository)],
     payments_client: Annotated[PaymentsClient, Depends(get_payments_client)],
     users_client: Annotated[UsersClient, Depends(get_users_client)],
@@ -40,7 +40,7 @@ def get_order_service(
     """Фабрика за OrderService."""
     return OrderService(
         order_repository=order_repository,
-        cart_repository=cart_repository,
+        cart_client=cart_client,
         product_repository=product_repository,
         session=session,
         payments_client=payments_client,
