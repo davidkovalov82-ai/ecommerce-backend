@@ -93,6 +93,10 @@ class OrderRepository:
         )
         return self._session.scalars(stmt).first()
 
+    def get_by_id(self, order_id: int) -> Order | None:
+        """Извлича поръчка само по id без заключване."""
+        return self._session.get(Order, order_id)
+
     def get_by_id_for_update(self, order_id: int) -> Order | None:
         """Извлича и заключва ред от поръчката само по id с FOR UPDATE."""
         stmt = (

@@ -613,17 +613,28 @@ class OrderService:
             self._session.add(release_event)
 
     def _publish_stock_release_immediate(self, order_id: int) -> None:
-        """Прави опит за незабавно освобождаване през CatalogClient след успешен commit на транзакцията."""
+        """Прави опит за незабавно освобождаване през CatalogClient след успешен commit на транзакцията.
+
+        Разрешава извикване към Catalog само ако съществува записано pending намерение
+        order.stock_release и текущият статус на поръчката е допустим за освобождаване (cancelled, expired).
+        Ако поръчката е в статус paid (или друг недопустим), резервът не се освобождава.
+        """
         try:
+            order = self._order_repository.get_by_id(order_id)
+            if order is None or order.status not in ("cancelled", "expired"):
+                return
+
+            event = self._order_repository.get_outbox_event(
+                order_id, "order.stock_release"
+            )
+            if event is None or event.status != "pending":
+                return
+
             self._catalog_client.release_stock(order_id)
             try:
-                event = self._order_repository.get_outbox_event(
-                    order_id, "order.stock_release"
-                )
-                if event is not None and event.status == "pending":
-                    event.status = "published"
-                    event.published_at = datetime.datetime.now(datetime.UTC)
-                    self._session.commit()
+                event.status = "published"
+                event.published_at = datetime.datetime.now(datetime.UTC)
+                self._session.commit()
             except Exception:  # noqa: BLE001
                 self._session.rollback()
         except Exception as exc:  # noqa: BLE001
@@ -777,15 +788,25 @@ class OrderService:
 
             try:
                 order_rec = self._order_repository.get_by_id_for_update(order_id)
-                if order_rec and order_rec.status not in (
-                    "cancelled",
-                    "expired",
-                    "paid",
-                ):
+                if order_rec is None:
+                    raise OrderNotFound(f"Order with id {order_id} not found")
+
+                if order_rec.status == "paid":
+                    self._session.rollback()
+                    raise OrderStateConflict(
+                        current_status="paid",
+                        message="Cannot expire order: payment already completed",
+                    )
+
+                should_release = False
+                if order_rec.status not in ("cancelled", "expired"):
                     order_rec.status = "expired"
                     self._restore_order_stock(order_rec)
+                    should_release = True
+
                 self._session.commit()
-                self._publish_stock_release_immediate(order_id)
+                if should_release:
+                    self._publish_stock_release_immediate(order_id)
             except Exception:
                 self._session.rollback()
                 raise

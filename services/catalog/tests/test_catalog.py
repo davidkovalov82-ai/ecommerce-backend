@@ -14,9 +14,12 @@ from app.models import Category, Product, SellerStatus
 from app.repository import CategoryRepository, ProductRepository
 from app.schemas import StockReserveItem
 from app.service import CatalogService, ReservationConflict
-from tests.conftest import MockUsersClient, TestingSessionLocal, make_auth_headers
-
-INTERNAL_HEADERS = {"X-Internal-Token": "ecommerce-catalog-internal-secret"}
+from tests.conftest import (
+    INTERNAL_HEADERS,
+    MockUsersClient,
+    TestingSessionLocal,
+    make_auth_headers,
+)
 
 
 def test_category_crud_and_permissions(client: TestClient) -> None:
@@ -263,6 +266,14 @@ def test_catalog_auth_revocation_blocking_and_fail_closed(
         "/internal/stock/reserve",
         json={"order_id": 999, "items": [{"product_id": 1, "quantity": 1}]},
         headers={},
+    )
+    assert resp.status_code == 401
+
+    # Невалиден (грешен) вътрешен токен
+    resp = client.post(
+        "/internal/stock/reserve",
+        json={"order_id": 999, "items": [{"product_id": 1, "quantity": 1}]},
+        headers={"X-Internal-Token": "invalid-wrong-token-xyz"},
     )
     assert resp.status_code == 401
 

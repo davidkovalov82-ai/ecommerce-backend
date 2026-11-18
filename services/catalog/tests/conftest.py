@@ -46,6 +46,24 @@ from app.users_client import RemoteUserInfo, UsersServiceUnavailableError
 
 settings.jwt_public_key = _test_public_pem
 
+
+class _InternalHeaders(dict[str, str]):
+    def __getitem__(self, key: str) -> str:
+        if key == "X-Internal-Token":
+            return settings.internal_auth_token
+        return super().__getitem__(key)
+
+    def get(self, key: str, default: object = None) -> object:
+        if key == "X-Internal-Token":
+            return settings.internal_auth_token
+        return super().get(key, default)
+
+    def copy(self) -> dict[str, str]:
+        return {"X-Internal-Token": settings.internal_auth_token}
+
+
+INTERNAL_HEADERS = _InternalHeaders({"X-Internal-Token": settings.internal_auth_token})
+
 TEST_DB_NAME = "catalog_test"
 TEST_ROLE_NAME = "catalog_test_role"
 TEST_ROLE_PASSWORD = "catalog_test_role_password"

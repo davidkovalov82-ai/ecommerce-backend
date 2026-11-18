@@ -1,16 +1,15 @@
 # Session State
 
-- **Текуща задача**: Корекции на устойчивостта и детайлите в Catalog, Cart и Orders (K6.2–K6.4).
+- **Текуща задача**: Корекции по устойчивост и тестове в Catalog и Orders (забележки към 4c4905f).
 - **Реализирано**:
-  - Orders: `_restore_order_stock` записва статус и pending outbox в една транзакция; Catalog release се вика само след commit; защитен rollback.
-  - Catalog: терминален запис за release (`order_stock_releases`) предотвратява късен reserve; премахнат дублиран advisory lock.
-  - Catalog consumer: разграничени временни DB грешки (requeue+delay) от невалидни събития (nack); строга валидация на `occurred_at`.
-  - CI: Cart и Catalog стартират `init_db` през `uv run --locked python -m scripts.init_db`.
+  - Orders: `_publish_stock_release_immediate` извиква Catalog само при запазено pending `order.stock_release` и статус `cancelled`/`expired`; при открит `paid` статус в `create_stripe_checkout_session` резервът не се освобождава.
+  - Catalog: тестовият вътрешен токен ползва `settings.internal_auth_token` като единен източник (синхронизиран с CI env); запазени проверки за празен, липсващ и невалиден токен.
+  - Тестове Orders: пренаписан `test_cancel_order_rollback_does_not_release_stock` (успешен първи commit, грешка на commit за cancelled/outbox, потвърден rollback); добавен тест за промяна към `paid` между фазите.
 - **Проверено**:
-  - Unit suites: Orders (127), Catalog (11), Cart (9), Users (57), Payments (34), Notifications (39) — общо 277 passed.
-  - E2E suites: `make test-catalog-e2e`, `make test-cart-e2e`, `make test-orders-e2e`, `make test-users-e2e` (чист стенд).
-  - Ruff check & format: 100% чист във всички 6 сервиза.
+  - Unit suites: Orders (128), Catalog (11) — общо 139 passed, 0 failed.
+  - E2E suites: `make test-orders-e2e`, `make test-catalog-e2e`, `make test-cart-e2e`, `make test-users-e2e` (чист стенд).
+  - Ruff check & format: 100% чист код в Catalog и Orders.
 - **Непроверено**: Продукционна мулти-нод среда (извън обхвата).
-- **Работещи команди**: `make test-orders-e2e`, `make test-cart-e2e`, `make test-catalog-e2e`, `make test-users-e2e`.
-- **Засегнати файлове**: `services/catalog/*`, `services/orders/*`, `services/cart/scripts/*`, `.github/workflows/ci.yml`.
+- **Работещи команди**: `make test-orders-e2e`, `make test-catalog-e2e`, `uv run --locked pytest`.
+- **Засегнати файлове**: `services/catalog/tests/*`, `services/orders/app/*`, `services/orders/tests/*`.
 - **Следваща стъпка**: Преглед и commit от потребителя (`git add` / `git commit`).

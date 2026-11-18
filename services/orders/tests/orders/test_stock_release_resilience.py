@@ -1,3 +1,4 @@
+import datetime
 import uuid
 from typing import Any
 from unittest.mock import MagicMock
@@ -8,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.main import app
 from app.modules.catalog.dependencies import get_catalog_client
+from app.modules.orders.dependencies import get_payments_client
 from app.modules.orders.models import Order, OrderOutboxEvent
 from app.modules.orders.outbox_processor import OutboxProcessor
 from app.modules.orders.payments_client import CancelPaymentResult, PaymentsClient
@@ -146,7 +148,12 @@ def test_cancel_order_rollback_does_not_release_stock(
     db_session: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """При грешка и rollback на транзакцията за отмяна, Catalog release_stock НЕ се извиква."""
+    """При грешка и rollback на транзакцията за отмяна, Catalog release_stock НЕ се извиква.
+
+    1. Първият подготвителен commit (Фаза 1, освобождаване на заключването) преминава успешно.
+    2. Грешката се предизвиква при commit във Фаза 3, който записва cancelled статус и outbox.
+    3. Потвърждаваме достигането на тази фаза, rollback на статуса и outbox, липса на Catalog release.
+    """
     user, token = _create_user_and_token(
         db_session, email="rollback_cancel@example.com"
     )
@@ -157,28 +164,126 @@ def test_cancel_order_rollback_does_not_release_stock(
     catalog_mock = MagicMock(wraps=shared_catalog_client)
     app.dependency_overrides[get_catalog_client] = lambda: catalog_mock
 
-    # Симулираме срив при commit на транзакцията за отмяна
-    def failing_commit(self: Session) -> None:
-        raise RuntimeError("Controlled DB commit failure during cancellation")
+    payments_mock = MagicMock(spec=PaymentsClient)
+    payments_mock.cancel_order_payment.return_value = CancelPaymentResult(
+        status="can_cancel", action="cancelled"
+    )
+    app.dependency_overrides[get_payments_client] = lambda: payments_mock
 
-    monkeypatch.setattr(Session, "commit", failing_commit)
+    orig_commit = Session.commit
+    commit_call_count = 0
+    phase_3_commit_reached = False
+
+    def controlled_commit(self: Session) -> None:
+        nonlocal commit_call_count, phase_3_commit_reached
+        commit_call_count += 1
+        # Първият подготвителен commit (Фаза 1) трябва да премине успешно
+        if commit_call_count == 1:
+            orig_commit(self)
+            return
+
+        # Вторият commit (Фаза 3) записва cancelled статус и outbox
+        # Потвърждаваме достигането на фазата чрез обектите в сесията преди commit
+        for obj in list(self.dirty) + list(self.new):
+            if isinstance(obj, Order) and obj.status == "cancelled":
+                phase_3_commit_reached = True
+                break
+        raise RuntimeError("Controlled DB commit failure during cancellation phase 3")
+
+    monkeypatch.setattr(Session, "commit", controlled_commit)
 
     headers = {"Authorization": f"Bearer {token}"}
     with pytest.raises(
-        RuntimeError, match="Controlled DB commit failure during cancellation"
+        RuntimeError, match="Controlled DB commit failure during cancellation phase 3"
     ):
         client.post(f"/orders/{order.id}/cancel", headers=headers)
 
-    # Catalog release_stock НЕ трябва да е извикан, защото транзакцията претърпя rollback
+    # 1. Потвърждаваме преминаването на подготвителния commit и достигането на фаза 3
+    assert commit_call_count == 2
+    assert phase_3_commit_reached is True
+
+    # 2. Catalog release_stock НЕ трябва да е извикан, защото транзакцията претърпя rollback
     catalog_mock.release_stock.assert_not_called()
 
-    # В базата поръчката остава в предишния статус
+    # 3. В базата поръчката претърпява rollback към 'pending_payment'
     with TestingSessionLocal() as session:
         refreshed_order = session.get(Order, order.id)
         assert refreshed_order is not None
         assert refreshed_order.status == "pending_payment"
 
-        # Никакво публикувано release събитие в Outbox
+        # 4. Никакво release събитие в Outbox
+        release_event = (
+            session.query(OrderOutboxEvent)
+            .filter(
+                OrderOutboxEvent.order_id == order.id,
+                OrderOutboxEvent.event_type == "order.stock_release",
+            )
+            .first()
+        )
+        assert release_event is None
+
+
+def test_create_checkout_session_order_paid_during_expiration_does_not_release_stock(
+    db_session: Session,
+) -> None:
+    """Ако между фазите на create_stripe_checkout_session поръчката стане paid:
+
+    1. Повторното четене открива статус paid.
+    2. Резервът в Catalog НЕ се освобождава.
+    3. Не се записва/публикува stock_release outbox събитие.
+    4. Заявката връща 409 Conflict със статус paid.
+    """
+    user, token = _create_user_and_token(
+        db_session, email="expire_paid_race@example.com"
+    )
+    product = _create_product(db_session, stock=10)
+    order = _create_order(db_session, user.id, product, quantity=2)
+
+    # Задаваме expires_at в миналото, за да задействаме клона за изтичане
+    order.expires_at = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
+        seconds=10
+    )
+    db_session.commit()
+
+    catalog_mock = MagicMock(wraps=shared_catalog_client)
+    app.dependency_overrides[get_catalog_client] = lambda: catalog_mock
+
+    # Симулираме, че по време на Фаза 2 (cancel_order_payment) поръчката е платена паралелно
+    payments_mock = MagicMock(spec=PaymentsClient)
+
+    def fake_cancel_order_payment(
+        order_id: int,
+        reason: str,
+        order_expires_at: Any,
+    ) -> CancelPaymentResult:
+        with TestingSessionLocal() as session:
+            o = session.get(Order, order_id)
+            assert o is not None
+            o.status = "paid"
+            session.commit()
+        return CancelPaymentResult(status="can_cancel", action="cancelled")
+
+    payments_mock.cancel_order_payment.side_effect = fake_cancel_order_payment
+    app.dependency_overrides[get_payments_client] = lambda: payments_mock
+
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = client.post(f"/orders/{order.id}/checkout-session", headers=headers)
+
+    # 1. Повторното четене открива paid -> 409 с код ORDER_STATUS_CONFLICT
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "ORDER_STATUS_CONFLICT"
+    assert "paid" in resp.json()["detail"]["message"]
+
+    # 2. Резервът в Catalog НЕ е освободен
+    catalog_mock.release_stock.assert_not_called()
+
+    # 3. Поръчката остава със статус paid в базата
+    with TestingSessionLocal() as session:
+        refreshed_order = session.get(Order, order.id)
+        assert refreshed_order is not None
+        assert refreshed_order.status == "paid"
+
+        # 4. Не е записано никакво stock_release outbox събитие
         release_event = (
             session.query(OrderOutboxEvent)
             .filter(
