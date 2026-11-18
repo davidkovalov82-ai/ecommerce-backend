@@ -3,7 +3,7 @@
 from fastapi.testclient import TestClient
 
 from app.config import settings
-from tests.conftest import MockCatalogClient, make_auth_headers
+from tests.conftest import MockCatalogClient, MockUsersClient, make_auth_headers
 
 
 def test_get_empty_cart(client: TestClient) -> None:
@@ -158,11 +158,16 @@ def test_internal_cart_snapshot_and_clear_purchased_preserves_concurrent_changes
     # Докато тече оформянето на поръчката, потребителят добавя нов артикул 203
     client.put("/cart/items/203", json={"quantity": 3}, headers=headers)
 
-    # Orders потвърждава поръчката само за 201 и 202
+    # Orders потвърждава поръчката само за 201 и 202 с версиите от снимката
     clear_resp = client.post(
         f"/internal/cart/{buyer_id}/clear-purchased",
         headers=internal_headers,
-        json={"product_ids": [201, 202]},
+        json={
+            "order_id": 999,
+            "items": [
+                {"product_id": i["product_id"], "version": i["version"]} for i in items
+            ],
+        },
     )
     assert clear_resp.status_code == 200
     assert clear_resp.json()["status"] == "cleared"
@@ -199,19 +204,21 @@ def test_versioned_clear_and_idempotency_by_order_id(
     assert len(items) == 2
     item301 = next(i for i in items if i["product_id"] == 301)
     item302 = next(i for i in items if i["product_id"] == 302)
-    assert item301["version"] == 1
-    assert item302["version"] == 1
+    v301 = item301["version"]
+    v302 = item302["version"]
+    assert v301 > 0
+    assert v302 > 0
 
-    # Потребителят променя количеството на 301 (version става 2) по време на checkout
+    # Потребителят променя количеството на 301 по време на checkout
     update_res = client.put("/cart/items/301", json={"quantity": 5}, headers=headers)
     assert update_res.status_code == 200
 
-    # Orders прави изчистване за order_id=1001 с първоначалните версии (301: v1, 302: v1)
+    # Orders прави изчистване за order_id=1001 с първоначалните версии от снимката
     clear_payload = {
         "order_id": 1001,
         "items": [
-            {"product_id": 301, "version": 1},
-            {"product_id": 302, "version": 1},
+            {"product_id": 301, "version": v301},
+            {"product_id": 302, "version": v302},
         ],
     }
     clear_res = client.post(
@@ -225,12 +232,12 @@ def test_versioned_clear_and_idempotency_by_order_id(
     assert 302 in cleared_ids
     assert 301 not in cleared_ids
 
-    # Проверка на количката: 301 остава с новото количество 5!
+    # Проверка на количката: 301 остава с новото количество 5 и по-нова версия!
     current_cart = client.get("/cart", headers=headers).json()
     assert len(current_cart["items"]) == 1
     assert current_cart["items"][0]["product_id"] == 301
     assert current_cart["items"][0]["quantity"] == 5
-    assert current_cart["items"][0]["version"] == 2
+    assert current_cart["items"][0]["version"] > v301
 
     # Идемпотентност: повторен опит за същия order_id връща 200 без промени
     retry_clear = client.post(
@@ -242,3 +249,98 @@ def test_versioned_clear_and_idempotency_by_order_id(
     assert retry_clear.json()["status"] == "cleared"
     # Нищо не е изтрито втори път
     assert retry_clear.json()["cleared_product_ids"] == []
+
+
+def test_cart_auth_revocation_blocking_and_fail_closed(
+    client: TestClient,
+    mock_users: MockUsersClient,
+) -> None:
+    """Проверка за валидиране на статус на потребителя през Users в Cart:
+
+    1. Оттеглен токен (token_version mismatch) -> 401
+    2. Блокиран потребител -> 403
+    3. Недостъпен Users сервиз -> 503 fail-closed
+    4. Празен или неконфигуриран X-Internal-Token -> 401
+    """
+    user_id = 99
+    # 1. Оттеглен токен
+    mock_users.set_user(user_id=user_id, token_version=2, status="active")
+    stale_headers = make_auth_headers(user_id=user_id, token_version=0)
+    resp = client.get("/cart", headers=stale_headers)
+    assert resp.status_code == 401
+    assert resp.json()["detail"]["code"] == "INVALID_TOKEN"
+
+    # 2. Блокиран потребител
+    mock_users.set_user(user_id=user_id, token_version=0, status="blocked")
+    valid_headers = make_auth_headers(user_id=user_id, token_version=0)
+    resp = client.get("/cart", headers=valid_headers)
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["code"] == "ACCOUNT_BLOCKED"
+
+    # 3. Недостъпен Users сервиз -> 503
+    mock_users.unavailable = True
+    resp = client.get("/cart", headers=valid_headers)
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["code"] == "USERS_SERVICE_UNAVAILABLE"
+    mock_users.unavailable = False
+
+    # 4. Празен вътрешен токен
+    resp = client.get(f"/internal/cart/{user_id}", headers={"X-Internal-Token": ""})
+    assert resp.status_code == 401
+
+    # Неконфигуриран вътрешен токен на сървъра
+    orig_token = settings.internal_auth_token
+    try:
+        settings.internal_auth_token = ""
+        resp = client.get(f"/internal/cart/{user_id}", headers={"X-Internal-Token": ""})
+        assert resp.status_code == 401
+    finally:
+        settings.internal_auth_token = orig_token
+
+
+def test_cart_readded_item_version_increment_and_safety(
+    client: TestClient,
+    mock_catalog: MockCatalogClient,
+) -> None:
+    """Изтриване и повторно добавяне на същия продукт получава нова по-голяма версия от sequence.
+
+    Старата снимка не може да изтрие повторно добавения артикул.
+    """
+    mock_catalog.set_mock_product(product_id=401, stock=50)
+    buyer_id = 66
+    headers = make_auth_headers(user_id=buyer_id)
+    internal_headers = {"X-Internal-Token": settings.internal_auth_token}
+
+    # 1. Добавяме продукт 401
+    client.put("/cart/items/401", json={"quantity": 1}, headers=headers)
+    snap1 = client.get(f"/internal/cart/{buyer_id}", headers=internal_headers).json()
+    v1 = snap1["items"][0]["version"]
+
+    # 2. Изтриваме продукта от количката
+    client.delete("/cart/items/401", headers=headers)
+    assert client.get("/cart", headers=headers).json()["items"] == []
+
+    # 3. Потребителят добавя същия продукт отново
+    client.put("/cart/items/401", json={"quantity": 3}, headers=headers)
+    snap2 = client.get(f"/internal/cart/{buyer_id}", headers=internal_headers).json()
+    v2 = snap2["items"][0]["version"]
+
+    # Версията строго нараства (чрез PostgreSQL sequence), не повтаря старата версия!
+    assert v2 > v1
+
+    # 4. Опит за изчистване със старата версия v1 за order_id=2001
+    clear_res = client.post(
+        f"/internal/cart/{buyer_id}/clear-purchased",
+        headers=internal_headers,
+        json={
+            "order_id": 2001,
+            "items": [{"product_id": 401, "version": v1}],
+        },
+    )
+    assert clear_res.status_code == 200
+    assert clear_res.json()["cleared_product_ids"] == []
+
+    # Продуктът 401 с новото количество 3 остава непокътнат в количката!
+    current_cart = client.get("/cart", headers=headers).json()
+    assert len(current_cart["items"]) == 1
+    assert current_cart["items"][0]["quantity"] == 3

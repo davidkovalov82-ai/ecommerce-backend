@@ -23,7 +23,6 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.modules.cart.client import CartClient
 from app.modules.catalog.client import CatalogClient
-from app.modules.catalog.repository import ProductRepository
 from app.modules.orders.payment_contracts import (
     PaymentContractError,
     ValidatedPaymentEvent,
@@ -163,7 +162,6 @@ class RabbitMQPaymentEventConsumer:
                 service = OrderService(
                     order_repository=OrderRepository(session),
                     cart_client=CartClient(),
-                    product_repository=ProductRepository(session),
                     catalog_client=CatalogClient(),
                     session=session,
                 )

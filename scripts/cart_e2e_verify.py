@@ -70,7 +70,7 @@ def wait_for_services(timeout_seconds: float = 35.0) -> None:
     )
     while time.time() - start < timeout_seconds:
         try:
-            r_c = httpx.get(f"{COMMERCE_API_URL}/openapi.json", timeout=2.0)
+            r_c = httpx.get(f"{COMMERCE_API_URL}/health", timeout=2.0)
             r_u = httpx.get(f"{USERS_API_URL}/health", timeout=2.0)
             r_cat = httpx.get(f"{CATALOG_API_URL}/health", timeout=2.0)
             r_cart = httpx.get(f"{CART_API_URL}/health", timeout=2.0)
@@ -115,10 +115,18 @@ def run_e2e_verification() -> None:
 
     with httpx.Client(timeout=10.0) as client:
         # [Step 0] Проверка за регресии от K6.2: вход с X-User-Id без JWT връща 401
-        print("==> [Step 0] Testing regression fixes: fake auth headers without JWT return 401...")
+        print(
+            "==> [Step 0] Testing regression fixes: fake auth headers without JWT return 401..."
+        )
         fake_catalog_resp = client.post(
             f"{CATALOG_API_URL}/products",
-            json={"title": "Hacked", "price_minor": 100, "currency": "EUR", "stock": 1, "active": True},
+            json={
+                "title": "Hacked",
+                "price_minor": 100,
+                "currency": "EUR",
+                "stock": 1,
+                "active": True,
+            },
             headers={"X-User-Id": "1", "X-User-Role": "seller"},
         )
         assert fake_catalog_resp.status_code == 401
@@ -130,11 +138,15 @@ def run_e2e_verification() -> None:
         )
         assert fake_cart_resp.status_code == 401
         assert fake_cart_resp.json()["detail"]["code"] == "AUTHENTICATION_REQUIRED"
-        print("    Regression checks passed: both Catalog and Cart reject fake headers with 401.")
+        print(
+            "    Regression checks passed: both Catalog and Cart reject fake headers with 401."
+        )
 
         # [Step 1] Регистрация на нов продавач и публикуване на стоки в Catalog
-        print("==> [Step 1] Registering a new seller and publishing products in Catalog...")
-        seller_id, seller_token = register_and_login(client, "seller_cart_k63")
+        print(
+            "==> [Step 1] Registering a new seller and publishing products in Catalog..."
+        )
+        _seller_id, seller_token = register_and_login(client, "seller_cart_k63")
         seller_headers = {"Authorization": f"Bearer {seller_token}"}
 
         # Създаване на Категория
@@ -158,7 +170,9 @@ def run_e2e_verification() -> None:
             },
             headers=seller_headers,
         )
-        assert prod1_resp.status_code == 201, f"Failed to create product 1: {prod1_resp.text}"
+        assert prod1_resp.status_code == 201, (
+            f"Failed to create product 1: {prod1_resp.text}"
+        )
         prod1 = prod1_resp.json()
         prod1_id = prod1["id"]
 
@@ -175,10 +189,14 @@ def run_e2e_verification() -> None:
             },
             headers=seller_headers,
         )
-        assert prod2_resp.status_code == 201, f"Failed to create product 2: {prod2_resp.text}"
+        assert prod2_resp.status_code == 201, (
+            f"Failed to create product 2: {prod2_resp.text}"
+        )
         prod2 = prod2_resp.json()
         prod2_id = prod2["id"]
-        print(f"    Products created: P1(id={prod1_id}, stock=5), P2(id={prod2_id}, stock=10).")
+        print(
+            f"    Products created: P1(id={prod1_id}, stock=5), P2(id={prod2_id}, stock=10)."
+        )
 
         # [Step 2] Регистрация на купувач
         print("==> [Step 2] Registering a new buyer...")
@@ -205,8 +223,12 @@ def run_e2e_verification() -> None:
         with psycopg.connect(CATALOG_DSN) as conn, conn.cursor() as cur:
             cur.execute("SELECT stock FROM products WHERE id = %s", (prod1_id,))
             stock_in_catalog = cur.fetchone()[0]
-            assert stock_in_catalog == 5, f"Stock should be 5, but got {stock_in_catalog}"
-        print("    Product 1 added to cart. Verified stock in Catalog is STILL 5 (not reserved).")
+            assert stock_in_catalog == 5, (
+                f"Stock should be 5, but got {stock_in_catalog}"
+            )
+        print(
+            "    Product 1 added to cart. Verified stock in Catalog is STILL 5 (not reserved)."
+        )
 
         # [Step 4] Купувачът вижда продукта в своята количка (GET /cart)
         print("==> [Step 4] Buyer views cart (GET /cart)...")
@@ -216,7 +238,9 @@ def run_e2e_verification() -> None:
         assert len(view_data["items"]) == 1
         assert view_data["items"][0]["title"] == "Wireless Mechanical Keyboard"
         assert view_data["items"][0]["available"] is True
-        print("    Cart view verified: 1 item present, available=True, total=10000 EUR.")
+        print(
+            "    Cart view verified: 1 item present, available=True, total=10000 EUR."
+        )
 
         # [Step 5] Купувачът добавя и Продукт 2 (qty=1) в количката
         print("==> [Step 5] Buyer adds Product 2 (qty=1) to cart...")
@@ -238,18 +262,28 @@ def run_e2e_verification() -> None:
             json=ORDER_PAYLOAD,
             headers={**buyer_headers, "Idempotency-Key": order_key},
         )
-        assert order_resp.status_code == 201, f"Failed to create order: {order_resp.text}"
+        assert order_resp.status_code == 201, (
+            f"Failed to create order: {order_resp.text}"
+        )
         order_data = order_resp.json()
         order_id = order_data["id"]
         assert order_data["total_minor"] == 11500
-        print(f"    Order #{order_id} placed successfully. Total: {order_data['total_minor']} EUR.")
+        print(
+            f"    Order #{order_id} placed successfully. Total: {order_data['total_minor']} EUR."
+        )
 
         # [Step 7] Проверка на количката: закупените позиции са изчезнали!
         print("==> [Step 7] Verifying purchased items disappeared from cart...")
-        cart_after = client.get(f"{COMMERCE_API_URL}/cart", headers=buyer_headers).json()
-        assert cart_after["items"] == [], f"Cart should be empty, but got: {cart_after['items']}"
+        cart_after = client.get(
+            f"{COMMERCE_API_URL}/cart", headers=buyer_headers
+        ).json()
+        assert cart_after["items"] == [], (
+            f"Cart should be empty, but got: {cart_after['items']}"
+        )
         assert cart_after["total_minor"] == 0
-        print("    Verified: purchased items completely disappeared from customer's cart.")
+        print(
+            "    Verified: purchased items completely disappeared from customer's cart."
+        )
 
         # Проверка на складовите остатъци в Catalog след поръчката:
         with psycopg.connect(CATALOG_DSN) as conn, conn.cursor() as cur:
@@ -257,16 +291,22 @@ def run_e2e_verification() -> None:
             assert cur.fetchone()[0] == 3  # 5 - 2 = 3
             cur.execute("SELECT stock FROM products WHERE id = %s", (prod2_id,))
             assert cur.fetchone()[0] == 9  # 10 - 1 = 9
-        print("    Verified: Catalog stocks correctly decremented (P1: 5->3, P2: 10->9).")
+        print(
+            "    Verified: Catalog stocks correctly decremented (P1: 5->3, P2: 10->9)."
+        )
 
         # [Step 8] Повтор на заявката с същия Idempotency-Key
-        print("==> [Step 8] Idempotent repeat: submitting order with the same Idempotency-Key...")
+        print(
+            "==> [Step 8] Idempotent repeat: submitting order with the same Idempotency-Key..."
+        )
         repeat_resp = client.post(
             f"{COMMERCE_API_URL}/orders",
             json=ORDER_PAYLOAD,
             headers={**buyer_headers, "Idempotency-Key": order_key},
         )
-        assert repeat_resp.status_code in (200, 201), f"Unexpected status: {repeat_resp.status_code}"
+        assert repeat_resp.status_code in (200, 201), (
+            f"Unexpected status: {repeat_resp.status_code}"
+        )
         repeat_data = repeat_resp.json()
         assert repeat_data["id"] == order_id
         assert repeat_data["total_minor"] == 11500
@@ -277,13 +317,19 @@ def run_e2e_verification() -> None:
             assert cur.fetchone()[0] == 3  # Остава 3!
             cur.execute("SELECT stock FROM products WHERE id = %s", (prod2_id,))
             assert cur.fetchone()[0] == 9  # Остава 9!
-        print("    Idempotency confirmed: same order returned, stocks still 3 and 9 (no duplicate deduction).")
+        print(
+            "    Idempotency confirmed: same order returned, stocks still 3 and 9 (no duplicate deduction)."
+        )
 
         # [Step 9] Директни проверки в PostgreSQL за пълна изолация на услугите
-        print("==> [Step 9] Direct DB isolation checks across Cart, Catalog, and Commerce...")
+        print(
+            "==> [Step 9] Direct DB isolation checks across Cart, Catalog, and Commerce..."
+        )
         # 1. Cart DB: cart_items за купувача е празен
         with psycopg.connect(CART_DSN) as conn, conn.cursor() as cur:
-            cur.execute("SELECT count(*) FROM cart_items WHERE user_id = %s", (buyer_id,))
+            cur.execute(
+                "SELECT count(*) FROM cart_items WHERE user_id = %s", (buyer_id,)
+            )
             assert cur.fetchone()[0] == 0
         print("    Cart DB: confirmed 0 rows in cart_items for buyer.")
 
@@ -309,7 +355,9 @@ def run_e2e_verification() -> None:
                     assert r[1] == "Braided USB-C Cable"
                     assert r[2] == 1
                     assert r[3] == 1500
-        print("    Commerce DB: confirmed exactly 1 order with preserved historical item snapshots.")
+        print(
+            "    Commerce DB: confirmed exactly 1 order with preserved historical item snapshots."
+        )
 
     print("\n" + "=" * 55)
     print("SUCCESS: K6.3 Cart extraction & checkout scenario PASSED!")
@@ -319,9 +367,10 @@ def run_e2e_verification() -> None:
 def main() -> None:
     try:
         run_e2e_verification()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         print(f"\n❌ E2E VERIFICATION FAILED: {exc}", file=sys.stderr)
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
 

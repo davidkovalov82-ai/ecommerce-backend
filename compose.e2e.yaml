@@ -283,6 +283,8 @@ services:
     depends_on:
       catalog-migrations-e2e:
         condition: service_completed_successfully
+      users-e2e:
+        condition: service_healthy
     environment:
       DB_HOST: db-e2e
       DB_PORT: "5432"
@@ -294,6 +296,8 @@ services:
       JWT_AUDIENCE: ecommerce
       JWT_PUBLIC_KEY_PATH: jwt_public.pem
       INTERNAL_AUTH_TOKEN: ecommerce-catalog-internal-secret
+      USERS_BASE_URL: http://users-e2e:8002
+      USERS_INTERNAL_AUTH_TOKEN: ecommerce-users-internal-secret
       RABBITMQ_HOST: rabbitmq-e2e
       RABBITMQ_PORT: "5672"
       RABBITMQ_USER: guest
@@ -346,6 +350,8 @@ services:
     depends_on:
       cart-migrations-e2e:
         condition: service_completed_successfully
+      users-e2e:
+        condition: service_healthy
       catalog-e2e:
         condition: service_healthy
     environment:
@@ -359,6 +365,8 @@ services:
       JWT_AUDIENCE: ecommerce
       JWT_PUBLIC_KEY_PATH: jwt_public.pem
       INTERNAL_AUTH_TOKEN: ecommerce-cart-internal-secret
+      USERS_BASE_URL: http://users-e2e:8002
+      USERS_INTERNAL_AUTH_TOKEN: ecommerce-users-internal-secret
       CATALOG_BASE_URL: http://catalog:8003
       CATALOG_INTERNAL_AUTH_TOKEN: ecommerce-catalog-internal-secret
     ports:

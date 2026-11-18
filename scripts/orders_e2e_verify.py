@@ -271,8 +271,15 @@ def run_e2e() -> None:
         print(
             "\n==> [5/7] Testing cart concurrency: item modification during checkout is NOT lost..."
         )
+        prod1_version = next(
+            i["version"] for i in cart_data["items"] if i["product_id"] == prod1_id
+        )
+        prod2_version = next(
+            i["version"] for i in cart_data["items"] if i["product_id"] == prod2_id
+        )
+
         # Симулираме паралелна промяна: купувачът променя количеството на Продукт 2 на 3
-        # Това увеличава версията на Продукт 2 в Cart до v2
+        # Това увеличава версията на Продукт 2 в Cart до нова версия
         update_p2 = client.put(
             f"{GATEWAY_URL}/cart/items/{prod2_id}",
             headers=buyer_headers,
@@ -280,7 +287,7 @@ def run_e2e() -> None:
         )
         assert update_p2.status_code == 200
 
-        # Изчистване със стар снимок (където Продукт 1 е v1, а Продукт 2 е бил v1)
+        # Изчистване със стар снимок (където Продукт 1 е с първоначалната версия, а Продукт 2 е бил с предишната версия)
         # Директно през вътрешния API на Cart за симулация на Orders с по-ранен снимок
         internal_clear = client.post(
             f"{CART_API_URL}/internal/cart/{buyer_id}/clear-purchased",
@@ -288,11 +295,11 @@ def run_e2e() -> None:
             json={
                 "order_id": 999901,
                 "items": [
-                    {"product_id": prod1_id, "version": 1},
+                    {"product_id": prod1_id, "version": prod1_version},
                     {
                         "product_id": prod2_id,
-                        "version": 1,
-                    },  # Снимката е с v1, а в Cart вече е v2!
+                        "version": prod2_version,
+                    },  # Снимката е със старата версия, а в Cart вече е нова!
                 ],
             },
         )

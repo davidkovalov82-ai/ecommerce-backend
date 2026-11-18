@@ -8,10 +8,6 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.main import app
-from app.modules.accounts.repository import UserRepository
-from app.modules.cart.repository import CartRepository
-from app.modules.catalog.models import Product
-from app.modules.catalog.repository import ProductRepository
 from app.modules.orders.dependencies import get_payments_client
 from app.modules.orders.models import Order
 from app.modules.orders.payments_client import (
@@ -25,6 +21,7 @@ from app.modules.orders.payments_client import (
 )
 from app.modules.orders.repository import OrderRepository
 from app.modules.orders.service import OrderService
+from tests.mock_models import Product
 from tests.payments.helpers import (
     _create_order,
     _create_product,
@@ -178,9 +175,6 @@ def test_checkout_session_passes_authoritative_order_data_and_rotates_on_failure
         # Симулираме payment.failed -> Commerce отваря attempt_2
         svc = OrderService(
             order_repository=OrderRepository(db_session),
-            cart_repository=CartRepository(db_session),
-            product_repository=ProductRepository(db_session),
-            user_repository=UserRepository(db_session),
             session=db_session,
             payments_client=mock_client,
         )

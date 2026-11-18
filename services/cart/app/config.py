@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     # Споделен таен токен за междусервизен вътрешен достъп (/internal/*)
     internal_auth_token: str = "ecommerce-cart-internal-secret"
 
+    # Връзка с Users за проверка на статус и права на потребител
+    users_base_url: str = "http://localhost:8002"
+    users_internal_auth_token: str = "ecommerce-users-internal-secret"
+    users_timeout_seconds: float = 5.0
+
     # Връзка с Catalog за проверка на наличност и извличане на актуални цени
     catalog_base_url: str = "http://localhost:8003"
     catalog_internal_auth_token: str = "ecommerce-catalog-internal-secret"

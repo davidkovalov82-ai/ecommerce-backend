@@ -50,7 +50,7 @@ class ClearPurchasedItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     product_id: int
-    version: int | None = None
+    version: int = Field(gt=0)
 
 
 class ClearPurchasedRequest(BaseModel):
@@ -58,9 +58,8 @@ class ClearPurchasedRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    order_id: int | None = None
-    items: list[ClearPurchasedItem] | None = None
-    product_ids: list[int] | None = None
+    order_id: int = Field(gt=0)
+    items: list[ClearPurchasedItem]
 
 
 class ClearPurchasedResponse(BaseModel):
@@ -69,7 +68,7 @@ class ClearPurchasedResponse(BaseModel):
     status: str = "cleared"
     user_id: int
     cleared_product_ids: list[int]
-    order_id: int | None = None
+    order_id: int
 
 
 class ProductInternalDetails(BaseModel):

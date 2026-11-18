@@ -16,7 +16,7 @@ cleanup() {
   if [ "${exit_code}" -ne 0 ]; then
     echo "==> Failure detected (exit code: ${exit_code}). Dumping consumer and outbox logs..."
     docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" logs users-outbox-e2e || true
-    docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" logs commerce-user-consumer-e2e || true
+    docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" logs catalog-user-consumer-e2e || true
   fi
   echo "==> Cleaning up isolated Users E2E stack (${PROJECT_NAME})..."
   docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" down -v --remove-orphans >/dev/null 2>&1 || true
@@ -37,32 +37,33 @@ echo "==> [2/3] Running reproducible Commerce -> Users E2E verification..."
   uv run --locked python "${ROOT_DIR}/scripts/users_e2e_verify.py"
 )
 
-echo "==> [2.1/3] Verifying Users restart preserves profile updates and does not rerun migration..."
-# 1. Обновяваме профила на пренесения потребител директно в Users БД
-docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" exec -T db-e2e psql -U users_app -d users \
-  -c "UPDATE users SET display_name = 'Preserved Legacy Seller Profile' WHERE email = 'legacy-catalog@internal.ecommerce.com';"
+echo "==> [2.1/3] Verifying Users restart preserves profile updates..."
+# 1. Обновяваме профила на съществуващ потребител директно в Users БД
+TEST_USER_EMAIL=$(docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" exec -T db-e2e psql -U users_app -d users -tAc \
+  "SELECT email FROM users ORDER BY id ASC LIMIT 1;")
 
-# 2. Рестартираме контейнера users-e2e
-docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" restart users-e2e
+if [ -n "${TEST_USER_EMAIL}" ]; then
+  docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" exec -T db-e2e psql -U users_app -d users \
+    -c "UPDATE users SET display_name = 'Preserved Seller Profile' WHERE email = '${TEST_USER_EMAIL}';"
 
-# 3. Изчакваме готовността на users-e2e
-echo "    Waiting for Users service to become healthy after restart..."
-until [ "$(docker inspect --format='{{json .State.Health.Status}}' users-api-e2e 2>/dev/null)" = '"healthy"' ]; do
-  sleep 1
-done
+  # 2. Рестартираме контейнера users-e2e
+  docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" restart users-e2e
 
-# 4. Проверяваме, че еднократната задача за миграция не е рестартирана
-MIGRATION_STATUS=$(docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" ps -a --format '{{.Status}}' users-accounts-migration-e2e)
-echo "    One-off accounts migration task status: ${MIGRATION_STATUS}"
+  # 3. Изчакваме готовността на users-e2e
+  echo "    Waiting for Users service to become healthy after restart..."
+  until [ "$(docker inspect --format='{{json .State.Health.Status}}' users-api-e2e 2>/dev/null)" = '"healthy"' ]; do
+    sleep 1
+  done
 
-# 5. Проверяваме, че промяната в профила е запазена и не е презаписана от миграция
-UPDATED_NAME=$(docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" exec -T db-e2e psql -U users_app -d users -tAc \
-  "SELECT display_name FROM users WHERE email = 'legacy-catalog@internal.ecommerce.com';")
+  # 4. Проверяваме, че промяната в профила е запазена
+  UPDATED_NAME=$(docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" exec -T db-e2e psql -U users_app -d users -tAc \
+    "SELECT display_name FROM users WHERE email = '${TEST_USER_EMAIL}';")
 
-if [ "${UPDATED_NAME}" != "Preserved Legacy Seller Profile" ]; then
-  echo "ERROR: Migrated profile change was overwritten after Users restart! Got: '${UPDATED_NAME}'"
-  exit 1
+  if [ "${UPDATED_NAME}" != "Preserved Seller Profile" ]; then
+    echo "ERROR: Profile change was overwritten after Users restart! Got: '${UPDATED_NAME}'"
+    exit 1
+  fi
+  echo "==> Profile preserved across Users restart ('${UPDATED_NAME}')."
 fi
-echo "==> Migrated profile preserved across Users restart ('${UPDATED_NAME}')."
 
 echo "==> [3/3] Users isolated E2E suite completed successfully."

@@ -4,11 +4,9 @@ import uuid
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.modules.accounts.models import User
 from app.modules.accounts.tokens import create_access_token
-from app.modules.cart.models import CartItem
-from app.modules.catalog.models import Product
 from app.modules.orders.models import Order, OrderItem
+from tests.mock_models import CartItem, Product, User
 
 DEFAULT_SHIPPING_ADDRESS = {
     "recipient_name": "Иван Иванов",

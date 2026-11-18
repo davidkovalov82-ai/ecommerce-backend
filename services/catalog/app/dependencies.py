@@ -18,8 +18,19 @@ from app.repository import (
 )
 from app.service import CatalogService
 from app.tokens import InvalidToken, TokenData, decode_access_token
+from app.users_client import (
+    UsersClient,
+    UsersServiceAuthError,
+    UsersServiceUnavailableError,
+)
 
 oauth2_scheme = HTTPBearer(auto_error=False)
+_users_client = UsersClient()
+
+
+def get_users_client() -> UsersClient:
+    """Връща клиент към Users сервиса."""
+    return _users_client
 
 
 def get_db_session() -> Generator[Session]:
@@ -80,11 +91,9 @@ CatalogServiceDep = Annotated[CatalogService, Depends(get_catalog_service)]
 
 def get_current_user(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(oauth2_scheme)],
+    users_client: Annotated[UsersClient, Depends(get_users_client)],
 ) -> TokenData:
-    """Извлича и верифицира потребителя по Bearer токен (RS256 JWT от Users).
-
-    Заявки с фалшиви заглавки X-User-Id/X-User-Role без валиден JWT връщат 401.
-    """
+    """Извлича и верифицира потребителя по Bearer токен (RS256 JWT) и проверява статус в Users."""
     if credentials is None or not credentials.credentials:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -95,12 +104,73 @@ def get_current_user(
         )
 
     try:
-        return decode_access_token(credentials.credentials)
+        token_data = decode_access_token(credentials.credentials)
     except InvalidToken as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "INVALID_TOKEN", "message": str(exc)},
         ) from exc
+
+    try:
+        remote_user = users_client.get_user_status(token_data.user_id)
+    except (UsersServiceUnavailableError, UsersServiceAuthError):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "USERS_SERVICE_UNAVAILABLE",
+                "message": "Users service is unavailable",
+            },
+        )
+
+    if remote_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "USER_NOT_FOUND",
+                "message": "User not found",
+            },
+        )
+
+    if remote_user.token_version != token_data.token_version:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "INVALID_TOKEN",
+                "message": "Token has been revoked",
+            },
+        )
+
+    if remote_user.status == "blocked":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "ACCOUNT_BLOCKED",
+                "message": "Account is blocked",
+            },
+        )
+    if remote_user.status == "closed":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "ACCOUNT_CLOSED",
+                "message": "Account is closed",
+            },
+        )
+    if remote_user.status != "active":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "ACCOUNT_INACTIVE",
+                "message": "Account is inactive",
+            },
+        )
+
+    return TokenData(
+        user_id=remote_user.id,
+        role=remote_user.role,
+        email=remote_user.email,
+        token_version=remote_user.token_version,
+    )
 
 
 CurrentUserDep = Annotated[TokenData, Depends(get_current_user)]
@@ -123,8 +193,14 @@ def verify_internal_auth(
     x_internal_token: Annotated[str | None, Header(alias="X-Internal-Token")] = None,
 ) -> None:
     """Проверява таен токен за междусервизни заявки от Commerce."""
-    if not settings.internal_auth_token:
-        return
+    if not settings.internal_auth_token or not settings.internal_auth_token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "INTERNAL_AUTH_REQUIRED",
+                "message": "Internal authentication token is not configured",
+            },
+        )
     if not x_internal_token or not hmac.compare_digest(
         x_internal_token, settings.internal_auth_token
     ):

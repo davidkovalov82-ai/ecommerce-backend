@@ -2,6 +2,7 @@
 
 import logging
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.catalog_client import CatalogClient
@@ -130,40 +131,29 @@ class CartService:
     def clear_purchased(
         self,
         user_id: int,
-        product_ids: list[int] | None = None,
-        items: list[tuple[int, int | None]] | None = None,
-        order_id: int | None = None,
+        order_id: int,
+        items: list[tuple[int, int]],
     ) -> list[int]:
         """Премахва единствено успешно закупените позиции за дадена поръчка.
 
         Гарантира:
-        1. Идемпотентност по order_id.
-        2. Версионна безопасност: позиции с променена версия по време на checkout
+        1. Атомарно транзакционно заключване по order_id чрез pg_advisory_xact_lock.
+        2. Идемпотентност по order_id: паралелни повтори не изтриват нови промени на купувача.
+        3. Версионна безопасност: позиции с променена версия по време на checkout
            се запазват непокътнати в количката.
         """
         try:
-            if order_id is not None and self._cart_repository.is_order_cleared(
-                order_id
-            ):
+            self._session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtext('cart_clear_' || :oid))"),
+                {"oid": str(order_id)},
+            )
+            if self._cart_repository.is_order_cleared(order_id):
                 return []
 
-            if items:
-                cleared = self._cart_repository.delete_items_versioned(
-                    user_id=user_id, items=items
-                )
-            elif product_ids:
-                self._cart_repository.delete_items(
-                    user_id=user_id, product_ids=product_ids
-                )
-                cleared = product_ids
-            else:
-                cleared = []
-
-            if order_id is not None:
-                self._cart_repository.mark_order_cleared(
-                    order_id=order_id, user_id=user_id
-                )
-
+            cleared = self._cart_repository.delete_items_versioned(
+                user_id=user_id, items=items
+            )
+            self._cart_repository.mark_order_cleared(order_id=order_id, user_id=user_id)
             self._session.commit()
             return cleared
         except Exception:

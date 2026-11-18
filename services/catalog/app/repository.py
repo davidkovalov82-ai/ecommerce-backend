@@ -165,8 +165,8 @@ class SellerStatusRepository:
         seller_id: int,
         status: str,
         updated_at: datetime.datetime | None = None,
-    ) -> None:
-        """Вмъква или обновява локалния статус на продавач."""
+    ) -> bool:
+        """Вмъква или обновява локалния статус на продавач със защита от по-стари събития."""
         now = updated_at or datetime.datetime.now(datetime.UTC)
         stmt = (
             insert(SellerStatus)
@@ -174,10 +174,13 @@ class SellerStatusRepository:
             .on_conflict_do_update(
                 index_elements=[SellerStatus.seller_id],
                 set_={"status": status, "updated_at": now},
+                where=(SellerStatus.updated_at <= now),
             )
+            .returning(SellerStatus.seller_id)
         )
-        self._session.execute(stmt)
+        res = self._session.execute(stmt).scalar_one_or_none()
         self._session.flush()
+        return res is not None
 
     def is_inbox_event_processed(self, event_id: str) -> bool:
         """Проверява дали дадено събитие вече е обработено."""
@@ -206,10 +209,11 @@ class SellerStatusRepository:
                 received_at=datetime.datetime.now(datetime.UTC),
             )
             .on_conflict_do_nothing(index_elements=[SellerInboxEvent.event_id])
+            .returning(SellerInboxEvent.event_id)
         )
-        result = self._session.execute(stmt)
+        res = self._session.execute(stmt).scalar_one_or_none()
         self._session.flush()
-        return bool(result.rowcount and result.rowcount > 0)
+        return res is not None
 
 
 class ReservationRepository:

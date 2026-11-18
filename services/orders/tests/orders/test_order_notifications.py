@@ -10,9 +10,6 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.main import app
-from app.modules.accounts.repository import UserRepository
-from app.modules.cart.repository import CartRepository
-from app.modules.catalog.repository import ProductRepository
 from app.modules.orders.dependencies import get_payments_client
 from app.modules.orders.models import (
     Order,
@@ -51,9 +48,6 @@ def test_payment_succeeded_event_creates_outbox_event(db_session: Session) -> No
 
     svc = OrderService(
         order_repository=OrderRepository(db_session),
-        cart_repository=CartRepository(db_session),
-        product_repository=ProductRepository(db_session),
-        user_repository=UserRepository(db_session),
         session=db_session,
         payments_client=MagicMock(spec=PaymentsClient),
     )
@@ -95,9 +89,6 @@ def test_delayed_payment_succeeded_after_processing_creates_outbox_event(
 
     svc = OrderService(
         order_repository=OrderRepository(db_session),
-        cart_repository=CartRepository(db_session),
-        product_repository=ProductRepository(db_session),
-        user_repository=UserRepository(db_session),
         session=db_session,
         payments_client=MagicMock(spec=PaymentsClient),
     )
@@ -140,9 +131,6 @@ def test_reconciliation_defers_when_payments_reports_paid_until_event_arrives(
 
     service = OrderService(
         order_repository=OrderRepository(db_session),
-        cart_repository=CartRepository(db_session),
-        product_repository=ProductRepository(db_session),
-        user_repository=UserRepository(db_session),
         session=db_session,
         payments_client=mock_payments,
     )
@@ -180,9 +168,6 @@ def test_duplicate_payment_event_does_not_create_duplicate_outbox_event(
 
     svc = OrderService(
         order_repository=OrderRepository(db_session),
-        cart_repository=CartRepository(db_session),
-        product_repository=ProductRepository(db_session),
-        user_repository=UserRepository(db_session),
         session=db_session,
         payments_client=MagicMock(spec=PaymentsClient),
     )
@@ -221,9 +206,6 @@ def test_duplicate_reconciliation_does_not_create_duplicate_outbox_event(
     )
     service = OrderService(
         order_repository=OrderRepository(db_session),
-        cart_repository=CartRepository(db_session),
-        product_repository=ProductRepository(db_session),
-        user_repository=UserRepository(db_session),
         session=db_session,
         payments_client=mock_payments,
     )
@@ -231,12 +213,25 @@ def test_duplicate_reconciliation_does_not_create_duplicate_outbox_event(
     service.reconcile_expired_orders()
     service.reconcile_expired_orders()
 
-    events = (
+    paid_events = (
         db_session.query(OrderOutboxEvent)
-        .filter(OrderOutboxEvent.order_id == order.id)
+        .filter(
+            OrderOutboxEvent.order_id == order.id,
+            OrderOutboxEvent.event_type == "order.paid",
+        )
         .all()
     )
-    assert len(events) == 0
+    assert len(paid_events) == 0
+
+    release_events = (
+        db_session.query(OrderOutboxEvent)
+        .filter(
+            OrderOutboxEvent.order_id == order.id,
+            OrderOutboxEvent.event_type == "order.stock_release",
+        )
+        .all()
+    )
+    assert len(release_events) == 1
 
 
 def test_rollback_before_commit_does_not_leave_outbox_event(
@@ -251,9 +246,6 @@ def test_rollback_before_commit_does_not_leave_outbox_event(
 
     svc = OrderService(
         order_repository=OrderRepository(db_session),
-        cart_repository=CartRepository(db_session),
-        product_repository=ProductRepository(db_session),
-        user_repository=UserRepository(db_session),
         session=db_session,
         payments_client=MagicMock(spec=PaymentsClient),
     )
@@ -320,7 +312,10 @@ def test_no_outbox_event_for_pending_cancelled_expired(db_session: Session) -> N
     assert order1.status == "cancelled"
     events_cancelled = (
         db_session.query(OrderOutboxEvent)
-        .filter(OrderOutboxEvent.order_id == order1.id)
+        .filter(
+            OrderOutboxEvent.order_id == order1.id,
+            OrderOutboxEvent.event_type == "order.paid",
+        )
         .all()
     )
     assert len(events_cancelled) == 0
@@ -334,9 +329,6 @@ def test_no_outbox_event_for_pending_cancelled_expired(db_session: Session) -> N
 
     service = OrderService(
         order_repository=OrderRepository(db_session),
-        cart_repository=CartRepository(db_session),
-        product_repository=ProductRepository(db_session),
-        user_repository=UserRepository(db_session),
         session=db_session,
         payments_client=mock_payments,
     )
@@ -345,7 +337,10 @@ def test_no_outbox_event_for_pending_cancelled_expired(db_session: Session) -> N
     assert order2.status == "expired"
     events_expired = (
         db_session.query(OrderOutboxEvent)
-        .filter(OrderOutboxEvent.order_id == order2.id)
+        .filter(
+            OrderOutboxEvent.order_id == order2.id,
+            OrderOutboxEvent.event_type == "order.paid",
+        )
         .all()
     )
     assert len(events_expired) == 0

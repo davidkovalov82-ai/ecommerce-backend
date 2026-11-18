@@ -52,11 +52,9 @@ from app.config import settings
 from app.dependencies import get_db_session
 from app.main import app
 from app.modules.accounts.dependencies import get_users_client
-from app.modules.accounts.models import User
 from app.modules.cart.dependencies import get_cart_client
-from app.modules.cart.models import CartItem
 from app.modules.catalog.dependencies import get_catalog_client
-from app.modules.catalog.models import Product, SellerStatus
+from tests.mock_models import CartItem, Product, SellerStatus, User
 
 settings.jwt_public_key = _test_public_pem
 settings.jwt_algorithm = "RS256"

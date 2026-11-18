@@ -4,8 +4,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from app.main import app
-from app.modules.catalog.models import Product
 from app.modules.orders.models import Order, OrderItem
+from tests.mock_models import Product
 from tests.orders.helpers import (
     DEFAULT_SHIPPING_ADDRESS,
     ORDER_PAYLOAD,

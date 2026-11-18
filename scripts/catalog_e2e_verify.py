@@ -56,7 +56,7 @@ def wait_for_services(timeout_seconds: float = 35.0) -> None:
     )
     while time.time() - start < timeout_seconds:
         try:
-            r_c = httpx.get(f"{COMMERCE_API_URL}/openapi.json", timeout=2.0)
+            r_c = httpx.get(f"{COMMERCE_API_URL}/health", timeout=2.0)
             r_u = httpx.get(f"{USERS_API_URL}/health", timeout=2.0)
             r_cat = httpx.get(f"{CATALOG_API_URL}/health", timeout=2.0)
             if (

@@ -1,6 +1,7 @@
 """RabbitMQ consumer в Catalog за входящи събития за статус на потребители от Users."""
 
 import contextlib
+import datetime
 import json
 import logging
 import threading
@@ -80,7 +81,7 @@ class RabbitMQUserEventConsumer:
     def _handle_message(
         self, channel: Any, method: Any, properties: Any, body: bytes
     ) -> None:
-        """Обработва събитие за потребител идемпотентно."""
+        """Обработва събитие за потребител идемпотентно и защитено от стари събития."""
         try:
             payload = json.loads(body.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -88,36 +89,92 @@ class RabbitMQUserEventConsumer:
             channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
             return
 
+        if not isinstance(payload, dict):
+            logger.warning(
+                "User event payload is not a JSON object: %s; dropping", payload
+            )
+            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            return
+
         event_id = payload.get("event_id")
         event_type = payload.get("event_type", "user.status_changed")
         user_id = payload.get("user_id")
         status = payload.get("status")
+        occurred_at_raw = payload.get("occurred_at")
 
-        if not event_id or user_id is None or not status:
-            logger.warning("Malformed user event payload: %s; dropping", payload)
+        if not event_id or not isinstance(event_id, str):
+            logger.warning(
+                "Missing or invalid event_id in payload: %s; dropping", payload
+            )
             channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
             return
 
-        with self._session_factory() as session:
-            repo = SellerStatusRepository(session)
-            if repo.is_inbox_event_processed(str(event_id)):
-                logger.info(
-                    "User event %s already processed; acknowledging redelivery",
-                    event_id,
-                )
-                channel.basic_ack(delivery_tag=method.delivery_tag)
-                return
-
-            repo.upsert_status(seller_id=int(user_id), status=str(status))
-            repo.record_inbox_event_idempotent(
-                event_id=str(event_id),
-                seller_id=int(user_id),
-                event_type=str(event_type),
-                status=str(status),
+        try:
+            seller_id = int(user_id)  # type: ignore[arg-type]
+            if seller_id <= 0:
+                raise ValueError("user_id must be positive")
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "Invalid user_id in user event: %s (%s); dropping", user_id, exc
             )
-            session.commit()
+            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            return
 
-        channel.basic_ack(delivery_tag=method.delivery_tag)
+        if (
+            not status
+            or not isinstance(status, str)
+            or status not in ("active", "blocked", "closed")
+        ):
+            logger.warning("Invalid status in user event: %s; dropping", status)
+            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            return
+
+        event_time: datetime.datetime | None = None
+        if occurred_at_raw:
+            try:
+                event_time = datetime.datetime.fromisoformat(str(occurred_at_raw))
+                if event_time.tzinfo is None:
+                    event_time = event_time.replace(tzinfo=datetime.UTC)
+            except ValueError:
+                event_time = None
+        if event_time is None:
+            event_time = datetime.datetime.now(datetime.UTC)
+
+        try:
+            with self._session_factory() as session:
+                repo = SellerStatusRepository(session)
+                # 1. Атомарна дедупликация чрез опит за запис в inbox
+                is_new = repo.record_inbox_event_idempotent(
+                    event_id=str(event_id),
+                    seller_id=seller_id,
+                    event_type=str(event_type),
+                    status=str(status),
+                )
+                if not is_new:
+                    logger.info(
+                        "User event %s already processed; acknowledging redelivery",
+                        event_id,
+                    )
+                    session.commit()
+                    channel.basic_ack(delivery_tag=method.delivery_tag)
+                    return
+
+                # 2. Обновяване на статус със защита от по-стари събития
+                repo.upsert_status(
+                    seller_id=seller_id,
+                    status=str(status),
+                    updated_at=event_time,
+                )
+                session.commit()
+
+            channel.basic_ack(delivery_tag=method.delivery_tag)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Unexpected error processing user event %s: %s; dropping",
+                event_id,
+                exc,
+            )
+            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
     def consume_available(self, max_messages: int = 100) -> int:
         """Извлича наличните събития еднократно (за тестове)."""

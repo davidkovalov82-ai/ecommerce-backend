@@ -10,7 +10,6 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.modules.accounts.dependencies import resolve_users_client
-from app.modules.accounts.repository import UserRepository
 from app.modules.accounts.users_client import (
     UsersClient,
     UsersServiceUnavailableError,
@@ -23,7 +22,6 @@ from app.modules.catalog.client import (
     CatalogProductUnavailableError,
 )
 from app.modules.catalog.dependencies import resolve_catalog_client
-from app.modules.catalog.repository import ProductRepository
 from app.modules.orders.models import (
     Order,
     OrderItem,
@@ -124,8 +122,8 @@ class OrderService:
         self,
         order_repository: OrderRepository,
         cart_repository: Any = None,
-        product_repository: ProductRepository | None = None,
-        user_repository: UserRepository | None = None,
+        product_repository: Any = None,
+        user_repository: Any = None,
         session: Session | None = None,
         payments_client: PaymentsClient | None = None,
         users_client: UsersClient | None = None,
@@ -133,10 +131,6 @@ class OrderService:
         cart_client: CartClient | None = None,
     ) -> None:
         self._order_repository = order_repository
-        self._product_repository = product_repository
-        self._user_repository = user_repository or (
-            UserRepository(session) if session is not None else None
-        )
         self._session = session
         self._payments_client = payments_client or HttpPaymentsClient()
         self._users_client = resolve_users_client(users_client)
@@ -189,6 +183,7 @@ class OrderService:
         customer_email: str | None = None,
     ) -> Order:
         order: Order | None = None
+        order_committed: bool = False
         try:
             # 1. Единна DB блокировка за текущия потребител по user_id
             if self._session is not None:
@@ -221,18 +216,22 @@ class OrderService:
                         "Idempotency key was already used with a different shipping address"
                     )
                 # Идемпотентен опит за довършване на изчистването в Cart при повторение
-                try:
-                    retry_items = [
-                        {"product_id": it.product_id, "version": None}
-                        for it in existing_order.items
-                    ]
-                    self._cart_client.clear_purchased(
-                        user_id=user_id,
-                        items=retry_items,
-                        order_id=existing_order.id,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Idempotent cart clear retry failed: %s", exc)
+                clear_ev = self._order_repository.get_outbox_event(
+                    existing_order.id, "order.cart_clear"
+                )
+                if clear_ev is not None and clear_ev.payload.get("items"):
+                    try:
+                        self._cart_client.clear_purchased(
+                            user_id=user_id,
+                            items=clear_ev.payload["items"],
+                            order_id=existing_order.id,
+                        )
+                        if clear_ev.status == "pending":
+                            clear_ev.status = "published"
+                            clear_ev.published_at = datetime.datetime.now(datetime.UTC)
+                            self._session.commit()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("Idempotent cart clear retry failed: %s", exc)
                 return existing_order
 
             # 3. Прочитане на текущата количка през вътрешния API на Cart
@@ -299,6 +298,7 @@ class OrderService:
                 )
 
             # 6. Създаване на поръчката с адрес за доставка
+            order_committed = False
             now = datetime.datetime.now(datetime.UTC)
             expires_at = now + datetime.timedelta(
                 minutes=settings.order_reserve_timeout_minutes
@@ -396,6 +396,7 @@ class OrderService:
             # 11. Записване на транзакцията (поръчката се записва ПРЕДИ изчистването)
             self._session.flush()
             self._session.commit()
+            order_committed = True
             self._session.refresh(order)
             _ = order.items
             _ = order.shipments
@@ -420,7 +421,11 @@ class OrderService:
             return order
         except Exception:
             self._session.rollback()
-            if order is not None and getattr(order, "id", None) is not None:
+            if (
+                not order_committed
+                and order is not None
+                and getattr(order, "id", None) is not None
+            ):
                 try:
                     self._catalog_client.release_stock(order.id)
                 except Exception as exc:  # noqa: BLE001
@@ -540,10 +545,11 @@ class OrderService:
             # Намиране на контактите на купувача за известието от записания email в поръчката
             customer_email = order.customer_email
             if not customer_email:
-                from app.modules.accounts.models import User
-
-                user_row = self._session.query(User).filter_by(id=order.user_id).first()
-                customer_email = user_row.email if (user_row and user_row.email) else ""
+                try:
+                    remote_u = self._users_client.get_user_status(order.user_id)
+                    customer_email = remote_u.email if remote_u else ""
+                except Exception:  # noqa: BLE001
+                    customer_email = ""
             customer_phone = (order.shipping_phone or "").strip() or None
 
             # Позиции само за този продавач
@@ -587,12 +593,40 @@ class OrderService:
             raise
 
     def _restore_order_stock(self, order: Order) -> None:
-        """Възстановява запазените количества от позициите на поръчката в склада чрез Catalog."""
+        """Възстановява запазените количества от позициите на поръчката в склада чрез Catalog.
+
+        Записва Outbox събитие order.stock_release за гарантирано фоново повторение,
+        след което прави опит за незабавно освобождаване през CatalogClient.
+        """
+        existing = self._order_repository.get_outbox_event(
+            order.id, "order.stock_release"
+        )
+        release_event: OrderOutboxEvent | None = None
+        if existing is None:
+            release_event = OrderOutboxEvent(
+                event_id=str(uuid.uuid4()),
+                event_type="order.stock_release",
+                event_version=1,
+                order_id=order.id,
+                status="pending",
+                payload={"order_id": order.id},
+            )
+            self._session.add(release_event)
+
         try:
             self._catalog_client.release_stock(order.id)
-        except Exception as exc:
-            logger.error("Failed to release stock for order %s: %s", order.id, exc)
-            raise
+            if release_event is not None:
+                release_event.status = "published"
+                release_event.published_at = datetime.datetime.now(datetime.UTC)
+            elif existing is not None and existing.status == "pending":
+                existing.status = "published"
+                existing.published_at = datetime.datetime.now(datetime.UTC)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Immediate stock release failed for order %s (%s). Outbox processor will retry.",
+                order.id,
+                exc,
+            )
 
     def _transition_order_to_paid(self, order: Order) -> None:
         """Превежда поръчката в статус paid и записва outbox събитие order.paid в същата транзакция.
@@ -612,10 +646,11 @@ class OrderService:
 
         customer_email = order.customer_email
         if not customer_email:
-            from app.modules.accounts.models import User
-
-            user_row = self._session.query(User).filter_by(id=order.user_id).first()
-            customer_email = user_row.email if (user_row and user_row.email) else ""
+            try:
+                remote_u = self._users_client.get_user_status(order.user_id)
+                customer_email = remote_u.email if remote_u else ""
+            except Exception:  # noqa: BLE001
+                customer_email = ""
         customer_phone = (order.shipping_phone or "").strip() or None
         now = datetime.datetime.now(datetime.UTC)
 

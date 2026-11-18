@@ -4,6 +4,7 @@ import datetime
 from collections.abc import Sequence
 from typing import Any
 
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -51,6 +52,14 @@ class ProductUnavailable(Exception):
     def __init__(self, product_id: int, message: str = "Product unavailable") -> None:
         super().__init__(message)
         self.product_id = product_id
+
+
+class ReservationConflict(Exception):
+    """Сигнализира, че за същия order_id съществува резервация с различен състав или вече освободена."""
+
+
+class InvalidReservationItems(Exception):
+    """Сигнализира невалиден състав за резервация (празен списък или дублиращи се позиции)."""
 
 
 def is_unique_category_name_violation(exc: IntegrityError) -> bool:
@@ -303,19 +312,51 @@ class CatalogService:
     def reserve_stock(self, order_id: int, items: Sequence[StockReserveItem]) -> None:
         """Атомарно и идемпотентно резервиране на наличност за поръчка.
 
-        1. Проверява дали за този order_id вече съществуват резервации.
-           Ако всички са в статус 'reserved' -> не прави повторно сваляне, връща успех.
-        2. Заключва засегнатите продукти във възходящ ред по ID с FOR UPDATE.
-        3. Проверява активност, статус на продавача и достатъчна наличност.
-        4. Намалява наличността (product.stock -= qty).
-        5. Създава записи в stock_reservations със статус 'reserved'.
-        6. Commit на транзакцията.
+        1. Валидира непразен състав и уникални product_id.
+        2. Заключва транзакционно order_id (pg_advisory_xact_lock) за защита от паралелни първи резервации.
+        3. Проверява дали за този order_id вече съществуват резервации:
+           - Същият състав и всички са 'reserved' -> безопасен повтор (връща успех).
+           - Различен състав или вече освободени -> хвърля ReservationConflict (409).
+        4. Заключва засегнатите продукти във възходящ ред по ID с FOR UPDATE.
+        5. Проверява активност, статус на продавача и достатъчна наличност.
+        6. Намалява наличността (product.stock -= qty).
+        7. Създава записи в stock_reservations със статус 'reserved'.
+        8. Commit на транзакцията.
         """
+        if not items:
+            raise InvalidReservationItems("Reservation items cannot be empty")
+        req_pids = [item.product_id for item in items]
+        if len(req_pids) != len(set(req_pids)):
+            raise InvalidReservationItems("Duplicate product_id in reservation items")
+
         try:
+            self._session.execute(
+                text(
+                    "SELECT pg_advisory_xact_lock(hashtext('catalog_reserve_' || :oid))"
+                ),
+                {"oid": str(order_id)},
+            )
+
+            self._session.execute(
+                text(
+                    "SELECT pg_advisory_xact_lock(hashtext('catalog_reserve_' || :oid))"
+                ),
+                {"oid": str(order_id)},
+            )
+
             existing = self._reservation_repository.get_by_order_id_for_update(order_id)
-            if existing and all(r.status == "reserved" for r in existing):
-                # Идемпотентно повторение за същата поръчка
-                return
+            if existing:
+                existing_map = {r.product_id: r.quantity for r in existing}
+                requested_map = {item.product_id: item.quantity for item in items}
+                if existing_map != requested_map:
+                    raise ReservationConflict(
+                        f"Reservation for order {order_id} exists with different items"
+                    )
+                if all(r.status == "reserved" for r in existing):
+                    return
+                raise ReservationConflict(
+                    f"Reservation for order {order_id} has already been released"
+                )
 
             sorted_product_ids = sorted({item.product_id for item in items})
             locked_products = self._product_repository.get_by_ids_for_update(
@@ -362,12 +403,25 @@ class CatalogService:
     def release_stock(self, order_id: int) -> None:
         """Идемпотентно освобождаване на резервирана наличност за поръчка.
 
-        1. Извлича и заключва записите за този order_id.
-        2. Ако няма резервации или вече са освободени ('released') -> нищо не се променя.
-        3. Ако има 'reserved' записи -> заключва продуктите, увеличава stock и обновява записа.
-        4. Commit на транзакцията.
+        1. Заключва транзакционно order_id (pg_advisory_xact_lock) за защита от състезание reserve/release.
+        2. Извлича и заключва записите за този order_id.
+        3. Ако няма резервации или вече са освободени ('released') -> нищо не се променя.
+        4. Ако има 'reserved' записи -> заключва продуктите, увеличава stock и обновява записа.
+        5. Commit на транзакцията.
         """
         try:
+            self._session.execute(
+                text(
+                    "SELECT pg_advisory_xact_lock(hashtext('catalog_reserve_' || :oid))"
+                ),
+                {"oid": str(order_id)},
+            )
+            self._session.execute(
+                text(
+                    "SELECT pg_advisory_xact_lock(hashtext('catalog_reserve_' || :oid))"
+                ),
+                {"oid": str(order_id)},
+            )
             existing = self._reservation_repository.get_by_order_id_for_update(order_id)
             if not existing:
                 return

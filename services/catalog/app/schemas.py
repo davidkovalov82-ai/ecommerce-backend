@@ -1,6 +1,6 @@
 """Pydantic схеми за заявки и отговори в Catalog."""
 
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -171,8 +171,17 @@ class StockReserveItem(BaseModel):
 class StockReserveRequest(BaseModel):
     """Заявка от Orders за резервиране на наличност за дадена поръчка."""
 
-    order_id: int
+    order_id: int = Field(gt=0)
     items: list[StockReserveItem]
+
+    @model_validator(mode="after")
+    def validate_items(self) -> Self:
+        if not self.items:
+            raise ValueError("Reservation items cannot be empty")
+        pids = [item.product_id for item in self.items]
+        if len(pids) != len(set(pids)):
+            raise ValueError("Duplicate product_id in reservation items")
+        return self
 
 
 class StockReserveResponse(BaseModel):

@@ -9,10 +9,6 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.main import app
-from app.modules.accounts.repository import UserRepository
-from app.modules.cart.repository import CartRepository
-from app.modules.catalog.models import Product
-from app.modules.catalog.repository import ProductRepository
 from app.modules.orders.models import (
     Order,
     OrderInboxEvent,
@@ -23,6 +19,7 @@ from app.modules.orders.payment_consumer import RabbitMQPaymentEventConsumer
 from app.modules.orders.payments_client import PaymentsClient
 from app.modules.orders.repository import OrderRepository
 from app.modules.orders.service import OrderService
+from tests.mock_models import Product
 from tests.payments.helpers import (
     _create_order,
     _create_product,
@@ -37,9 +34,6 @@ client = TestClient(app)
 def _new_service(session: Session) -> OrderService:
     return OrderService(
         order_repository=OrderRepository(session),
-        cart_repository=CartRepository(session),
-        product_repository=ProductRepository(session),
-        user_repository=UserRepository(session),
         session=session,
         payments_client=MagicMock(spec=PaymentsClient),
     )

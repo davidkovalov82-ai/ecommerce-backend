@@ -7,10 +7,6 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.main import app
-from app.modules.accounts.repository import UserRepository
-from app.modules.cart.repository import CartRepository
-from app.modules.catalog.models import Product
-from app.modules.catalog.repository import ProductRepository
 from app.modules.orders.dependencies import get_payments_client
 from app.modules.orders.models import Order
 from app.modules.orders.payments_client import (
@@ -24,6 +20,7 @@ from app.modules.orders.payments_client import (
 )
 from app.modules.orders.repository import OrderRepository
 from app.modules.orders.service import OrderService
+from tests.mock_models import Product
 from tests.payments.helpers import (
     _create_order,
     _create_product,
@@ -415,9 +412,6 @@ def test_cancel_order_concurrent_payment_expired_and_retry_checkout_leaves_cance
             with session_factory() as event_session:
                 svc = OrderService(
                     order_repository=OrderRepository(event_session),
-                    cart_repository=CartRepository(event_session),
-                    product_repository=ProductRepository(event_session),
-                    user_repository=UserRepository(event_session),
                     session=event_session,
                     payments_client=coordinator,
                 )
@@ -586,9 +580,6 @@ def test_lost_response_cancellation_saves_cancelled_outcome_and_restores_stock(
         assert p_lost is not None and p_lost.stock == 8
         svc_lost = OrderService(
             order_repository=OrderRepository(s_lost),
-            cart_repository=CartRepository(s_lost),
-            product_repository=ProductRepository(s_lost),
-            user_repository=UserRepository(s_lost),
             session=s_lost,
         )
         assert (
@@ -643,9 +634,6 @@ def test_terminal_closure_conflict_expired_prevents_manual_cancel_and_restores_s
     with session_factory() as s_exp:
         svc_exp = OrderService(
             order_repository=OrderRepository(s_exp),
-            cart_repository=CartRepository(s_exp),
-            product_repository=ProductRepository(s_exp),
-            user_repository=UserRepository(s_exp),
             session=s_exp,
         )
         assert (
@@ -687,9 +675,6 @@ def test_terminal_closure_conflict_cancelled_defers_reconciliation_and_preserves
     with session_factory() as s_rec:
         svc_rec = OrderService(
             order_repository=OrderRepository(s_rec),
-            cart_repository=CartRepository(s_rec),
-            product_repository=ProductRepository(s_rec),
-            user_repository=UserRepository(s_rec),
             session=s_rec,
             payments_client=mock_can,
         )

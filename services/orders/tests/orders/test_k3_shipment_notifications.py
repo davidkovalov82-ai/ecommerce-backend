@@ -7,10 +7,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.main import app
-from app.modules.catalog.models import Product
 from app.modules.orders.models import Order, OrderOutboxEvent, Shipment
 from app.modules.orders.outbox_processor import OutboxProcessor
 from app.modules.orders.publisher import BrokerUnavailableError, EventPublisher
+from tests.mock_models import Product
 from tests.orders.helpers import (
     DEFAULT_SHIPPING_ADDRESS,
     _add_to_cart,

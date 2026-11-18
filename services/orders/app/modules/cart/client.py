@@ -140,19 +140,23 @@ class CartClient:
     def clear_purchased(
         self,
         user_id: int,
-        product_ids: list[int] | None = None,
         items: list[dict[str, Any]] | None = None,
         order_id: int | None = None,
+        product_ids: list[int] | None = None,
     ) -> dict[str, Any]:
         """Изчиства само закупените позиции от количката след успешна поръчка."""
         url = f"/internal/cart/{user_id}/clear-purchased"
-        payload: dict[str, Any] = {}
-        if order_id is not None:
-            payload["order_id"] = order_id
+        payload: dict[str, Any] = {
+            "order_id": order_id if order_id is not None else 0,
+        }
         if items is not None:
             payload["items"] = items
-        if product_ids is not None:
-            payload["product_ids"] = product_ids
+        elif product_ids is not None:
+            payload["items"] = [
+                {"product_id": pid, "version": 1} for pid in product_ids
+            ]
+        else:
+            payload["items"] = []
 
         try:
             resp = self._client.post(

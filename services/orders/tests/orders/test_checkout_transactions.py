@@ -5,9 +5,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.main import app
-from app.modules.cart.models import CartItem
-from app.modules.catalog.models import Product
 from app.modules.orders.models import Order, OrderItem
+from tests.mock_models import CartItem, Product
 from tests.orders.helpers import (
     ORDER_PAYLOAD,
     _add_to_cart,

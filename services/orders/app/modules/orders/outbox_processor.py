@@ -10,6 +10,8 @@ from sqlalchemy.orm import Session
 
 from app.modules.cart.client import CartClient
 from app.modules.cart.dependencies import resolve_cart_client
+from app.modules.catalog.client import CatalogClient
+from app.modules.catalog.dependencies import resolve_catalog_client
 from app.modules.orders.publisher import EventPublisher, RabbitMQEventPublisher
 from app.modules.orders.repository import OrderRepository
 
@@ -41,10 +43,12 @@ class OutboxProcessor:
         session_factory: Callable[[], Session],
         publisher: EventPublisher | None = None,
         cart_client: CartClient | None = None,
+        catalog_client: CatalogClient | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._publisher = publisher or RabbitMQEventPublisher()
         self._cart_client = cart_client or resolve_cart_client()
+        self._catalog_client = catalog_client or resolve_catalog_client()
 
     def close(self) -> None:
         """Затваря връзката на издателя при спиране на процеса."""
@@ -107,13 +111,49 @@ class OutboxProcessor:
                         self._cart_client.clear_purchased(
                             user_id=payload["user_id"],
                             items=payload.get("items"),
-                            product_ids=payload.get("product_ids"),
                             order_id=payload.get("order_id"),
                         )
                 except Exception as exc:  # noqa: BLE001
                     safe_error = _sanitize_error_message(exc, payload)
                     logger.warning(
                         "Failed to clear cart for outbox event event_id=%s order_id=%s error=%s",
+                        event_id,
+                        order_id,
+                        safe_error,
+                    )
+                    with self._session_factory() as session:
+                        repo = OrderRepository(session)
+                        event = repo.get_outbox_event_by_id_for_update(outbox_id)
+                        if event and event.status == "pending":
+                            event.retry_count += 1
+                            event.last_error = safe_error
+                            session.commit()
+                    stats["failed"] += 1
+                    continue
+
+                now = datetime.datetime.now(datetime.UTC)
+                with self._session_factory() as session:
+                    repo = OrderRepository(session)
+                    event = repo.get_outbox_event_by_id_for_update(outbox_id)
+                    if event and event.status == "pending":
+                        event.status = "published"
+                        event.published_at = now
+                        event.processed_at = now
+                        event.last_error = None
+                        session.commit()
+                stats["published"] += 1
+                continue
+
+            if event_type == "order.stock_release":
+                try:
+                    if self._catalog_client:
+                        self._catalog_client.release_stock(
+                            order_id=payload["order_id"],
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    safe_error = _sanitize_error_message(exc, payload)
+                    logger.warning(
+                        "Failed to release stock for outbox event event_id=%s order_id=%s error=%s",
                         event_id,
                         order_id,
                         safe_error,

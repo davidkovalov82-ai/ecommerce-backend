@@ -5,11 +5,10 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.modules.accounts.models import User
 from app.modules.accounts.tokens import create_access_token
-from app.modules.catalog.models import Product
 from app.modules.orders.models import Order, OrderItem
 from app.modules.orders.payment_contracts import ValidatedPaymentEvent
+from tests.mock_models import Product, User
 
 
 def _create_user_and_token(

@@ -6,10 +6,10 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.main import app
-from app.modules.catalog.models import Product
 from app.modules.orders.dependencies import get_payments_client
 from app.modules.orders.models import Order
 from app.modules.orders.payments_client import CancelPaymentResult, PaymentsClient
+from tests.mock_models import Product
 from tests.orders.helpers import (
     _create_order,
     _create_product,

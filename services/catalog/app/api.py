@@ -29,8 +29,10 @@ from app.service import (
     CategoryNotFound,
     InsufficientStock,
     InvalidCategoryId,
+    InvalidReservationItems,
     ProductNotFound,
     ProductUnavailable,
+    ReservationConflict,
 )
 
 categories_router = APIRouter(prefix="/categories", tags=["categories"])
@@ -311,6 +313,22 @@ def reserve_stock(
                 "code": "PRODUCT_UNAVAILABLE",
                 "product_id": exc.product_id,
                 "message": f"Product {exc.product_id} is unavailable or seller is inactive",
+            },
+        )
+    except ReservationConflict as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "RESERVATION_CONFLICT",
+                "message": str(exc),
+            },
+        )
+    except InvalidReservationItems as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "INVALID_RESERVATION_ITEMS",
+                "message": str(exc),
             },
         )
 

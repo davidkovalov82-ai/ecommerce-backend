@@ -2,7 +2,7 @@
 
 from fastapi.testclient import TestClient
 
-from tests.conftest import make_auth_headers
+from tests.conftest import MockUsersClient, make_auth_headers
 
 INTERNAL_HEADERS = {"X-Internal-Token": "ecommerce-catalog-internal-secret"}
 
@@ -204,3 +204,337 @@ def test_auth_headers_without_jwt_returns_401(client: TestClient) -> None:
     resp = client.get("/users/me/products", headers={"X-User-Id": "1"})
     assert resp.status_code == 401
     assert resp.json()["detail"]["code"] == "AUTHENTICATION_REQUIRED"
+
+
+def test_catalog_auth_revocation_blocking_and_fail_closed(
+    client: TestClient, mock_users_client: MockUsersClient
+) -> None:
+    """Проверка за валидиране на статус на потребителя през Users:
+
+    1. Оттеглен токен (token_version mismatch) -> 401
+    2. Блокиран потребител -> 403
+    3. Недостъпен Users сервиз -> 503 fail-closed
+    4. Празен или липсващ X-Internal-Token -> 401
+    5. Неконфигуриран вътрешен токен на сървъра -> 401
+    """
+    user_id = 42
+    # 1. Токен с token_version 0, но в Users токенът е вдигнат на 1
+    mock_users_client.set_user(user_id=user_id, token_version=1, status="active")
+    stale_headers = make_auth_headers(user_id=user_id, token_version=0)
+    resp = client.get("/users/me/products", headers=stale_headers)
+    assert resp.status_code == 401
+    assert resp.json()["detail"]["code"] == "INVALID_TOKEN"
+
+    # 2. Блокиран потребител
+    mock_users_client.set_user(user_id=user_id, token_version=0, status="blocked")
+    valid_headers = make_auth_headers(user_id=user_id, token_version=0)
+    resp = client.get("/users/me/products", headers=valid_headers)
+    assert resp.status_code == 403
+    assert resp.json()["detail"]["code"] == "ACCOUNT_BLOCKED"
+
+    # 3. Недостъпен Users сервиз -> fail-closed 503
+    mock_users_client.unavailable = True
+    resp = client.get("/users/me/products", headers=valid_headers)
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["code"] == "USERS_SERVICE_UNAVAILABLE"
+    mock_users_client.unavailable = False
+
+    # 4. Празен или липсващ вътрешен токен
+    resp = client.post(
+        "/internal/stock/reserve",
+        json={"order_id": 999, "items": [{"product_id": 1, "quantity": 1}]},
+        headers={"X-Internal-Token": ""},
+    )
+    assert resp.status_code == 401
+
+    resp = client.post(
+        "/internal/stock/reserve",
+        json={"order_id": 999, "items": [{"product_id": 1, "quantity": 1}]},
+        headers={},
+    )
+    assert resp.status_code == 401
+
+    # 5. Неконфигуриран вътрешен токен на сървъра не разрешава достъп
+    from app.config import settings
+
+    orig_token = settings.internal_auth_token
+    try:
+        settings.internal_auth_token = ""
+        resp = client.post(
+            "/internal/stock/reserve",
+            json={"order_id": 999, "items": [{"product_id": 1, "quantity": 1}]},
+            headers={"X-Internal-Token": ""},
+        )
+        assert resp.status_code == 401
+    finally:
+        settings.internal_auth_token = orig_token
+
+
+def test_stock_reservation_conflicts_and_validations(client: TestClient) -> None:
+    """Валидации и защита от конфликти при резервация в Catalog:
+
+    1. Празен състав на позиции -> 422
+    2. Повтарящи се product_id -> 422
+    3. Различен състав за същия order_id -> 409
+    4. Повторна резервация на вече освободена поръчка -> 409
+    """
+    seller_headers = make_auth_headers(user_id=10, role="customer")
+    resp = client.post(
+        "/products",
+        json={
+            "title": "Item A",
+            "price_minor": 1000,
+            "currency": "EUR",
+            "stock": 10,
+            "active": True,
+        },
+        headers=seller_headers,
+    )
+    prod_a = resp.json()["id"]
+
+    resp = client.post(
+        "/products",
+        json={
+            "title": "Item B",
+            "price_minor": 2000,
+            "currency": "EUR",
+            "stock": 10,
+            "active": True,
+        },
+        headers=seller_headers,
+    )
+    prod_b = resp.json()["id"]
+
+    # 1. Празен състав
+    resp = client.post(
+        "/internal/stock/reserve",
+        json={"order_id": 501, "items": []},
+        headers=INTERNAL_HEADERS,
+    )
+    assert resp.status_code == 422
+
+    # 2. Повтарящ се product_id
+    resp = client.post(
+        "/internal/stock/reserve",
+        json={
+            "order_id": 501,
+            "items": [
+                {"product_id": prod_a, "quantity": 1},
+                {"product_id": prod_a, "quantity": 2},
+            ],
+        },
+        headers=INTERNAL_HEADERS,
+    )
+    assert resp.status_code == 422
+
+    # 3. Първоначална резервация за order_id 501
+    resp = client.post(
+        "/internal/stock/reserve",
+        json={
+            "order_id": 501,
+            "items": [{"product_id": prod_a, "quantity": 2}],
+        },
+        headers=INTERNAL_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "reserved"
+
+    # Различен състав за същия order_id 501 -> 409 конфликт
+    resp = client.post(
+        "/internal/stock/reserve",
+        json={
+            "order_id": 501,
+            "items": [{"product_id": prod_b, "quantity": 2}],
+        },
+        headers=INTERNAL_HEADERS,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "RESERVATION_CONFLICT"
+
+    # Различно количество за същия order_id 501 -> 409 конфликт
+    resp = client.post(
+        "/internal/stock/reserve",
+        json={
+            "order_id": 501,
+            "items": [{"product_id": prod_a, "quantity": 3}],
+        },
+        headers=INTERNAL_HEADERS,
+    )
+    assert resp.status_code == 409
+
+    # 4. Освобождаване на поръчка 501
+    resp = client.post(
+        "/internal/stock/release",
+        json={"order_id": 501},
+        headers=INTERNAL_HEADERS,
+    )
+    assert resp.status_code == 200
+
+    # Опит за нова резервация за вече освободена поръчка -> 409 конфликт
+    resp = client.post(
+        "/internal/stock/reserve",
+        json={
+            "order_id": 501,
+            "items": [{"product_id": prod_a, "quantity": 2}],
+        },
+        headers=INTERNAL_HEADERS,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "RESERVATION_CONFLICT"
+
+
+def test_concurrent_reserve_and_release_safety(
+    mock_users_client: MockUsersClient,
+) -> None:
+    """Конкурентни заявки за reserve и release за един и същ order_id:
+
+    Advisory lock предпазва от надпревара между едновременни първи извиквания.
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from app.dependencies import get_db_session
+    from app.main import app
+    from tests.conftest import TestingSessionLocal
+
+    def override_session_factory():
+        with TestingSessionLocal() as s:
+            yield s
+
+    app.dependency_overrides[get_db_session] = override_session_factory
+
+    with TestClient(app) as local_client:
+        seller_headers = make_auth_headers(user_id=11, role="customer")
+        resp = local_client.post(
+            "/products",
+            json={
+                "title": "Concurrent Item",
+                "price_minor": 1500,
+                "currency": "EUR",
+                "stock": 10,
+                "active": True,
+            },
+            headers=seller_headers,
+        )
+        prod_id = resp.json()["id"]
+
+        order_id = 777
+        barrier = threading.Barrier(5)
+
+        def _do_reserve() -> int:
+            barrier.wait(timeout=5.0)
+            r = local_client.post(
+                "/internal/stock/reserve",
+                json={
+                    "order_id": order_id,
+                    "items": [{"product_id": prod_id, "quantity": 2}],
+                },
+                headers=INTERNAL_HEADERS,
+            )
+            return r.status_code
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            results = list(pool.map(lambda _: _do_reserve(), range(5)))
+
+        # Всички паралелни заявки с еднакъв състав за един order_id връщат 200 (идемпотентност)
+        assert all(code == 200 for code in results)
+
+        # Наличността е намалена точно с 2, не с 10!
+        resp = local_client.get(f"/products/{prod_id}")
+        assert resp.json()["stock"] == 8
+
+    app.dependency_overrides.pop(get_db_session, None)
+
+
+def test_catalog_consumer_validation_and_deduplication() -> None:
+    """Catalog потребителски consumer:
+
+    1. Валидация на съобщения (счупен JSON, липсващи полета) -> nack(requeue=False)
+    2. Атомарна дедупликация през seller_inbox_events
+    3. Защита от по-стари събития при пренареждане
+    """
+    import json
+    from unittest.mock import MagicMock
+
+    from app.models import SellerStatus
+    from app.user_consumer import RabbitMQUserEventConsumer
+    from tests.conftest import TestingSessionLocal
+
+    consumer = RabbitMQUserEventConsumer(session_factory=TestingSessionLocal)
+
+    mock_channel = MagicMock()
+    mock_method = MagicMock()
+    mock_method.delivery_tag = 1
+
+    # 1. Невалиден JSON
+    consumer._handle_message(
+        channel=mock_channel,
+        method=mock_method,
+        properties=MagicMock(),
+        body=b"not a valid json",
+    )
+    mock_channel.basic_nack.assert_called_once_with(delivery_tag=1, requeue=False)
+    mock_channel.reset_mock()
+
+    # 2. Невалидна схема (липсва user_id)
+    bad_payload = json.dumps(
+        {"event_id": "evt-1", "event_type": "user.blocked", "payload": {}}
+    ).encode("utf-8")
+    consumer._handle_message(
+        channel=mock_channel,
+        method=mock_method,
+        properties=MagicMock(),
+        body=bad_payload,
+    )
+    mock_channel.basic_nack.assert_called_once_with(delivery_tag=1, requeue=False)
+    mock_channel.reset_mock()
+
+    # 3. Валидно събитие
+    seller_id = 9999
+    valid_payload = json.dumps(
+        {
+            "event_id": "evt-valid-1",
+            "event_type": "user.blocked",
+            "occurred_at": "2026-11-18T10:00:00Z",
+            "user_id": seller_id,
+            "status": "blocked",
+        }
+    ).encode("utf-8")
+
+    consumer._handle_message(
+        channel=mock_channel,
+        method=mock_method,
+        properties=MagicMock(),
+        body=valid_payload,
+    )
+    mock_channel.basic_ack.assert_called_once_with(delivery_tag=1)
+    mock_channel.reset_mock()
+
+    with TestingSessionLocal() as session:
+        st = session.get(SellerStatus, seller_id)
+        assert st is not None
+        assert st.status == "blocked"
+
+    # 4. По-старо събитие за същия продавач (out-of-order) не презаписва по-новия статус
+    stale_payload = json.dumps(
+        {
+            "event_id": "evt-stale-2",
+            "event_type": "user.activated",
+            "occurred_at": "2026-11-17T10:00:00Z",  # По-старо с един ден!
+            "user_id": seller_id,
+            "status": "active",
+        }
+    ).encode("utf-8")
+
+    consumer._handle_message(
+        channel=mock_channel,
+        method=mock_method,
+        properties=MagicMock(),
+        body=stale_payload,
+    )
+    mock_channel.basic_ack.assert_called_once_with(delivery_tag=1)
+
+    with TestingSessionLocal() as session:
+        st = session.get(SellerStatus, seller_id)
+        assert st is not None
+        assert st.status == "blocked"  # Остава blocked!

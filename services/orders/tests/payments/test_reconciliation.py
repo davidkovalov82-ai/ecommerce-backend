@@ -4,9 +4,6 @@ from unittest.mock import MagicMock
 import pytest
 from sqlalchemy.orm import Session
 
-from app.modules.accounts.repository import UserRepository
-from app.modules.cart.repository import CartRepository
-from app.modules.catalog.repository import ProductRepository
 from app.modules.orders.payments_client import (
     CancelPaymentResult,
     PaymentGatewayError,
@@ -81,9 +78,6 @@ def test_reconciliation_service_and_rules(db_session: Session) -> None:
 
     service = OrderService(
         order_repository=OrderRepository(db_session),
-        cart_repository=CartRepository(db_session),
-        product_repository=ProductRepository(db_session),
-        user_repository=UserRepository(db_session),
         session=db_session,
         payments_client=mock_payments,
     )
@@ -146,9 +140,6 @@ def test_expired_reserve_with_unknown_initiated_payment_preserves_stock(
 
     service = OrderService(
         order_repository=OrderRepository(db_session),
-        cart_repository=CartRepository(db_session),
-        product_repository=ProductRepository(db_session),
-        user_repository=UserRepository(db_session),
         session=db_session,
         payments_client=mock_client,
     )
@@ -200,9 +191,6 @@ def test_lost_create_expired_payment_event_restores_stock_once_and_ignores_retri
     )
     service = OrderService(
         order_repository=OrderRepository(db_session),
-        cart_repository=CartRepository(db_session),
-        product_repository=ProductRepository(db_session),
-        user_repository=UserRepository(db_session),
         session=db_session,
         payments_client=mock_client,
     )

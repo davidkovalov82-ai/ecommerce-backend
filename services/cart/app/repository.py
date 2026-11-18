@@ -29,20 +29,20 @@ class CartRepository:
         return self._session.get(CartItem, (user_id, product_id))
 
     def upsert_item(self, user_id: int, product_id: int, quantity: int) -> CartItem:
-        """Вмъква нова позиция (version=1) или обновява количеството и инкрементира version."""
+        """Вмъква нова позиция или обновява количеството с нова монотонна версия от sequence."""
         stmt = (
             insert(CartItem)
             .values(
                 user_id=user_id,
                 product_id=product_id,
                 quantity=quantity,
-                version=1,
+                version=func.nextval("cart_item_version_seq"),
             )
             .on_conflict_do_update(
                 index_elements=[CartItem.user_id, CartItem.product_id],
                 set_={
                     "quantity": quantity,
-                    "version": CartItem.version + 1,
+                    "version": func.nextval("cart_item_version_seq"),
                     "updated_at": func.now(),
                 },
             )
@@ -86,21 +86,20 @@ class CartRepository:
         self._session.execute(stmt)
 
     def delete_items_versioned(
-        self, user_id: int, items: list[tuple[int, int | None]]
+        self, user_id: int, items: list[tuple[int, int]]
     ) -> list[int]:
         """Изтрива позициите само ако версията им в базата съвпада със снимката на поръчката.
 
-        Ако потребителят е променил количеството по време на checkout (по-висока версия),
-        позицията НЕ се изтрива и остава в количката му.
+        Ако потребителят е променил количеството по време на checkout (по-висока версия)
+        или позицията е била пресъздадена наново (нова версия от sequence), тя НЕ се изтрива.
         """
         cleared_ids: list[int] = []
         for product_id, expected_version in items:
             stmt = delete(CartItem).where(
                 CartItem.user_id == user_id,
                 CartItem.product_id == product_id,
+                CartItem.version == expected_version,
             )
-            if expected_version is not None:
-                stmt = stmt.where(CartItem.version == expected_version)
             res = self._session.execute(stmt)
             if res.rowcount > 0:
                 cleared_ids.append(product_id)

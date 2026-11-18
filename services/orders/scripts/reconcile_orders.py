@@ -7,9 +7,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.db import db
-from app.modules.accounts.repository import UserRepository
-from app.modules.cart.repository import CartRepository
-from app.modules.catalog.repository import ProductRepository
 from app.modules.orders.payments_client import HttpPaymentsClient
 from app.modules.orders.repository import OrderRepository
 from app.modules.orders.service import OrderService
@@ -20,9 +17,6 @@ def run_reconciliation() -> dict[str, int]:
     with db.session() as session:
         service = OrderService(
             order_repository=OrderRepository(session),
-            cart_repository=CartRepository(session),
-            product_repository=ProductRepository(session),
-            user_repository=UserRepository(session),
             session=session,
             payments_client=HttpPaymentsClient(),
         )

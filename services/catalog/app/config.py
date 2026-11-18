@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     # Споделен таен токен за междусервизен вътрешен достъп (/internal/*)
     internal_auth_token: str = "ecommerce-catalog-internal-secret"
 
+    # Връзка с Users за верификация на статус, права и token_version
+    users_base_url: str = "http://localhost:8002"
+    users_internal_auth_token: str = "ecommerce-users-internal-secret"
+    users_timeout_seconds: float = 5.0
+
     # JWT настройки за верификация на токени, издадени от Users
     jwt_algorithm: str = "RS256"
     jwt_issuer: str = "ecommerce-users"

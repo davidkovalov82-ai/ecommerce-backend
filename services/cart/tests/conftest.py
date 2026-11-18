@@ -41,9 +41,10 @@ os.environ["JWT_AUDIENCE"] = "ecommerce"
 
 from app.catalog_client import CatalogClient
 from app.config import settings
-from app.dependencies import get_catalog_client, get_db_session
+from app.dependencies import get_catalog_client, get_db_session, get_users_client
 from app.main import app
 from app.schemas import ProductInternalDetails
+from app.users_client import RemoteUserInfo, UsersServiceUnavailableError
 
 settings.jwt_public_key = _test_public_pem
 
@@ -171,17 +172,64 @@ def clean_tables() -> Generator[None]:
     _clean()
 
 
+class MockUsersClient:
+    """Мок клиент за Users в тестове на Cart."""
+
+    def __init__(self) -> None:
+        self.unavailable = False
+        self.users: dict[int, RemoteUserInfo] = {}
+
+    def set_user(
+        self,
+        user_id: int,
+        role: str = "customer",
+        status: str = "active",
+        token_version: int = 0,
+        email: str | None = None,
+    ) -> None:
+        self.users[user_id] = RemoteUserInfo(
+            id=user_id,
+            email=email or f"user{user_id}@example.com",
+            role=role,
+            status=status,
+            token_version=token_version,
+        )
+
+    def get_user_status(self, user_id: int) -> RemoteUserInfo | None:
+        if self.unavailable:
+            raise UsersServiceUnavailableError("Users mock is set to unavailable")
+        if user_id in self.users:
+            return self.users[user_id]
+        role = "admin" if user_id == 1 else "customer"
+        return RemoteUserInfo(
+            id=user_id,
+            email=f"user{user_id}@example.com",
+            role=role,
+            status="active",
+            token_version=0,
+        )
+
+
+@pytest.fixture
+def mock_users() -> MockUsersClient:
+    """Връща инстанция на MockUsersClient."""
+    return MockUsersClient()
+
+
 @pytest.fixture
 def client(
-    db_session: Session, mock_catalog: MockCatalogClient
+    db_session: Session,
+    mock_catalog: MockCatalogClient,
+    mock_users: MockUsersClient,
 ) -> Generator[TestClient]:
-    """FastAPI TestClient с пренасочена сесия и мок Catalog клиент."""
+    """FastAPI TestClient с пренасочена сесия и мок Catalog/Users клиенти."""
 
     def override_get_db_session() -> Generator[Session]:
         yield db_session
 
     app.dependency_overrides[get_db_session] = override_get_db_session
     app.dependency_overrides[get_catalog_client] = lambda: mock_catalog
+    app.dependency_overrides[get_users_client] = lambda: mock_users
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
@@ -191,6 +239,7 @@ def make_auth_headers(
     user_id: int,
     role: str = "customer",
     email: str = "buyer@example.com",
+    token_version: int = 0,
 ) -> dict[str, str]:
     """Генерира валидна заглавка Authorization с RS256 токен."""
     now = datetime.now(UTC)
@@ -198,7 +247,7 @@ def make_auth_headers(
         "sub": str(user_id),
         "role": role,
         "email": email,
-        "token_version": 0,
+        "token_version": token_version,
         "iss": "ecommerce-users",
         "aud": "ecommerce",
         "iat": int(now.timestamp()),
