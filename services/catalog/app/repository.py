@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.models import (
     Category,
+    OrderStockRelease,
     Product,
     SellerInboxEvent,
     SellerStatus,
@@ -246,3 +247,21 @@ class ReservationRepository:
         self._session.add(reservation)
         self._session.flush()
         return reservation
+
+    def is_order_released(self, order_id: int) -> bool:
+        """Проверява дали за поръчката вече е записан терминален факт за освобождаване."""
+        stmt = select(OrderStockRelease).where(OrderStockRelease.order_id == order_id)
+        return self._session.scalar(stmt) is not None
+
+    def mark_order_released(self, order_id: int) -> None:
+        """Записва терминалния факт за освобождаване на складова наличност."""
+        stmt = (
+            insert(OrderStockRelease)
+            .values(
+                order_id=order_id,
+                released_at=datetime.datetime.now(datetime.UTC),
+            )
+            .on_conflict_do_nothing(index_elements=[OrderStockRelease.order_id])
+        )
+        self._session.execute(stmt)
+        self._session.flush()

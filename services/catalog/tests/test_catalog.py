@@ -1,8 +1,20 @@
 """Тестове за основните сценарии на Catalog микросервиса."""
 
-from fastapi.testclient import TestClient
+import json
+from typing import Any
+from unittest.mock import MagicMock
 
-from tests.conftest import MockUsersClient, make_auth_headers
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
+
+from app.dependencies import get_users_client
+from app.main import app
+from app.models import Category, Product, SellerStatus
+from app.repository import CategoryRepository, ProductRepository
+from app.schemas import StockReserveItem
+from app.service import CatalogService, ReservationConflict
+from tests.conftest import MockUsersClient, TestingSessionLocal, make_auth_headers
 
 INTERNAL_HEADERS = {"X-Internal-Token": "ecommerce-catalog-internal-secret"}
 
@@ -395,7 +407,6 @@ def test_concurrent_reserve_and_release_safety(
 
     from app.dependencies import get_db_session
     from app.main import app
-    from tests.conftest import TestingSessionLocal
 
     def override_session_factory():
         with TestingSessionLocal() as s:
@@ -458,7 +469,6 @@ def test_catalog_consumer_validation_and_deduplication() -> None:
 
     from app.models import SellerStatus
     from app.user_consumer import RabbitMQUserEventConsumer
-    from tests.conftest import TestingSessionLocal
 
     consumer = RabbitMQUserEventConsumer(session_factory=TestingSessionLocal)
 
@@ -538,3 +548,165 @@ def test_catalog_consumer_validation_and_deduplication() -> None:
         st = session.get(SellerStatus, seller_id)
         assert st is not None
         assert st.status == "blocked"  # Остава blocked!
+
+
+def test_release_before_first_reserve_and_late_reserve_conflict(
+    db_session: Session,
+    mock_users_client: MockUsersClient,
+) -> None:
+    """Критерий: Терминален release преди reserve предотвратява късен reserve за същия order_id."""
+    app.dependency_overrides[get_users_client] = lambda: mock_users_client
+    seller_id = 100
+    mock_users_client.set_user(seller_id, "active", "seller", 1)
+
+    cat_repo = CategoryRepository(db_session)
+    category = cat_repo.create(Category(name="Electronics Early Release"))
+    db_session.commit()
+
+    prod_repo = ProductRepository(db_session)
+    product = prod_repo.create(
+        Product(
+            seller_id=seller_id,
+            category_id=category.id,
+            title="Early Release Gadget",
+            price_minor=5000,
+            currency="EUR",
+            stock=5,
+            active=True,
+        )
+    )
+    db_session.commit()
+
+    service = CatalogService(db_session)
+    order_id = 888801
+
+    # 1. Изпълняваме release преди какъвто и да е reserve
+    service.release_stock(order_id=order_id)
+
+    # Повторен release е идемпотентен
+    service.release_stock(order_id=order_id)
+
+    # 2. Късен reserve за същия order_id връща ReservationConflict и НЕ променя наличността
+    with pytest.raises(ReservationConflict, match="already been released"):
+        service.reserve_stock(
+            order_id=order_id,
+            items=[StockReserveItem(product_id=product.id, quantity=2)],
+        )
+
+    # Наличността остава точно 5
+    db_session.refresh(product)
+    assert product.stock == 5
+
+
+def test_consumer_transient_db_error_requeues_and_subsequent_delivery_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Критерий: Временен отказ на БД -> basic_nack(requeue=True); следваща доставка -> basic_ack."""
+    from sqlalchemy.exc import OperationalError
+
+    from app.user_consumer import RabbitMQUserEventConsumer
+
+    consumer = RabbitMQUserEventConsumer(
+        session_factory=TestingSessionLocal,
+        retry_delay=0.0,
+    )
+
+    seller_id = 77771
+    event_payload = json.dumps(
+        {
+            "event_id": "evt-transient-1",
+            "event_type": "user.blocked",
+            "occurred_at": "2026-11-18T12:00:00Z",
+            "user_id": seller_id,
+            "status": "blocked",
+        }
+    ).encode("utf-8")
+
+    # 1. Първа доставка: симулираме временна грешка в базата (OperationalError)
+    def raise_operational(*_args: Any, **_kwargs: Any) -> None:
+        raise OperationalError("SELECT 1", {}, Exception("Database connection refused"))
+
+    monkeypatch.setattr(
+        "app.repository.SellerStatusRepository.record_inbox_event_idempotent",
+        raise_operational,
+    )
+
+    mock_channel1 = MagicMock()
+    mock_method1 = MagicMock()
+    mock_method1.delivery_tag = 101
+
+    consumer._handle_message(
+        channel=mock_channel1,
+        method=mock_method1,
+        properties=MagicMock(),
+        body=event_payload,
+    )
+
+    # Трябва да извика nack с requeue=True
+    mock_channel1.basic_nack.assert_called_once_with(delivery_tag=101, requeue=True)
+    mock_channel1.basic_ack.assert_not_called()
+
+    # Статусът в БД още не е записан
+    with TestingSessionLocal() as session:
+        st = session.get(SellerStatus, seller_id)
+        assert st is None
+
+    # 2. Втора доставка: базата данни е възстановена
+    monkeypatch.undo()
+
+    mock_channel2 = MagicMock()
+    mock_method2 = MagicMock()
+    mock_method2.delivery_tag = 102
+
+    consumer._handle_message(
+        channel=mock_channel2,
+        method=mock_method2,
+        properties=MagicMock(),
+        body=event_payload,
+    )
+
+    # Сега трябва да е потвърдено успешно с basic_ack
+    mock_channel2.basic_ack.assert_called_once_with(delivery_tag=102)
+    mock_channel2.basic_nack.assert_not_called()
+
+    # Статусът е успешно обновен в БД
+    with TestingSessionLocal() as session:
+        st = session.get(SellerStatus, seller_id)
+        assert st is not None
+        assert st.status == "blocked"
+
+
+def test_consumer_rejects_missing_or_invalid_occurred_at() -> None:
+    """Критерий: Липсващо или невалидно occurred_at не се подменя с now(), а директно се отхвърля."""
+    from app.user_consumer import RabbitMQUserEventConsumer
+
+    consumer = RabbitMQUserEventConsumer(session_factory=TestingSessionLocal)
+    mock_channel = MagicMock()
+    mock_method = MagicMock()
+    mock_method.delivery_tag = 1
+
+    # Липсващо occurred_at
+    no_time_payload = json.dumps(
+        {
+            "event_id": "evt-no-time",
+            "event_type": "user.blocked",
+            "user_id": 9991,
+            "status": "blocked",
+        }
+    ).encode("utf-8")
+    consumer._handle_message(mock_channel, mock_method, MagicMock(), no_time_payload)
+    mock_channel.basic_nack.assert_called_once_with(delivery_tag=1, requeue=False)
+    mock_channel.reset_mock()
+
+    # Невалиден формат на occurred_at
+    bad_time_payload = json.dumps(
+        {
+            "event_id": "evt-bad-time",
+            "event_type": "user.blocked",
+            "occurred_at": "not-a-timestamp",
+            "user_id": 9991,
+            "status": "blocked",
+        }
+    ).encode("utf-8")
+    consumer._handle_message(mock_channel, mock_method, MagicMock(), bad_time_payload)
+    mock_channel.basic_nack.assert_called_once_with(delivery_tag=1, requeue=False)

@@ -337,12 +337,10 @@ class CatalogService:
                 {"oid": str(order_id)},
             )
 
-            self._session.execute(
-                text(
-                    "SELECT pg_advisory_xact_lock(hashtext('catalog_reserve_' || :oid))"
-                ),
-                {"oid": str(order_id)},
-            )
+            if self._reservation_repository.is_order_released(order_id):
+                raise ReservationConflict(
+                    f"Reservation for order {order_id} has already been released"
+                )
 
             existing = self._reservation_repository.get_by_order_id_for_update(order_id)
             if existing:
@@ -416,19 +414,16 @@ class CatalogService:
                 ),
                 {"oid": str(order_id)},
             )
-            self._session.execute(
-                text(
-                    "SELECT pg_advisory_xact_lock(hashtext('catalog_reserve_' || :oid))"
-                ),
-                {"oid": str(order_id)},
-            )
+            self._reservation_repository.mark_order_released(order_id)
             existing = self._reservation_repository.get_by_order_id_for_update(order_id)
             if not existing:
+                self._session.commit()
                 return
 
             active_reservations = [r for r in existing if r.status == "reserved"]
             if not active_reservations:
                 # Всички вече са освободени
+                self._session.commit()
                 return
 
             product_ids = sorted({r.product_id for r in active_reservations})

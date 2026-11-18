@@ -172,7 +172,7 @@ jobs:
         run: uv run --locked ruff format --check .
 
       - name: Initialize database and role
-        run: uv run --locked python scripts/init_db.py
+        run: uv run --locked python -m scripts.init_db
 
       - name: Apply migrations to an empty database
         run: uv run --locked alembic upgrade head
@@ -237,7 +237,7 @@ jobs:
         run: uv run --locked ruff format --check .
 
       - name: Initialize database and role
-        run: uv run --locked python scripts/init_db.py
+        run: uv run --locked python -m scripts.init_db
 
       - name: Apply migrations to an empty database
         run: uv run --locked alembic upgrade head

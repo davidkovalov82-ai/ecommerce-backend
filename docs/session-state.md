@@ -1,18 +1,16 @@
 # Session State
 
-- **Текуща задача**: Завършване на интеграцията K6.2–K6.4 след отделянето на Catalog, Cart и Orders.
+- **Текуща задача**: Корекции на устойчивостта и детайлите в Catalog, Cart и Orders (K6.2–K6.4).
 - **Реализирано**:
-  - Catalog & Cart: валидация на статус, роля и token_version през Users; fail-closed защита; празен вътрешен токен не заобикаля автентикацията.
-  - Catalog consumer: валидация на схемата, атомарна дедупликация и защита от презаписване с по-стари събития.
-  - Catalog наличности: advisory lock за паралелни reserve/release; 409 при конфликтен състав за същия order_id; валидация за празен/дублиран състав.
-  - Orders: грешка след commit не освобождава наличност; release при отказ се записва в Outbox (`order.stock_release`) за фонов retry.
-  - Cart: монотонни версии през sequence `cart_item_version_seq`; изчистване само по точни версии; advisory lock и дедупликация по order_id.
-  - Премахнати остатъчни чужди домейни от Orders; обновени Compose и CI за директни Users проверки.
+  - Orders: `_restore_order_stock` записва статус и pending outbox в една транзакция; Catalog release се вика само след commit; защитен rollback.
+  - Catalog: терминален запис за release (`order_stock_releases`) предотвратява късен reserve; премахнат дублиран advisory lock.
+  - Catalog consumer: разграничени временни DB грешки (requeue+delay) от невалидни събития (nack); строга валидация на `occurred_at`.
+  - CI: Cart и Catalog стартират `init_db` през `uv run --locked python -m scripts.init_db`.
 - **Проверено**:
-  - `make test-catalog-e2e`, `make test-cart-e2e`, `make test-orders-e2e`, `make test-users-e2e` (всички 4 E2E преминават на чист стенд).
-  - Unit тестове: Users (57), Catalog (8), Cart (9), Orders (126), Payments (34), Notifications (39) — общо 273 passed, 0 failed.
-  - Ruff lint & format: 100% чист код във всички 6 сервиза и скриптове.
-- **Непроверено**: Натоварващо тестване в реална мулти-нод среда (извън обхвата).
+  - Unit suites: Orders (127), Catalog (11), Cart (9), Users (57), Payments (34), Notifications (39) — общо 277 passed.
+  - E2E suites: `make test-catalog-e2e`, `make test-cart-e2e`, `make test-orders-e2e`, `make test-users-e2e` (чист стенд).
+  - Ruff check & format: 100% чист във всички 6 сервиза.
+- **Непроверено**: Продукционна мулти-нод среда (извън обхвата).
 - **Работещи команди**: `make test-orders-e2e`, `make test-cart-e2e`, `make test-catalog-e2e`, `make test-users-e2e`.
-- **Засегнати файлове**: `services/catalog/*`, `services/cart/*`, `services/orders/*`, `compose*.yaml`, `scripts/*`.
-- **Следваща стъпка**: Готово за commit и push от потребителя.
+- **Засегнати файлове**: `services/catalog/*`, `services/orders/*`, `services/cart/scripts/*`, `.github/workflows/ci.yml`.
+- **Следваща стъпка**: Преглед и commit от потребителя (`git add` / `git commit`).

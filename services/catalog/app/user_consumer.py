@@ -5,17 +5,39 @@ import datetime
 import json
 import logging
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
 import pika
 import pika.exceptions
+import psycopg
+from sqlalchemy.exc import (
+    DataError,
+    DisconnectionError,
+    InterfaceError,
+    OperationalError,
+)
+from sqlalchemy.exc import (
+    TimeoutError as SQLAlchemyTimeoutError,
+)
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.repository import SellerStatusRepository
 
 logger = logging.getLogger(__name__)
+
+_TRANSIENT_DB_ERRORS = (
+    OperationalError,
+    InterfaceError,
+    DisconnectionError,
+    SQLAlchemyTimeoutError,
+    psycopg.OperationalError,
+    psycopg.InterfaceError,
+    OSError,
+    TimeoutError,
+)
 
 
 class RabbitMQUserEventConsumer:
@@ -33,8 +55,10 @@ class RabbitMQUserEventConsumer:
         exchange: str | None = None,
         events_queue: str | None = None,
         prefetch_count: int | None = None,
+        retry_delay: float = 1.0,
     ) -> None:
         self._session_factory = session_factory
+        self.retry_delay = retry_delay
         self.host = host or settings.rabbitmq_host
         self.port = port or settings.rabbitmq_port
         self.user = user or settings.rabbitmq_user
@@ -129,16 +153,25 @@ class RabbitMQUserEventConsumer:
             channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
             return
 
-        event_time: datetime.datetime | None = None
-        if occurred_at_raw:
-            try:
-                event_time = datetime.datetime.fromisoformat(str(occurred_at_raw))
-                if event_time.tzinfo is None:
-                    event_time = event_time.replace(tzinfo=datetime.UTC)
-            except ValueError:
-                event_time = None
-        if event_time is None:
-            event_time = datetime.datetime.now(datetime.UTC)
+        if not occurred_at_raw:
+            logger.warning(
+                "Missing occurred_at in user event payload: %s; dead-lettering", payload
+            )
+            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            return
+
+        try:
+            event_time = datetime.datetime.fromisoformat(str(occurred_at_raw))
+            if event_time.tzinfo is None:
+                event_time = event_time.replace(tzinfo=datetime.UTC)
+        except (ValueError, TypeError) as exc:
+            logger.warning(
+                "Invalid occurred_at in user event: %s (%s); dead-lettering",
+                occurred_at_raw,
+                exc,
+            )
+            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+            return
 
         try:
             with self._session_factory() as session:
@@ -168,9 +201,26 @@ class RabbitMQUserEventConsumer:
                 session.commit()
 
             channel.basic_ack(delivery_tag=method.delivery_tag)
+        except DataError as exc:
+            logger.warning(
+                "Dead-lettering user event DataError event_id=%s seller_id=%s error=%s",
+                event_id,
+                seller_id,
+                exc,
+            )
+            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+        except _TRANSIENT_DB_ERRORS as exc:
+            logger.warning(
+                "Temporary DB failure processing user event %s: %s; requeuing with delay",
+                event_id,
+                exc,
+            )
+            if self.retry_delay > 0:
+                time.sleep(self.retry_delay)
+            channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
         except Exception as exc:  # noqa: BLE001
             logger.error(
-                "Unexpected error processing user event %s: %s; dropping",
+                "Unexpected non-retryable error processing user event %s: %s; dropping",
                 event_id,
                 exc,
             )

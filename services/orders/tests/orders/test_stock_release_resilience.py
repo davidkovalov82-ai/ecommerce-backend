@@ -1,15 +1,30 @@
+import uuid
+from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.modules.orders.models import OrderOutboxEvent
+from app.main import app
+from app.modules.catalog.dependencies import get_catalog_client
+from app.modules.orders.models import Order, OrderOutboxEvent
 from app.modules.orders.outbox_processor import OutboxProcessor
 from app.modules.orders.payments_client import CancelPaymentResult, PaymentsClient
 from app.modules.orders.repository import OrderRepository
 from app.modules.orders.service import OrderService
-from tests.mock_clients import LocalTestCatalogClient
+from tests.conftest import TestingSessionLocal
+from tests.mock_clients import LocalTestCatalogClient, shared_catalog_client
 from tests.mock_models import Product
-from tests.orders.helpers import _create_order, _create_user_and_token
+from tests.orders.helpers import (
+    ORDER_PAYLOAD,
+    _add_to_cart,
+    _create_order,
+    _create_product,
+    _create_user_and_token,
+)
+
+client = TestClient(app)
 
 
 def test_stock_release_outbox_persistence_and_retry(db_session: Session) -> None:
@@ -87,16 +102,89 @@ def test_stock_release_outbox_persistence_and_retry(db_session: Session) -> None
 
 def test_post_commit_error_does_not_release_reserve(
     db_session: Session,
-    monkeypatch: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Грешка след успешен commit на поръчката (напр. в Cart) НЕ освобождава резерва в Catalog."""
-    user, _ = _create_user_and_token(db_session, email="post_commit@example.com")
-    product = Product(title="Committed Item", price_minor=1000, stock=10)
-    db_session.add(product)
-    order = _create_order(db_session, user.id, product, quantity=1)
+    """Грешка след успешен commit на поръчката (напр. в refresh) НЕ освобождава резерва в Catalog."""
+    user, token = _create_user_and_token(db_session, email="post_commit@example.com")
+    product = _create_product(db_session, stock=10, price_minor=1000)
+    _add_to_cart(db_session, user.id, product.id, quantity=2)
 
-    catalog_client = MagicMock(spec=LocalTestCatalogClient)
+    catalog_mock = MagicMock(wraps=shared_catalog_client)
+    app.dependency_overrides[get_catalog_client] = lambda: catalog_mock
 
-    # Уверяваме се, че поръчката е със статус pending_payment
+    orig_refresh = Session.refresh
+    refresh_called = False
+
+    def failing_refresh(self: Session, instance: Any, **kwargs: Any) -> None:
+        nonlocal refresh_called
+        if isinstance(instance, Order):
+            refresh_called = True
+            raise RuntimeError("Controlled post-commit refresh error")  # noqa: TRY004
+        orig_refresh(self, instance, **kwargs)
+
+    monkeypatch.setattr(Session, "refresh", failing_refresh)
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Idempotency-Key": str(uuid.uuid4()),
+    }
+
+    with pytest.raises(RuntimeError, match="Controlled post-commit refresh error"):
+        client.post("/orders", json=ORDER_PAYLOAD, headers=headers)
+
+    assert refresh_called is True
+    catalog_mock.reserve_stock.assert_called_once()
+    catalog_mock.release_stock.assert_not_called()
+
+    with TestingSessionLocal() as session:
+        saved_order = session.query(Order).filter(Order.user_id == user.id).first()
+        assert saved_order is not None
+        assert saved_order.status == "pending_payment"
+
+
+def test_cancel_order_rollback_does_not_release_stock(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """При грешка и rollback на транзакцията за отмяна, Catalog release_stock НЕ се извиква."""
+    user, token = _create_user_and_token(
+        db_session, email="rollback_cancel@example.com"
+    )
+    product = _create_product(db_session, stock=10)
+    order = _create_order(db_session, user.id, product, quantity=2)
     assert order.status == "pending_payment"
-    catalog_client.release_stock.assert_not_called()
+
+    catalog_mock = MagicMock(wraps=shared_catalog_client)
+    app.dependency_overrides[get_catalog_client] = lambda: catalog_mock
+
+    # Симулираме срив при commit на транзакцията за отмяна
+    def failing_commit(self: Session) -> None:
+        raise RuntimeError("Controlled DB commit failure during cancellation")
+
+    monkeypatch.setattr(Session, "commit", failing_commit)
+
+    headers = {"Authorization": f"Bearer {token}"}
+    with pytest.raises(
+        RuntimeError, match="Controlled DB commit failure during cancellation"
+    ):
+        client.post(f"/orders/{order.id}/cancel", headers=headers)
+
+    # Catalog release_stock НЕ трябва да е извикан, защото транзакцията претърпя rollback
+    catalog_mock.release_stock.assert_not_called()
+
+    # В базата поръчката остава в предишния статус
+    with TestingSessionLocal() as session:
+        refreshed_order = session.get(Order, order.id)
+        assert refreshed_order is not None
+        assert refreshed_order.status == "pending_payment"
+
+        # Никакво публикувано release събитие в Outbox
+        release_event = (
+            session.query(OrderOutboxEvent)
+            .filter(
+                OrderOutboxEvent.order_id == order.id,
+                OrderOutboxEvent.event_type == "order.stock_release",
+            )
+            .first()
+        )
+        assert release_event is None

@@ -136,3 +136,18 @@ class StockReservation(Base):
         nullable=False,
         default=lambda: datetime.datetime.now(datetime.UTC),
     )
+
+
+class OrderStockRelease(Base):
+    """SQLAlchemy ORM модел за регистрирани освобождавания на складови наличности по поръчки."""
+
+    __tablename__ = "order_stock_releases"
+
+    order_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=False
+    )
+    released_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.datetime.now(datetime.UTC),
+    )

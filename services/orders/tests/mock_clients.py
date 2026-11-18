@@ -116,6 +116,10 @@ class LocalTestCatalogClient(CatalogClient):
         return [self._products[pid] for pid in product_ids if pid in self._products]
 
     def reserve_stock(self, order_id: int, items: list[dict[str, int]]) -> None:
+        if order_id in self._released_orders:
+            raise CatalogProductUnavailableError(
+                0, f"Reservation for order {order_id} has already been released"
+            )
         if order_id in self._reservations:
             return
 

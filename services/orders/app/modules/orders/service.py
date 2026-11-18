@@ -593,15 +593,14 @@ class OrderService:
             raise
 
     def _restore_order_stock(self, order: Order) -> None:
-        """Възстановява запазените количества от позициите на поръчката в склада чрез Catalog.
+        """Записва Outbox събитие order.stock_release в транзакцията за гарантирано фоново повторение.
 
-        Записва Outbox събитие order.stock_release за гарантирано фоново повторение,
-        след което прави опит за незабавно освобождаване през CatalogClient.
+        Важно: Самият мрежов разговор към Catalog се изпълнява едва след успешен commit
+        на отмяната/изтичането, за да не се освободи резерв при rollback.
         """
         existing = self._order_repository.get_outbox_event(
             order.id, "order.stock_release"
         )
-        release_event: OrderOutboxEvent | None = None
         if existing is None:
             release_event = OrderOutboxEvent(
                 event_id=str(uuid.uuid4()),
@@ -613,18 +612,24 @@ class OrderService:
             )
             self._session.add(release_event)
 
+    def _publish_stock_release_immediate(self, order_id: int) -> None:
+        """Прави опит за незабавно освобождаване през CatalogClient след успешен commit на транзакцията."""
         try:
-            self._catalog_client.release_stock(order.id)
-            if release_event is not None:
-                release_event.status = "published"
-                release_event.published_at = datetime.datetime.now(datetime.UTC)
-            elif existing is not None and existing.status == "pending":
-                existing.status = "published"
-                existing.published_at = datetime.datetime.now(datetime.UTC)
+            self._catalog_client.release_stock(order_id)
+            try:
+                event = self._order_repository.get_outbox_event(
+                    order_id, "order.stock_release"
+                )
+                if event is not None and event.status == "pending":
+                    event.status = "published"
+                    event.published_at = datetime.datetime.now(datetime.UTC)
+                    self._session.commit()
+            except Exception:  # noqa: BLE001
+                self._session.rollback()
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Immediate stock release failed for order %s (%s). Outbox processor will retry.",
-                order.id,
+                order_id,
                 exc,
             )
 
@@ -780,6 +785,7 @@ class OrderService:
                     order_rec.status = "expired"
                     self._restore_order_stock(order_rec)
                 self._session.commit()
+                self._publish_stock_release_immediate(order_id)
             except Exception:
                 self._session.rollback()
                 raise
@@ -939,6 +945,11 @@ class OrderService:
                 return "already_processed"
 
             self._session.commit()
+            if order.status in ("cancelled", "expired") and outcome in (
+                "cancelled",
+                "expired",
+            ):
+                self._publish_stock_release_immediate(order.id)
             return outcome
         except Exception:
             self._session.rollback()
@@ -1029,6 +1040,7 @@ class OrderService:
             self._session.commit()
             self._session.refresh(order)
             _ = order.items
+            self._publish_stock_release_immediate(order.id)
             return order
         except Exception:
             self._session.rollback()
@@ -1093,6 +1105,7 @@ class OrderService:
             order.status = "expired"
             self._restore_order_stock(order)
             self._session.commit()
+            self._publish_stock_release_immediate(order.id)
             return "expired"
         except Exception:
             self._session.rollback()
