@@ -1,6 +1,7 @@
 """Тестове за основните сценарии на Catalog микросервиса."""
 
 from fastapi.testclient import TestClient
+
 from tests.conftest import make_auth_headers
 
 INTERNAL_HEADERS = {"X-Internal-Token": "ecommerce-catalog-internal-secret"}

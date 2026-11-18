@@ -10,14 +10,14 @@ permissions:
   contents: read
 
 jobs:
-  commerce-checks:
-    name: commerce-checks
+  orders-checks:
+    name: orders-checks
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     defaults:
       run:
-        working-directory: services/commerce
+        working-directory: services/orders
 
     env:
       DB_HOST: 127.0.0.1
@@ -97,13 +97,146 @@ jobs:
       - name: Apply migrations to an empty database
         run: uv run --locked alembic upgrade head
 
-      - name: Check standalone product insertion
-        run: >-
-          uv run --locked pytest
-          tests/catalog/test_product_constraints.py::test_zero_price_and_zero_stock_allowed
-          -q
-
       - name: Run all tests
+        run: uv run --locked pytest -q
+
+  catalog-checks:
+    name: catalog-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        working-directory: services/catalog
+
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: "5432"
+      DB_USER: catalog
+      DB_PASSWORD: catalog_ci
+      DB_NAME: catalog
+      DB_ADMIN_USER: commerce
+      DB_ADMIN_PASSWORD: commerce_ci
+      DB_ADMIN_NAME: commerce
+      INTERNAL_AUTH_TOKEN: "ci-test-internal-catalog-token-32b!"
+      RABBITMQ_HOST: 127.0.0.1
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASSWORD: guest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: commerce
+          POSTGRES_PASSWORD: commerce_ci
+          POSTGRES_DB: commerce
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U commerce -d commerce"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      rabbitmq:
+        image: rabbitmq:4-management-alpine
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.6"
+
+      - name: Install Python
+        run: uv python install 3.13
+
+      - name: Install locked dependencies
+        run: uv sync --locked --dev --python 3.13
+
+      - name: Check lint
+        run: uv run --locked ruff check .
+
+      - name: Check formatting
+        run: uv run --locked ruff format --check .
+
+      - name: Apply migrations to an empty database
+        run: uv run --locked alembic upgrade head
+
+      - name: Run catalog tests
+        run: uv run --locked pytest -q
+
+  cart-checks:
+    name: cart-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        working-directory: services/cart
+
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: "5432"
+      DB_USER: cart
+      DB_PASSWORD: cart_ci
+      DB_NAME: cart
+      DB_ADMIN_USER: commerce
+      DB_ADMIN_PASSWORD: commerce_ci
+      DB_ADMIN_NAME: commerce
+      INTERNAL_AUTH_TOKEN: "ci-test-internal-cart-token-32b!"
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: commerce
+          POSTGRES_PASSWORD: commerce_ci
+          POSTGRES_DB: commerce
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U commerce -d commerce"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.6"
+
+      - name: Install Python
+        run: uv python install 3.13
+
+      - name: Install locked dependencies
+        run: uv sync --locked --dev --python 3.13
+
+      - name: Check lint
+        run: uv run --locked ruff check .
+
+      - name: Check formatting
+        run: uv run --locked ruff format --check .
+
+      - name: Apply migrations to an empty database
+        run: uv run --locked alembic upgrade head
+
+      - name: Run cart tests
         run: uv run --locked pytest -q
 
   notifications-checks:
@@ -382,8 +515,8 @@ jobs:
       - name: Install Python
         run: uv python install 3.13
 
-      - name: Install locked commerce dependencies for K5 E2E runner
-        working-directory: services/commerce
+      - name: Install locked orders dependencies for K5 E2E runner
+        working-directory: services/orders
         run: uv sync --locked --dev --python 3.13
 
       - name: Run isolated K5 E2E suite from repository root
@@ -406,9 +539,33 @@ jobs:
       - name: Install Python
         run: uv python install 3.13
 
-      - name: Install locked commerce dependencies for Users E2E runner
-        working-directory: services/commerce
+      - name: Install locked orders dependencies for Users E2E runner
+        working-directory: services/orders
         run: uv sync --locked --dev --python 3.13
 
       - name: Run isolated Users E2E suite from repository root
         run: make test-users-e2e
+
+  orders-e2e-checks:
+    name: orders-e2e-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          version: "0.13.6"
+
+      - name: Install Python
+        run: uv python install 3.13
+
+      - name: Install locked orders dependencies for Orders E2E runner
+        working-directory: services/orders
+        run: uv sync --locked --dev --python 3.13
+
+      - name: Run isolated Orders E2E suite from repository root
+        run: make test-orders-e2e

@@ -85,11 +85,29 @@ services:
       timeout: 5s
       retries: 5
 
-  api:
+  gateway:
+    image: nginx:1.27-alpine
+    container_name: commerce-gateway
+    restart: unless-stopped
+    ports:
+      - "8000:80"
+    volumes:
+      - ./gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      users:
+        condition: service_healthy
+      catalog:
+        condition: service_healthy
+      cart:
+        condition: service_healthy
+      orders:
+        condition: service_healthy
+
+  orders:
     build:
-      context: ./services/commerce
+      context: ./services/orders
       dockerfile: Dockerfile
-    container_name: commerce-api
+    container_name: orders-api
     restart: unless-stopped
     depends_on:
       db-init:
@@ -103,10 +121,10 @@ services:
     environment:
       DB_HOST: db
       DB_PORT: "5432"
-      DB_USER: ${COMMERCE_DB_USER:-commerce_app}
-      DB_PASSWORD: ${COMMERCE_DB_PASSWORD:-commerce_app}
-      DB_NAME: commerce
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set and non-empty}
+      DB_USER: ${ORDERS_DB_USER:-${COMMERCE_DB_USER:-commerce_app}}
+      DB_PASSWORD: ${ORDERS_DB_PASSWORD:-${COMMERCE_DB_PASSWORD:-commerce_app}}
+      DB_NAME: ${ORDERS_DB_NAME:-${COMMERCE_DB_NAME:-commerce}}
+      JWT_SECRET: ${JWT_SECRET:-1e3c0d99b3b5c2e6afb5bf73554df714af33884490bceb1eb7d2b9ed3c309ce7}
       USERS_BASE_URL: ${USERS_BASE_URL:-http://users:8002}
       USERS_INTERNAL_AUTH_TOKEN: ${USERS_INTERNAL_AUTH_TOKEN:-ecommerce-users-internal-secret}
       CATALOG_BASE_URL: ${CATALOG_BASE_URL:-http://catalog:8003}
@@ -115,7 +133,7 @@ services:
       CART_INTERNAL_AUTH_TOKEN: ${CART_INTERNAL_AUTH_TOKEN:-ecommerce-cart-internal-secret}
       JWT_PUBLIC_KEY_PATH: ${JWT_PUBLIC_KEY_PATH:-jwt_public.pem}
       PAYMENTS_BASE_URL: ${PAYMENTS_BASE_URL:-http://payments:8001}
-      PAYMENTS_INTERNAL_AUTH_TOKEN: ${PAYMENTS_INTERNAL_AUTH_TOKEN:?PAYMENTS_INTERNAL_AUTH_TOKEN must be set and non-empty}
+      PAYMENTS_INTERNAL_AUTH_TOKEN: ${PAYMENTS_INTERNAL_AUTH_TOKEN:-k5-internal-payments-token-32b-ok!}
       SMTP_HOST: ${SMTP_HOST:-mailpit}
       SMTP_PORT: ${SMTP_PORT:-1025}
       SMTP_FROM: ${SMTP_FROM:-noreply@example.com}
@@ -126,54 +144,61 @@ services:
     volumes:
       - ./services/users/jwt_public.pem:/app/jwt_public.pem:ro
     ports:
-      - "8000:8000"
+      - "8005:8000"
     command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\")' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
-  commerce-outbox:
+  orders-outbox:
     build:
-      context: ./services/commerce
+      context: ./services/orders
       dockerfile: Dockerfile
-    container_name: commerce-outbox
+    container_name: orders-outbox
     restart: unless-stopped
     depends_on:
       db-init:
         condition: service_completed_successfully
-      api:
+      orders:
         condition: service_started
     environment:
       DB_HOST: db
       DB_PORT: "5432"
-      DB_USER: ${COMMERCE_DB_USER:-commerce_app}
-      DB_PASSWORD: ${COMMERCE_DB_PASSWORD:-commerce_app}
-      DB_NAME: commerce
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set and non-empty}
-      PAYMENTS_INTERNAL_AUTH_TOKEN: ${PAYMENTS_INTERNAL_AUTH_TOKEN:?PAYMENTS_INTERNAL_AUTH_TOKEN must be set and non-empty}
+      DB_USER: ${ORDERS_DB_USER:-${COMMERCE_DB_USER:-commerce_app}}
+      DB_PASSWORD: ${ORDERS_DB_PASSWORD:-${COMMERCE_DB_PASSWORD:-commerce_app}}
+      DB_NAME: ${ORDERS_DB_NAME:-${COMMERCE_DB_NAME:-commerce}}
+      JWT_SECRET: ${JWT_SECRET:-1e3c0d99b3b5c2e6afb5bf73554df714af33884490bceb1eb7d2b9ed3c309ce7}
+      PAYMENTS_INTERNAL_AUTH_TOKEN: ${PAYMENTS_INTERNAL_AUTH_TOKEN:-k5-internal-payments-token-32b-ok!}
+      CART_BASE_URL: ${CART_BASE_URL:-http://cart:8004}
+      CART_INTERNAL_AUTH_TOKEN: ${CART_INTERNAL_AUTH_TOKEN:-ecommerce-cart-internal-secret}
       RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
       RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
       RABBITMQ_USER: ${RABBITMQ_USER:-guest}
       RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
     command: sh -c "python scripts/process_outbox.py --daemon --poll-interval 1.0"
 
-  commerce-payment-consumer:
+  orders-payment-consumer:
     build:
-      context: ./services/commerce
+      context: ./services/orders
       dockerfile: Dockerfile
-    container_name: commerce-payment-consumer
+    container_name: orders-payment-consumer
     restart: unless-stopped
     depends_on:
       db-init:
         condition: service_completed_successfully
-      api:
+      orders:
         condition: service_started
     environment:
       DB_HOST: db
       DB_PORT: "5432"
-      DB_USER: ${COMMERCE_DB_USER:-commerce_app}
-      DB_PASSWORD: ${COMMERCE_DB_PASSWORD:-commerce_app}
-      DB_NAME: commerce
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set and non-empty}
+      DB_USER: ${ORDERS_DB_USER:-${COMMERCE_DB_USER:-commerce_app}}
+      DB_PASSWORD: ${ORDERS_DB_PASSWORD:-${COMMERCE_DB_PASSWORD:-commerce_app}}
+      DB_NAME: ${ORDERS_DB_NAME:-${COMMERCE_DB_NAME:-commerce}}
+      JWT_SECRET: ${JWT_SECRET:-1e3c0d99b3b5c2e6afb5bf73554df714af33884490bceb1eb7d2b9ed3c309ce7}
       PAYMENTS_BASE_URL: ${PAYMENTS_BASE_URL:-http://payments:8001}
-      PAYMENTS_INTERNAL_AUTH_TOKEN: ${PAYMENTS_INTERNAL_AUTH_TOKEN:?PAYMENTS_INTERNAL_AUTH_TOKEN must be set and non-empty}
+      PAYMENTS_INTERNAL_AUTH_TOKEN: ${PAYMENTS_INTERNAL_AUTH_TOKEN:-k5-internal-payments-token-32b-ok!}
       RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
       RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
       RABBITMQ_USER: ${RABBITMQ_USER:-guest}
@@ -195,7 +220,7 @@ services:
       DB_USER: ${PAYMENTS_DB_USER:-payments}
       DB_PASSWORD: ${PAYMENTS_DB_PASSWORD:-payments}
       DB_NAME: payments
-      PAYMENTS_INTERNAL_AUTH_TOKEN: ${PAYMENTS_INTERNAL_AUTH_TOKEN:?PAYMENTS_INTERNAL_AUTH_TOKEN must be set and non-empty}
+      PAYMENTS_INTERNAL_AUTH_TOKEN: ${PAYMENTS_INTERNAL_AUTH_TOKEN:-k5-internal-payments-token-32b-ok!}
       STRIPE_MODE: ${STRIPE_MODE:-test}
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
@@ -226,7 +251,7 @@ services:
       DB_USER: ${PAYMENTS_DB_USER:-payments}
       DB_PASSWORD: ${PAYMENTS_DB_PASSWORD:-payments}
       DB_NAME: payments
-      PAYMENTS_INTERNAL_AUTH_TOKEN: ${PAYMENTS_INTERNAL_AUTH_TOKEN:?PAYMENTS_INTERNAL_AUTH_TOKEN must be set and non-empty}
+      PAYMENTS_INTERNAL_AUTH_TOKEN: ${PAYMENTS_INTERNAL_AUTH_TOKEN:-k5-internal-payments-token-32b-ok!}
       RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
       RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
       RABBITMQ_USER: ${RABBITMQ_USER:-guest}
@@ -303,31 +328,6 @@ services:
       timeout: 3s
       retries: 15
     command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8002"
-
-  commerce-user-consumer:
-    build:
-      context: ./services/commerce
-      dockerfile: Dockerfile
-    container_name: commerce-user-consumer
-    restart: unless-stopped
-    depends_on:
-      db-init:
-        condition: service_completed_successfully
-      api:
-        condition: service_started
-      rabbitmq:
-        condition: service_healthy
-    environment:
-      DB_HOST: db
-      DB_PORT: "5432"
-      DB_USER: ${COMMERCE_DB_USER:-commerce_app}
-      DB_PASSWORD: ${COMMERCE_DB_PASSWORD:-commerce_app}
-      DB_NAME: commerce
-      RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
-      RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-guest}
-    command: sh -c "python scripts/consume_user_events.py --daemon"
 
   catalog:
     build:

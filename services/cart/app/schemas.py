@@ -21,7 +21,7 @@ CartItemUpdateRequest = CartItemPayload
 
 
 class CartItemResponse(BaseModel):
-    """Схема за позиция в количката с обогатени данни от Catalog."""
+    """Схема за позиция в количката с обогатени данни от Catalog и версия на записа."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -31,6 +31,7 @@ class CartItemResponse(BaseModel):
     unit_price_minor: int
     subtotal_minor: int
     available: bool
+    version: int = 1
 
 
 class CartResponse(BaseModel):
@@ -43,12 +44,23 @@ class CartResponse(BaseModel):
     currency: str = "EUR"
 
 
+class ClearPurchasedItem(BaseModel):
+    """Позиция за изчистване с очаквана версия от снимката на поръчката."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    product_id: int
+    version: int | None = None
+
+
 class ClearPurchasedRequest(BaseModel):
     """Заявка от Orders за изчистване на успешно закупени позиции от количката."""
 
     model_config = ConfigDict(extra="forbid")
 
-    product_ids: list[int]
+    order_id: int | None = None
+    items: list[ClearPurchasedItem] | None = None
+    product_ids: list[int] | None = None
 
 
 class ClearPurchasedResponse(BaseModel):
@@ -57,6 +69,7 @@ class ClearPurchasedResponse(BaseModel):
     status: str = "cleared"
     user_id: int
     cleared_product_ids: list[int]
+    order_id: int | None = None
 
 
 class ProductInternalDetails(BaseModel):

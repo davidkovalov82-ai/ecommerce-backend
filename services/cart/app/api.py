@@ -101,12 +101,19 @@ def clear_purchased_items(
     cart_service: CartServiceDep,
 ) -> ClearPurchasedResponse:
     """Вътрешен API за Orders: изчистване само на закупените позиции след поръчка."""
+    versioned_items = None
+    if payload.items is not None:
+        versioned_items = [(it.product_id, it.version) for it in payload.items]
+
     cleared = cart_service.clear_purchased(
         user_id=user_id,
         product_ids=payload.product_ids,
+        items=versioned_items,
+        order_id=payload.order_id,
     )
     return ClearPurchasedResponse(
         status="cleared",
         user_id=user_id,
         cleared_product_ids=cleared,
+        order_id=payload.order_id,
     )

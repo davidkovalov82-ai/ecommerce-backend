@@ -165,9 +165,9 @@ services:
       RABBITMQ_PASSWORD: guest
     command: sh -c "python scripts/process_outbox.py --daemon --poll-interval 0.2"
 
-  commerce-migrations-e2e:
+  orders-migrations-e2e:
     build:
-      context: ./services/commerce
+      context: ./services/orders
       dockerfile: Dockerfile
     restart: "no"
     depends_on:
@@ -229,24 +229,6 @@ services:
       DB_NAME: cart
     command: sh -c "alembic upgrade head"
 
-  users-accounts-migration-e2e:
-    build:
-      context: ./services/users
-      dockerfile: Dockerfile
-    restart: "no"
-    depends_on:
-      commerce-migrations-e2e:
-        condition: service_completed_successfully
-      users-migrations-e2e:
-        condition: service_completed_successfully
-    environment:
-      DB_HOST: db-e2e
-      DB_PORT: "5432"
-      DB_USER: users_app
-      DB_PASSWORD: users_app
-      DB_NAME: users
-    command: sh -c "python scripts/migrate_from_commerce.py --apply --commerce-url postgresql://commerce_app:commerce_app@db-e2e:5432/commerce --users-url postgresql://users_app:users_app@db-e2e:5432/users"
-
   users-e2e:
     build:
       context: ./services/users
@@ -254,7 +236,7 @@ services:
     container_name: users-api-e2e
     restart: unless-stopped
     depends_on:
-      users-accounts-migration-e2e:
+      users-migrations-e2e:
         condition: service_completed_successfully
     environment:
       DB_HOST: db-e2e
@@ -394,12 +376,31 @@ services:
       timeout: 3s
       retries: 15
 
-  commerce-api-e2e:
-    build:
-      context: ./services/commerce
-      dockerfile: Dockerfile
+  gateway-e2e:
+    image: nginx:1.27-alpine
+    container_name: commerce-gateway-e2e
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:58000:80"
+    volumes:
+      - ./gateway/nginx.e2e.conf:/etc/nginx/nginx.conf:ro
     depends_on:
-      commerce-migrations-e2e:
+      users-e2e:
+        condition: service_healthy
+      catalog-e2e:
+        condition: service_healthy
+      cart-e2e:
+        condition: service_healthy
+      orders-api-e2e:
+        condition: service_healthy
+
+  orders-api-e2e:
+    build:
+      context: ./services/orders
+      dockerfile: Dockerfile
+    container_name: orders-api-e2e
+    depends_on:
+      orders-migrations-e2e:
         condition: service_completed_successfully
       users-e2e:
         condition: service_healthy
@@ -414,11 +415,11 @@ services:
       DB_PASSWORD: commerce_app
       DB_NAME: commerce
       JWT_SECRET: k4-e2e-test-jwt-secret-key-at-least-32-bytes-long!
-      USERS_BASE_URL: http://users:8002
+      USERS_BASE_URL: http://users-e2e:8002
       USERS_INTERNAL_AUTH_TOKEN: ecommerce-users-internal-secret
-      CATALOG_BASE_URL: http://catalog:8003
+      CATALOG_BASE_URL: http://catalog-e2e:8003
       CATALOG_INTERNAL_AUTH_TOKEN: ecommerce-catalog-internal-secret
-      CART_BASE_URL: http://cart:8004
+      CART_BASE_URL: http://cart-e2e:8004
       CART_INTERNAL_AUTH_TOKEN: ecommerce-cart-internal-secret
       JWT_PUBLIC_KEY_PATH: jwt_public.pem
       PAYMENTS_BASE_URL: http://payments-e2e:8001
@@ -433,22 +434,23 @@ services:
     volumes:
       - ${USERS_E2E_JWT_PUBLIC_KEY_PATH}:/app/jwt_public.pem:ro
     ports:
-      - "127.0.0.1:58000:8000"
+      - "127.0.0.1:58005:8000"
     command: sh -c "uvicorn app.main:app --host 0.0.0.0 --port 8000"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/openapi.json', timeout=2)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
       interval: 2s
       timeout: 3s
       retries: 15
 
-  commerce-outbox-e2e:
+  orders-outbox-e2e:
     build:
-      context: ./services/commerce
+      context: ./services/orders
       dockerfile: Dockerfile
+    container_name: orders-outbox-e2e
     depends_on:
-      commerce-migrations-e2e:
+      orders-migrations-e2e:
         condition: service_completed_successfully
-      commerce-api-e2e:
+      orders-api-e2e:
         condition: service_healthy
     environment:
       DB_HOST: db-e2e
@@ -458,20 +460,23 @@ services:
       DB_NAME: commerce
       JWT_SECRET: k4-e2e-test-jwt-secret-key-at-least-32-bytes-long!
       PAYMENTS_INTERNAL_AUTH_TOKEN: k5-e2e-internal-payments-token-32b!
+      CART_BASE_URL: http://cart-e2e:8004
+      CART_INTERNAL_AUTH_TOKEN: ecommerce-cart-internal-secret
       RABBITMQ_HOST: rabbitmq-e2e
       RABBITMQ_PORT: "5672"
       RABBITMQ_USER: guest
       RABBITMQ_PASSWORD: guest
     command: sh -c "python scripts/process_outbox.py --daemon --poll-interval 0.2"
 
-  commerce-payment-consumer-e2e:
+  orders-payment-consumer-e2e:
     build:
-      context: ./services/commerce
+      context: ./services/orders
       dockerfile: Dockerfile
+    container_name: orders-payment-consumer-e2e
     depends_on:
-      commerce-migrations-e2e:
+      orders-migrations-e2e:
         condition: service_completed_successfully
-      commerce-api-e2e:
+      orders-api-e2e:
         condition: service_healthy
     environment:
       DB_HOST: db-e2e
@@ -480,9 +485,9 @@ services:
       DB_PASSWORD: commerce_app
       DB_NAME: commerce
       JWT_SECRET: k4-e2e-test-jwt-secret-key-at-least-32-bytes-long!
-      USERS_BASE_URL: http://users:8002
+      USERS_BASE_URL: http://users-e2e:8002
       USERS_INTERNAL_AUTH_TOKEN: ecommerce-users-internal-secret
-      CATALOG_BASE_URL: http://catalog:8003
+      CATALOG_BASE_URL: http://catalog-e2e:8003
       CATALOG_INTERNAL_AUTH_TOKEN: ecommerce-catalog-internal-secret
       JWT_PUBLIC_KEY_PATH: jwt_public.pem
       PAYMENTS_BASE_URL: http://payments-e2e:8001
@@ -526,30 +531,6 @@ services:
       DELIVERY_LEASE_SECONDS: "30"
       WORKER_POLL_INTERVAL_SECONDS: "0.25"
     command: sh -c "alembic upgrade head && python -m app.main"
-
-  commerce-user-consumer-e2e:
-    build:
-      context: ./services/commerce
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    depends_on:
-      commerce-migrations-e2e:
-        condition: service_completed_successfully
-      commerce-api-e2e:
-        condition: service_healthy
-      rabbitmq-e2e:
-        condition: service_healthy
-    environment:
-      DB_HOST: db-e2e
-      DB_PORT: "5432"
-      DB_USER: commerce_app
-      DB_PASSWORD: commerce_app
-      DB_NAME: commerce
-      RABBITMQ_HOST: rabbitmq-e2e
-      RABBITMQ_PORT: "5672"
-      RABBITMQ_USER: guest
-      RABBITMQ_PASSWORD: guest
-    command: sh -c "python scripts/consume_user_events.py --daemon"
 
   users-outbox-e2e:
     build:

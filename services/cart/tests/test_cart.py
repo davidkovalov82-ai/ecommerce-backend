@@ -175,3 +175,70 @@ def test_internal_cart_snapshot_and_clear_purchased_preserves_concurrent_changes
     assert len(after_cart["items"]) == 1
     assert after_cart["items"][0]["product_id"] == 203
     assert after_cart["items"][0]["quantity"] == 3
+
+
+def test_versioned_clear_and_idempotency_by_order_id(
+    client: TestClient,
+    mock_catalog: MockCatalogClient,
+) -> None:
+    """Проверка на K6.4: версионно изчистване и идемпотентност по order_id."""
+    mock_catalog.set_mock_product(product_id=301, title="Item A", stock=20)
+    mock_catalog.set_mock_product(product_id=302, title="Item B", stock=20)
+
+    buyer_id = 55
+    headers = make_auth_headers(user_id=buyer_id)
+    internal_headers = {"X-Internal-Token": settings.internal_auth_token}
+
+    # Потребителят добавя артикул 301 и 302
+    client.put("/cart/items/301", json={"quantity": 2}, headers=headers)
+    client.put("/cart/items/302", json={"quantity": 1}, headers=headers)
+
+    # 1. Orders взима снимка на количката с версии
+    snapshot = client.get(f"/internal/cart/{buyer_id}", headers=internal_headers).json()
+    items = snapshot["items"]
+    assert len(items) == 2
+    item301 = next(i for i in items if i["product_id"] == 301)
+    item302 = next(i for i in items if i["product_id"] == 302)
+    assert item301["version"] == 1
+    assert item302["version"] == 1
+
+    # Потребителят променя количеството на 301 (version става 2) по време на checkout
+    update_res = client.put("/cart/items/301", json={"quantity": 5}, headers=headers)
+    assert update_res.status_code == 200
+
+    # Orders прави изчистване за order_id=1001 с първоначалните версии (301: v1, 302: v1)
+    clear_payload = {
+        "order_id": 1001,
+        "items": [
+            {"product_id": 301, "version": 1},
+            {"product_id": 302, "version": 1},
+        ],
+    }
+    clear_res = client.post(
+        f"/internal/cart/{buyer_id}/clear-purchased",
+        headers=internal_headers,
+        json=clear_payload,
+    )
+    assert clear_res.status_code == 200
+    cleared_ids = clear_res.json()["cleared_product_ids"]
+    # 301 не е изтрит, защото версията му е променена; 302 е успешно изтрит!
+    assert 302 in cleared_ids
+    assert 301 not in cleared_ids
+
+    # Проверка на количката: 301 остава с новото количество 5!
+    current_cart = client.get("/cart", headers=headers).json()
+    assert len(current_cart["items"]) == 1
+    assert current_cart["items"][0]["product_id"] == 301
+    assert current_cart["items"][0]["quantity"] == 5
+    assert current_cart["items"][0]["version"] == 2
+
+    # Идемпотентност: повторен опит за същия order_id връща 200 без промени
+    retry_clear = client.post(
+        f"/internal/cart/{buyer_id}/clear-purchased",
+        headers=internal_headers,
+        json=clear_payload,
+    )
+    assert retry_clear.status_code == 200
+    assert retry_clear.json()["status"] == "cleared"
+    # Нищо не е изтрито втори път
+    assert retry_clear.json()["cleared_product_ids"] == []

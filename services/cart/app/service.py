@@ -71,6 +71,7 @@ class CartService:
                     unit_price_minor=product.price_minor,
                     subtotal_minor=subtotal_minor,
                     available=available,
+                    version=item.version,
                 )
             )
 
@@ -126,15 +127,45 @@ class CartService:
             self._session.rollback()
             raise
 
-    def clear_purchased(self, user_id: int, product_ids: list[int]) -> list[int]:
+    def clear_purchased(
+        self,
+        user_id: int,
+        product_ids: list[int] | None = None,
+        items: list[tuple[int, int | None]] | None = None,
+        order_id: int | None = None,
+    ) -> list[int]:
         """Премахва единствено успешно закупените позиции за дадена поръчка.
 
-        Всички останали промени в количката по време на плащането се запазват.
+        Гарантира:
+        1. Идемпотентност по order_id.
+        2. Версионна безопасност: позиции с променена версия по време на checkout
+           се запазват непокътнати в количката.
         """
         try:
-            self._cart_repository.delete_items(user_id=user_id, product_ids=product_ids)
+            if order_id is not None and self._cart_repository.is_order_cleared(
+                order_id
+            ):
+                return []
+
+            if items:
+                cleared = self._cart_repository.delete_items_versioned(
+                    user_id=user_id, items=items
+                )
+            elif product_ids:
+                self._cart_repository.delete_items(
+                    user_id=user_id, product_ids=product_ids
+                )
+                cleared = product_ids
+            else:
+                cleared = []
+
+            if order_id is not None:
+                self._cart_repository.mark_order_cleared(
+                    order_id=order_id, user_id=user_id
+                )
+
             self._session.commit()
-            return product_ids
+            return cleared
         except Exception:
             self._session.rollback()
             raise

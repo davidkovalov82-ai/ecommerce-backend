@@ -1,16 +1,16 @@
 # Session State
 
-- **Текуща задача**: K6.3 — отделяне на Cart в самостоятелен микросервис services/cart на чист стенд.
+- **Текуща задача**: K6.4 — завършване на 6 микросервиса (Users, Catalog, Cart, Orders, Payments, Notifications) + Gateway.
 - **Реализирано**:
-  - Отстранени регресии: затворени фалшиви `X-User-*` заглавки без JWT в Catalog (връща 401); коригиран `scripts/users_e2e_verify.py` към Catalog DB; форматиран `app/config.py`.
-  - `services/cart`: FastAPI, PostgreSQL БД `cart`, Alembic миграции, Docker compose услуга (порт 8004/58004). Запазени GET/PUT/DELETE `/cart` по верифициран JWT токен.
-  - Cart съхранява само състав и количества; цени/наличности извлича от Catalog; добавянето не резервира наличност.
-  - Orders извлича количката през `GET /internal/cart/{user_id}`, резервира през Catalog и изчиства поръчаните позиции през `POST /internal/cart/{user_id}/clear-purchased`.
-  - Премахнато директно четене/запис на `cart_items` от Orders; пълна идемпотентност при повторен Idempotency-Key.
+  - `services/commerce` превърнат в `services/orders`: изчистени чужди таблици/модели/репозитории (миграция l6a7b8c9d0e1).
+  - Nginx Reverse Proxy Gateway (`gateway/nginx.conf`, порт 8000/58000) с приоритетен маршрут `^~ /users/me/products` към Catalog.
+  - Версионирана и идемпотентна очистка на количката при checkout с Outbox събитие `order.cart_clear` за надежден повтор при срив на Cart.
+  - Обновени Compose файлове, CI workflows, Makefile (`make test-orders-e2e`), E2E тестове и TODO.md.
 - **Проверено**:
-  - `make test-cart-e2e` (`bash scripts/test_cart_e2e.sh`): 100% успешно на чист изолиран стенд.
-  - Pytest: `services/cart` (6 passed), `services/commerce` (310 passed). Ruff: 100% чист и форматиран.
-- **Непроверено**: няма.
-- **Работещи команди**: `make test-cart-e2e`, `cd services/cart && uv run --locked pytest`, `cd services/commerce && uv run --locked pytest`.
-- **Засегнати файлове**: `services/cart/*`, `services/commerce/*`, `services/catalog/*`, `compose.yaml`, `compose.e2e.yaml`, `scripts/*`.
+  - `make test-orders-e2e` (`bash scripts/test_orders_e2e.sh`): пълен цикъл (регистрация -> продукт -> количка -> поръчка -> Stripe mock -> paid -> Mailpit уведомление, запазване на паралелна промяна в количката, идемпотентност, БД изолация).
+  - Pytest във всички 6 сервиза: Orders (124 passed), Users (57 passed), Notifications (39 passed), Payments (34 passed), Cart (7 passed), Catalog (4 passed) — общо 265 passed, 0 failed.
+  - Ruff lint & format: 100% чист код във всички 6 сервиза и E2E скриптовете.
+- **Непроверено**: Натоварващи тестове и Kubernetes (извън обхвата на K6).
+- **Работещи команди**: `make test-orders-e2e`, `make test-cart-e2e`, `make test-catalog-e2e`, `make test-users-e2e`.
+- **Засегнати файлове**: `services/orders/*`, `services/cart/*`, `gateway/*`, `compose.yaml`, `compose.e2e.yaml`, `scripts/*`, `.github/workflows/ci.yml`.
 - **Следваща стъпка**: Потребителят да прегледа и комитне промените.

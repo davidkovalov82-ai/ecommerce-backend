@@ -25,7 +25,7 @@ docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" up -d --build --wait
 
 echo "==> [2/3] Running all K5 E2E scenarios (offline Commerce, broker outage, concurrency, cancel/discrepancy, reconciliation, DLQ, cutover migration)..."
 (
-  cd "${ROOT_DIR}/services/commerce"
+  cd "${ROOT_DIR}/services/orders"
   uv run --locked python "${ROOT_DIR}/scripts/k5_e2e_verify.py"
 )
 

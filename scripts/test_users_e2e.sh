@@ -31,7 +31,7 @@ docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" up -d --build --wait
 
 echo "==> [2/3] Running reproducible Commerce -> Users E2E verification..."
 (
-  cd "${ROOT_DIR}/services/commerce"
+  cd "${ROOT_DIR}/services/orders"
   export COMPOSE_PROJECT_NAME="${PROJECT_NAME}"
   export COMPOSE_FILE="${COMPOSE_FILE}"
   uv run --locked python "${ROOT_DIR}/scripts/users_e2e_verify.py"

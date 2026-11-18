@@ -6,7 +6,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from app.models import CartItem
+from app.models import CartClearedOrder, CartItem
 
 
 class CartRepository:
@@ -29,17 +29,22 @@ class CartRepository:
         return self._session.get(CartItem, (user_id, product_id))
 
     def upsert_item(self, user_id: int, product_id: int, quantity: int) -> CartItem:
-        """Вмъква нова позиция или обновява количеството при съществуваща такава."""
+        """Вмъква нова позиция (version=1) или обновява количеството и инкрементира version."""
         stmt = (
             insert(CartItem)
             .values(
                 user_id=user_id,
                 product_id=product_id,
                 quantity=quantity,
+                version=1,
             )
             .on_conflict_do_update(
                 index_elements=[CartItem.user_id, CartItem.product_id],
-                set_={"quantity": quantity, "updated_at": func.now()},
+                set_={
+                    "quantity": quantity,
+                    "version": CartItem.version + 1,
+                    "updated_at": func.now(),
+                },
             )
             .returning(CartItem)
         )
@@ -65,6 +70,41 @@ class CartRepository:
         )
         result = self._session.execute(stmt)
         return result.rowcount
+
+    def is_order_cleared(self, order_id: int) -> bool:
+        """Проверява дали поръчка с даден order_id вече е обработена от Cart."""
+        stmt = select(CartClearedOrder).where(CartClearedOrder.order_id == order_id)
+        return self._session.scalar(stmt) is not None
+
+    def mark_order_cleared(self, order_id: int, user_id: int) -> None:
+        """Записва order_id като обработен за осигуряване на идемпотентност."""
+        stmt = (
+            insert(CartClearedOrder)
+            .values(order_id=order_id, user_id=user_id)
+            .on_conflict_do_nothing()
+        )
+        self._session.execute(stmt)
+
+    def delete_items_versioned(
+        self, user_id: int, items: list[tuple[int, int | None]]
+    ) -> list[int]:
+        """Изтрива позициите само ако версията им в базата съвпада със снимката на поръчката.
+
+        Ако потребителят е променил количеството по време на checkout (по-висока версия),
+        позицията НЕ се изтрива и остава в количката му.
+        """
+        cleared_ids: list[int] = []
+        for product_id, expected_version in items:
+            stmt = delete(CartItem).where(
+                CartItem.user_id == user_id,
+                CartItem.product_id == product_id,
+            )
+            if expected_version is not None:
+                stmt = stmt.where(CartItem.version == expected_version)
+            res = self._session.execute(stmt)
+            if res.rowcount > 0:
+                cleared_ids.append(product_id)
+        return cleared_ids
 
     def clear_by_user_id(self, user_id: int) -> int:
         """Премахва всички позиции от количката на потребител."""

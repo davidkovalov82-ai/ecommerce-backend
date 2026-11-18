@@ -17,7 +17,7 @@ cleanup() {
     echo "==> Failure detected (exit code: ${exit_code}). Dumping service logs..."
     docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" logs cart-e2e || true
     docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" logs catalog-e2e || true
-    docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" logs commerce-api-e2e || true
+    docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" logs orders-api-e2e || true
   fi
   echo "==> Cleaning up isolated clean stand stack (${PROJECT_NAME})..."
   docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" down -v --remove-orphans >/dev/null 2>&1 || true
@@ -27,12 +27,12 @@ trap cleanup EXIT
 
 cd "${ROOT_DIR}"
 
-echo "==> [1/2] Starting isolated clean stand infrastructure (Cart, Catalog, Commerce, Users)..."
+echo "==> [1/2] Starting isolated clean stand infrastructure (Cart, Catalog, Orders, Users)..."
 docker compose -p "${PROJECT_NAME}" -f "${COMPOSE_FILE}" up -d --build --wait
 
 echo "==> [2/2] Running K6.3 standalone Cart E2E verification..."
 (
-  cd "${ROOT_DIR}/services/commerce"
+  cd "${ROOT_DIR}/services/orders"
   export COMPOSE_PROJECT_NAME="${PROJECT_NAME}"
   export COMPOSE_FILE="${COMPOSE_FILE}"
   uv run --locked python "${ROOT_DIR}/scripts/cart_e2e_verify.py"
